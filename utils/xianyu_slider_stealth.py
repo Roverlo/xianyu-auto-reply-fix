@@ -1039,6 +1039,10 @@ class XianyuSliderStealth:
                 elif detected_channel:
                     self.browser_channel = detected_channel
         self.playwright = None
+        self._playwright_thread_id: Optional[int] = None
+        # 内层 _detect_qr_code_verification 滑块自救成功后的兜底回流标记，由 run() 入口重置
+        self._post_recovery_success: bool = False
+        self._post_recovery_cookies = None
         self._concurrency_slot_registered = False
         
         # 提取纯用户ID（移除时间戳部分）
@@ -2303,6 +2307,7 @@ class XianyuSliderStealth:
             playwright_factory = self._get_sync_playwright_factory()
             logger.info(f"【{self.pure_user_id}】启动浏览器自动化后端: {self.automation_backend}")
             self.playwright = playwright_factory().start()
+            self._playwright_thread_id = threading.get_ident()
             logger.info(f"【{self.pure_user_id}】{self.automation_backend} 启动成功")
             
             # 为账号加载稳定浏览器画像
@@ -9310,36 +9315,64 @@ class XianyuSliderStealth:
             return False
 
     def _stop_playwright_with_timeout(self, timeout_seconds: float = 5.0) -> bool:
-        """best-effort 停止 Playwright，避免 stop() 卡死把整个清理链拖住。"""
+        """best-effort 停止 Playwright，遇到跨线程 greenlet 错误时降级为引用置空。
+
+        历史实现把 stop() 放进新 daemon 线程做超时保护——但 Playwright sync 实例
+        必须在 start() 时所在的同一线程销毁，跨线程 stop() 必抛
+        `Cannot switch to a different thread`，等于零保护还污染日志。
+        现在改为：
+        - 同线程：直接 stop()，让 Playwright 自己回收
+        - 跨线程：跳过 stop()，仅返回 False，由 close_browser 负责把 self.playwright = None
+        """
         if not getattr(self, 'playwright', None):
             return True
 
-        errors = []
-
-        def _stop_target():
-            try:
-                self.playwright.stop()
-            except Exception as exc:
-                errors.append(exc)
-
-        stop_thread = threading.Thread(
-            target=_stop_target,
-            name=f"slider-playwright-stop-{self.pure_user_id}",
-            daemon=True,
-        )
-        stop_thread.start()
-        stop_thread.join(timeout_seconds)
-
-        if stop_thread.is_alive():
+        creating_tid = getattr(self, '_playwright_thread_id', None)
+        current_tid = threading.get_ident()
+        if creating_tid is not None and current_tid != creating_tid:
             logger.warning(
-                f"【{self.pure_user_id}】Playwright.stop() 超过 {timeout_seconds:.1f} 秒仍未返回，"
-                f"跳过阻塞等待，避免并发槽位泄漏"
+                f"【{self.pure_user_id}】跨线程销毁 Playwright "
+                f"(创建 tid={creating_tid}, 当前 tid={current_tid})，"
+                f"跳过 sync stop() 以避免 greenlet 错误"
             )
             return False
 
-        if errors:
-            raise errors[0]
-        return True
+        try:
+            self.playwright.stop()
+            return True
+        except Exception as exc:
+            msg = str(exc)
+            if 'Cannot switch to a different thread' in msg or 'greenlet' in msg.lower():
+                logger.warning(
+                    f"【{self.pure_user_id}】Playwright.stop() 命中 greenlet 错误，已忽略: {msg}"
+                )
+                return False
+            raise
+
+    def _safe_pw_dispose(self, obj_name: str, obj, action: str = 'close') -> None:
+        """统一封装 Playwright 同步资源关闭：跨线程 greenlet 错误降级为日志，不抛。"""
+        if not obj:
+            return
+        creating_tid = getattr(self, '_playwright_thread_id', None)
+        current_tid = threading.get_ident()
+        if creating_tid is not None and current_tid != creating_tid:
+            logger.warning(
+                f"【{self.pure_user_id}】跨线程销毁 {obj_name} "
+                f"(创建 tid={creating_tid}, 当前 tid={current_tid})，"
+                f"跳过 sync {action}() 以避免 greenlet 错误"
+            )
+            return
+        try:
+            getattr(obj, action)()
+            logger.debug(f"【{self.pure_user_id}】{obj_name} 已 {action}")
+        except Exception as e:
+            msg = str(e)
+            if 'Cannot switch to a different thread' in msg or 'greenlet' in msg.lower():
+                logger.warning(
+                    f"【{self.pure_user_id}】销毁 {obj_name} 命中 greenlet 错误，已忽略: {msg}"
+                )
+            else:
+                logger.warning(f"【{self.pure_user_id}】{action} {obj_name} 时出错: {e}")
 
     def close_browser(self):
         """安全关闭浏览器并清理资源"""
@@ -9347,46 +9380,32 @@ class XianyuSliderStealth:
 
         # 先释放槽位，避免后续任一清理步骤卡死把同账号任务永久堵住。
         self._release_concurrency_slot("close_browser开始")
-        
-        # 清理页面
-        try:
-            if hasattr(self, 'page') and self.page:
-                self.page.close()
-                logger.debug(f"【{self.pure_user_id}】页面已关闭")
-                self.page = None
-        except Exception as e:
-            logger.warning(f"【{self.pure_user_id}】关闭页面时出错: {e}")
-        
-        # 清理上下文
-        try:
-            if hasattr(self, 'context') and self.context:
-                self.context.close()
-                logger.debug(f"【{self.pure_user_id}】上下文已关闭")
-                self.context = None
-        except Exception as e:
-            logger.warning(f"【{self.pure_user_id}】关闭上下文时出错: {e}")
-        
-        # 【修复】同步关闭浏览器，确保资源真正释放
-        try:
-            if hasattr(self, 'browser') and self.browser:
-                self.browser.close()  # 直接同步关闭，不使用异步任务
-                logger.info(f"【{self.pure_user_id}】浏览器已关闭")
-                self.browser = None
-        except Exception as e:
-            logger.warning(f"【{self.pure_user_id}】关闭浏览器时出错: {e}")
-        
-        # 【修复】同步停止Playwright，确保资源真正释放
+
+        # 清理页面 / 上下文 / 浏览器：跨线程 greenlet 错误由 _safe_pw_dispose 统一吸收
+        self._safe_pw_dispose('页面', getattr(self, 'page', None), action='close')
+        self.page = None
+
+        self._safe_pw_dispose('上下文', getattr(self, 'context', None), action='close')
+        self.context = None
+
+        self._safe_pw_dispose('浏览器', getattr(self, 'browser', None), action='close')
+        self.browser = None
+
+        # 停止 Playwright（_stop_playwright_with_timeout 内部已做跨线程保护）
         try:
             if hasattr(self, 'playwright') and self.playwright:
                 stopped = self._stop_playwright_with_timeout()
                 if stopped:
                     logger.info(f"【{self.pure_user_id}】Playwright已停止")
                 else:
-                    logger.warning(f"【{self.pure_user_id}】Playwright停止超时，已跳过阻塞等待")
-                self.playwright = None
+                    logger.warning(f"【{self.pure_user_id}】Playwright未能在当前线程停止，已放弃 stop() 仅置空引用")
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】停止Playwright时出错: {e}")
-        
+        finally:
+            # 不论 stop 成功与否，都把引用置空，避免下一次 close_browser 又对死引用操作
+            self.playwright = None
+            self._playwright_thread_id = None
+
         # 清理临时目录
         try:
             if hasattr(self, 'temp_dir') and self.temp_dir:
@@ -9395,10 +9414,10 @@ class XianyuSliderStealth:
                 self.temp_dir = None  # 设置为None，防止重复清理
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】清理临时目录时出错: {e}")
-        
+
         # 再兜底释放一次，兼容前面提前释放失败的极端情况。
         self._release_concurrency_slot("close_browser收尾")
-        
+
         logger.info(f"【{self.pure_user_id}】资源清理完成")
     
     def __del__(self):
@@ -9526,9 +9545,41 @@ class XianyuSliderStealth:
             frame: iframe 的 content_frame
 
         Returns:
-            str: 验证类型 - 'password_error' / 'face_verify' / 'sms_verify' / 'qr_verify' / 'unknown'
+            str: 验证类型 - 'password_error' / 'face_verify' / 'sms_verify' / 'qr_verify'
+                 / 'login_page' / 'unknown'
+                 'login_page' 用于命中阿里普通登录页（如 mini_login.htm 左侧"快速进入"扫码登录），
+                 这种情况只是登录态丢失而非身份校验，调用方应直接走登录补救而不要标为风控暂停。
         """
         try:
+            # ── 0. 先看 frame URL，把"普通登录页"从 keyword 判定中独立出来 ──
+            # 历史上 keyword 'qr_verify'(扫码/二维码/扫一扫/手机淘宝) 会把
+            # passport.goofish.com/mini_login.htm 误判为身份验证页（因为该页本身就是
+            # "扫码登录 + 账密登录" 的组合，文案天然包含"扫码"等关键词），导致
+            # _request_stop_after_account_pause 误暂停账号。
+            try:
+                frame_url_raw = frame.url if hasattr(frame, 'url') else ""
+            except Exception:
+                frame_url_raw = ""
+            frame_url_lower = (frame_url_raw or "").lower()
+            risk_url_markers = (
+                '/punish', 'captcha', 'verify_account', 'identity_verify',
+                'face_verify', 'faceverify', 'liveness', 'risk_control',
+                'sec_verify', 'security_verify', 'risk-control',
+            )
+            login_page_url_markers = (
+                'passport.goofish.com/mini_login',
+                'passport.goofish.com/newlogin',
+                'passport.taobao.com/mini_login',
+                'login.taobao.com/member/login',
+            )
+            if frame_url_lower and not any(m in frame_url_lower for m in risk_url_markers):
+                if any(m in frame_url_lower for m in login_page_url_markers):
+                    logger.info(
+                        f"【{self.pure_user_id}】frame URL 命中普通登录页({frame_url_raw})，"
+                        f"不进入身份验证 keyword 判定"
+                    )
+                    return 'login_page'
+
             detection_text = self._read_frame_text_for_detection(frame)
             detection_text_lower = detection_text.lower()
 
@@ -9657,6 +9708,22 @@ class XianyuSliderStealth:
                                         extra_meta={'detection_source': '_detect_qr_code_verification'},
                                     )
                                     time.sleep(3)  # 等待滑块验证后的状态更新
+                                    # 内层自救成功 → 立刻把 cookies 抓出来交给 run() 主流程，
+                                    # 否则 run() 主体的 success 仍然是 False，会误存 run_failed 快照并触发退避
+                                    try:
+                                        recovered = self._get_cookies_after_success()
+                                        if recovered:
+                                            self._post_recovery_success = True
+                                            self._post_recovery_cookies = recovered
+                                            logger.info(
+                                                f"【{self.pure_user_id}】内层滑块自救成功并已捕获 "
+                                                f"cookies(条数 {len(recovered) if hasattr(recovered, '__len__') else 'unknown'})，"
+                                                f"将上抛给 run() 主流程"
+                                            )
+                                    except Exception as recover_e:
+                                        logger.warning(
+                                            f"【{self.pure_user_id}】内层滑块自救成功但获取 cookie 失败: {recover_e}"
+                                        )
                                 else:
                                     # 常规重试仍失败后，刷新页面再补一次机会。
                                     logger.warning(
@@ -9686,6 +9753,21 @@ class XianyuSliderStealth:
                                                 extra_meta={'detection_source': '_detect_qr_code_verification'},
                                             )
                                             time.sleep(3)
+                                            # 同上：内层自救成功 → 抓 cookies 交给 run() 主流程
+                                            try:
+                                                recovered = self._get_cookies_after_success()
+                                                if recovered:
+                                                    self._post_recovery_success = True
+                                                    self._post_recovery_cookies = recovered
+                                                    logger.info(
+                                                        f"【{self.pure_user_id}】刷新后内层滑块自救成功并已捕获 "
+                                                        f"cookies(条数 {len(recovered) if hasattr(recovered, '__len__') else 'unknown'})，"
+                                                        f"将上抛给 run() 主流程"
+                                                    )
+                                            except Exception as recover_e:
+                                                logger.warning(
+                                                    f"【{self.pure_user_id}】刷新后内层滑块自救成功但获取 cookie 失败: {recover_e}"
+                                                )
                                     except Exception as e:
                                         logger.error(f"【{self.pure_user_id}】❌ 页面刷新失败: {e}")
                                         self._finish_password_login_slider_risk_log(
@@ -9743,6 +9825,26 @@ class XianyuSliderStealth:
                                 # 先检测具体的验证类型
                                 verification_type = self._detect_verification_type(frame)
                                 logger.info(f"【{self.pure_user_id}】检测到验证类型: {verification_type}")
+
+                                # 命中"普通登录页"（mini_login.htm 等）→ 不是风控验证，
+                                # 但仍是"账号需要重新登录"——交给 _process_verification_requirement
+                                # 走「等待用户操作」路径并通知用户扫码；普通扫码登录不应作为暂停账号的诱因。
+                                if verification_type == 'login_page':
+                                    logger.info(
+                                        f"【{self.pure_user_id}】alibaba-login-box 是普通登录页，"
+                                        f"作为「待扫码登录」上抛给 _process_verification_requirement"
+                                    )
+                                    verification_screenshot = self._capture_verification_screenshot(
+                                        page,
+                                        frame=frame,
+                                        iframe_selector='iframe#alibaba-login-box'
+                                    )
+                                    return True, VerificationFrameWrapper(
+                                        frame,
+                                        verification_type='login_page',
+                                        verify_url=(frame.url if hasattr(frame, 'url') else None),
+                                        screenshot_path=verification_screenshot,
+                                    )
 
                                 # 记录风控日志
                                 try:
@@ -9859,6 +9961,18 @@ class XianyuSliderStealth:
                         
                         if not is_slider:
                             verification_type = self._detect_verification_type(frame)
+                            if verification_type == 'login_page':
+                                logger.info(
+                                    f"【{self.pure_user_id}】Frame {idx} mini_login 判定为普通登录页，"
+                                    f"作为「待扫码登录」上抛"
+                                )
+                                verification_screenshot = self._capture_verification_screenshot(page, frame=frame)
+                                return True, VerificationFrameWrapper(
+                                    frame,
+                                    verification_type='login_page',
+                                    verify_url=frame_url,
+                                    screenshot_path=verification_screenshot,
+                                )
                             if verification_type == 'password_error':
                                 logger.error(f"【{self.pure_user_id}】❌ mini_login 页面判定为账号密码错误")
                                 raise PasswordLoginVerificationError("账号密码错误，请检查账号密码是否正确")
@@ -9887,6 +10001,18 @@ class XianyuSliderStealth:
                                 logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到 alibaba-login-box（人脸验证/短信验证）")
                                 logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame URL: {frame_url}")
                                 verification_type = self._detect_verification_type(frame)
+                                if verification_type == 'login_page':
+                                    logger.info(
+                                        f"【{self.pure_user_id}】Frame {idx} alibaba-login-box 是普通登录页，"
+                                        f"作为「待扫码登录」上抛"
+                                    )
+                                    verification_screenshot = self._capture_verification_screenshot(page, frame=frame)
+                                    return True, VerificationFrameWrapper(
+                                        frame,
+                                        verification_type='login_page',
+                                        verify_url=frame_url,
+                                        screenshot_path=verification_screenshot,
+                                    )
                                 if verification_type == 'password_error':
                                     logger.error(f"【{self.pure_user_id}】❌ alibaba-login-box 页面判定为账号密码错误")
                                     raise PasswordLoginVerificationError("账号密码错误，请检查账号密码是否正确")
@@ -10408,6 +10534,7 @@ class XianyuSliderStealth:
 
             playwright_factory = self._get_sync_playwright_factory()
             playwright = playwright_factory().start()
+            self._playwright_thread_id = threading.get_ident()
             browser = None
             used_profile_lock_fallback = False
             launch_options: Dict[str, Any] = {
@@ -11761,6 +11888,9 @@ class XianyuSliderStealth:
     ):
         """运行主流程，返回(成功状态, cookie数据)"""
         cookies = None
+        # 每次 run() 进入都先清空内层自救兜底标记，避免上次状态残留
+        self._post_recovery_success = False
+        self._post_recovery_cookies = None
         try:
             # 检查日期有效性
             if not self._check_date_validity():
@@ -11889,6 +12019,15 @@ class XianyuSliderStealth:
                         )
                         if verification_result:
                             return True, verification_result
+                    # 兜底回流：_detect_qr_code_verification 内部 reload+solve_slider 自救成功时，
+                    # 会把 cookies 写入 self._post_recovery_cookies 并标记 _post_recovery_success。
+                    # 这里识别该信号并把 run() 主流程翻成成功，避免外层误以为失败而触发 600s 退避。
+                    if self._post_recovery_success and self._post_recovery_cookies:
+                        logger.success(
+                            f"【{self.pure_user_id}】✅ 外层滑块判失败，但内层 _detect_qr_code_verification 自救成功，"
+                            f"按 run() 成功收口"
+                        )
+                        return True, self._post_recovery_cookies
                     self._save_debug_snapshot("run_failed", getattr(self, "_detected_slider_frame", None))
                 
                 return success, cookies

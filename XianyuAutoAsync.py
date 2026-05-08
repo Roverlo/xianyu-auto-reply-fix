@@ -891,6 +891,19 @@ class XianyuLive:
     def _is_account_pause_status(status: str) -> bool:
         return status in {"account_risk_protected", "manual_verification_required"}
 
+    @staticmethod
+    def _should_pause_for_manual_verification(verification_type: str, verification_context: str) -> bool:
+        """判断人工介入提示是否应禁用账号。
+
+        普通扫码登录页（login_page / mini_login）只是登录态丢失后的正常登录入口，
+        不能当作风控/身份校验来暂停账号；真正的人脸/短信/二维码身份验证仍按自动流程保护。
+        """
+        if verification_context in MANUAL_VERIFICATION_CONTEXTS:
+            return False
+        if verification_type == 'login_page':
+            return False
+        return True
+
     async def _apply_account_pause_state(
         self,
         *,
@@ -1016,6 +1029,7 @@ class XianyuLive:
             'face_verify': '人脸验证',
             'sms_verify': '短信验证',
             'qr_verify': '二维码验证',
+            'login_page': '扫码登录',
             'unknown': '身份验证',
         }
         type_name = verification_type_names.get(verification_type, '身份验证')
@@ -1023,9 +1037,14 @@ class XianyuLive:
         message = str(error_message or f"检测到需要人工完成的{type_name}").strip()
 
         if not pause_account:
-            logger.warning(
-                f"【{self.cookie_id}】检测到需要人工完成的{type_name}，但当前属于手动流程({verification_context})，不自动暂停账号"
-            )
+            if verification_type == 'login_page':
+                logger.warning(
+                    f"【{self.cookie_id}】检测到普通扫码登录入口({verification_context})，仅通知用户完成登录，不自动暂停账号"
+                )
+            else:
+                logger.warning(
+                    f"【{self.cookie_id}】检测到需要人工完成的{type_name}，但当前属于手动流程({verification_context})，不自动暂停账号"
+                )
             return False
 
         await self._apply_account_pause_state(
@@ -7338,7 +7357,7 @@ class XianyuLive:
             ):
                 """通知回调包装函数，支持接收截图路径和验证链接"""
                 verification_context = 'manual_cookie_refresh' if self.is_manual_refresh_active(self.cookie_id, allow_handoff_recovery=True) else 'auto_refresh'
-                should_pause_account = verification_context not in MANUAL_VERIFICATION_CONTEXTS
+                should_pause_account = self._should_pause_for_manual_verification(verification_type, verification_context)
                 self.last_token_refresh_status = 'verification_pending_manual' if not should_pause_account else 'manual_verification_required'
                 self.last_token_refresh_error_message = str(message or '').strip()
                 pause_target_loop = None

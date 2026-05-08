@@ -13,6 +13,8 @@ import time
 import json
 import os
 import re
+import uuid
+import base64
 from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
@@ -28,6 +30,7 @@ from config import RISK_CONTROL
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from utils.qr_login import qr_login_manager
+from utils.qr_login_lite import qrcode_login_lite
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
 from utils.time_utils import (
@@ -799,6 +802,12 @@ password_login_locks = defaultdict(lambda: asyncio.Lock())
 manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 manual_cookie_import_locks = defaultdict(lambda: asyncio.Lock())
 PASSWORD_LOGIN_TERMINAL_STATUSES = {'success', 'failed', 'cancelled'}
+
+# ── 轻量扫码登录(qr_login_lite)会话表 ───────────────────────────
+# value: {state, qr_data_url, error_message, account_info, started_at, finished, user_id}
+# state: pending | waiting | success | error | expired
+qr_lite_sessions: Dict[str, Dict[str, Any]] = {}
+QR_LITE_SESSION_TTL = 600  # 10 分钟未完结即清理
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
 
@@ -3829,20 +3838,51 @@ async def trigger_session_keepalive(cid: str, current_user: Dict[str, Any] = Dep
         from XianyuAutoAsync import XianyuLive
         live_instance = XianyuLive.get_instance(cid)
         if not live_instance:
-            raise HTTPException(status_code=400, detail="账号未启动，暂无法执行轻量保活")
+            try:
+                live_instance = getattr(cookie_manager.manager, 'live_instances', {}).get(cid) if cookie_manager.manager else None
+            except Exception:
+                live_instance = None
 
         log_with_user('info', f"手动触发账号 {cid} 的轻量会话保活", current_user)
-        keepalive_ok = await _run_live_instance_on_manager_loop(
-            cid,
-            lambda: live_instance.keep_session_alive(),
-            timeout=40,
-        )
+        used_temporary_instance = False
+
+        if live_instance:
+            keepalive_ok = await _run_live_instance_on_manager_loop(
+                cid,
+                lambda: live_instance.keep_session_alive(),
+                timeout=40,
+            )
+        else:
+            # 账号刚完成扫码/手动刷新、或旧误暂停导致主任务尚未恢复时，仍允许用数据库中的
+            # 最新 Cookie 做一次 one-shot 轻保活；普通扫码登录不应因为“实例未注册”而无法验证会话。
+            cookie_value = db_manager.get_cookie(cid)
+            if not cookie_value:
+                raise HTTPException(status_code=400, detail="账号Cookie不存在，暂无法执行轻量保活")
+
+            async def _run_temporary_keepalive():
+                temp_live = XianyuLive(cookie_value, cookie_id=cid, register_instance=False)
+                try:
+                    return await temp_live.keep_session_alive()
+                finally:
+                    try:
+                        await temp_live.close_session()
+                    except Exception as close_e:
+                        logger.warning(f"临时轻量保活关闭会话失败: {cid} - {mask_sensitive_text(close_e)}")
+
+            keepalive_ok = await _run_live_instance_on_manager_loop(
+                cid,
+                _run_temporary_keepalive,
+                timeout=40,
+            )
+            used_temporary_instance = True
+
         runtime_status = _build_live_runtime_status(cid)
         return {
             'success': keepalive_ok,
             'cookie_id': cid,
             'message': '轻量会话保活成功' if keepalive_ok else '轻量会话保活失败',
             'runtime_status': runtime_status,
+            'temporary_instance': used_temporary_instance,
         }
     except HTTPException:
         raise
@@ -5746,6 +5786,162 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         return {'status': 'error', 'message': str(e)}
 
 
+# ========================= 轻量扫码登录(qr_login_lite) =========================
+
+def _cleanup_qr_lite_sessions():
+    now = time.time()
+    stale = [
+        sid for sid, st in qr_lite_sessions.items()
+        if st.get('finished') and now - st.get('finished_at', st.get('started_at', now)) > QR_LITE_SESSION_TTL
+    ]
+    for sid in stale:
+        qr_lite_sessions.pop(sid, None)
+
+
+def _render_qr_data_url(qr_url: str) -> str:
+    """把 cv-cat 返回的二维码内容渲染成 data:image/png;base64,..."""
+    import qrcode as _qrlib
+    img = _qrlib.make(qr_url)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+async def _run_qr_login_lite(session_id: str, current_user: Dict[str, Any]):
+    state = qr_lite_sessions.get(session_id)
+    if state is None:
+        return
+
+    def _on_qr_url(qr_url: str):
+        try:
+            state['qr_data_url'] = _render_qr_data_url(qr_url)
+            state['state'] = 'waiting'
+        except Exception as render_e:
+            state['error_message'] = f'二维码渲染失败: {render_e}'
+            state['state'] = 'error'
+
+    def _on_status(raw: str):
+        # cv-cat 内部 qrCodeStatus → 前端可识别的 state
+        normalized = (raw or '').strip().upper()
+        state['raw_qr_status'] = normalized
+        if normalized == 'SCANNED':
+            state['state'] = 'scanned'
+        elif normalized == 'CONFIRMED':
+            state['state'] = 'confirmed'
+        elif normalized == 'NEW':
+            # NEW 与初始 waiting 同义，避免回退覆盖更靠后的 confirmed
+            if state.get('state') in (None, 'pending', 'waiting'):
+                state['state'] = 'waiting'
+        # EXPIRED / 异常字符串：让 qrcode_login_lite 抛 TimeoutError，由 finally 收口
+
+    try:
+        cookies, acct = await asyncio.to_thread(
+            qrcode_login_lite,
+            poll_interval=3.0,
+            timeout=180.0,
+            show_qrcode_in_terminal=False,
+            on_qr_url=_on_qr_url,
+            on_status=_on_status,
+        )
+        cookie_str = '; '.join(f"{k}={v}" for k, v in cookies.items())
+        info = await process_qr_login_cookies(cookie_str, acct.get('unb', ''), current_user)
+        merged = {**acct, **(info or {})}
+        # process_qr_login_cookies 通常会回填 account_id/cookie_length 等
+        state['account_info'] = merged
+        state['state'] = 'success'
+    except TimeoutError as exc:
+        state['state'] = 'expired'
+        state['error_message'] = str(exc) or '二维码已过期或扫码超时'
+        log_with_user('warning', f"轻量扫码登录超时: {exc}", current_user)
+    except Exception as exc:
+        state['state'] = 'error'
+        state['error_message'] = str(exc) or '轻量扫码登录失败'
+        log_with_user('error', f"轻量扫码登录异常: {exc}", current_user)
+    finally:
+        state['finished'] = True
+        state['finished_at'] = time.time()
+
+
+@app.post("/qr-login-lite/generate")
+async def generate_qr_code_lite(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """生成轻量扫码登录(纯 HTTP)二维码"""
+    try:
+        log_with_user('info', "请求生成轻量扫码登录二维码", current_user)
+        _cleanup_qr_lite_sessions()
+
+        session_id = uuid.uuid4().hex
+        qr_lite_sessions[session_id] = {
+            'state': 'pending',
+            'qr_data_url': None,
+            'error_message': None,
+            'account_info': None,
+            'started_at': time.time(),
+            'finished': False,
+            'user_id': current_user.get('user_id'),
+        }
+
+        asyncio.create_task(_run_qr_login_lite(session_id, current_user))
+
+        # 等 build_initial_cookies + node tfstk + mini_login + generate.do 出二维码
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            st = qr_lite_sessions[session_id]
+            if st.get('qr_data_url') or st.get('error_message') or st.get('finished'):
+                break
+            await asyncio.sleep(0.3)
+
+        st = qr_lite_sessions[session_id]
+        if st.get('error_message'):
+            return {'success': False, 'message': st['error_message']}
+        if not st.get('qr_data_url'):
+            return {'success': False, 'message': '生成二维码超时（>30s），可能 node/网络异常'}
+
+        log_with_user('info', f"轻量扫码登录二维码生成成功: {session_id}", current_user)
+        return {
+            'success': True,
+            'session_id': session_id,
+            'qr_code_url': st['qr_data_url'],
+        }
+    except Exception as e:
+        log_with_user('error', f"生成轻量扫码登录二维码异常: {str(e)}", current_user)
+        return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
+
+
+@app.get("/qr-login-lite/check/{session_id}")
+async def check_qr_code_status_lite(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """检查轻量扫码登录状态"""
+    try:
+        st = qr_lite_sessions.get(session_id)
+        if not st:
+            return {'status': 'error', 'message': '会话不存在或已过期'}
+
+        if st.get('user_id') and st['user_id'] != current_user.get('user_id'):
+            return {'status': 'error', 'message': '无权访问该会话'}
+
+        state = st.get('state', 'pending')
+        if state == 'pending':
+            return {'status': 'waiting', 'message': '正在生成二维码…'}
+        if state == 'waiting':
+            return {'status': 'waiting', 'message': '等待扫码…'}
+        if state == 'scanned':
+            return {'status': 'scanned', 'message': '已扫码，请在手机上确认…'}
+        if state == 'confirmed':
+            return {'status': 'confirmed', 'message': '已确认，正在获取Cookie…'}
+        if state == 'success':
+            return {
+                'status': 'success',
+                'message': '扫码登录已完成',
+                'account_info': st.get('account_info') or {},
+            }
+        if state == 'expired':
+            return {'status': 'expired', 'message': st.get('error_message') or '二维码已过期'}
+        # error
+        return {'status': 'error', 'message': st.get('error_message') or '扫码登录失败'}
+    except Exception as e:
+        log_with_user('error', f"检查轻量扫码登录状态异常: {str(e)}", current_user)
+        return {'status': 'error', 'message': str(e)}
+
+
 async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[str, Any]) -> Dict[str, Any]:
     """处理扫码登录获取的Cookie - 先获取真实cookie再保存到数据库"""
     try:
@@ -5857,6 +6053,11 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                             task_restarted = True
                             db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
                             XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready', grace_until=qr_login_grace_until)
+                            # 扫码刚拿到全新可信 cookie，立即清掉旧的密码登录失败退避，
+                            # 否则 init() 会被旧的 slider_failed/credentials 退避 skip，
+                            # 表现为"扫码完成但 WS 起不来"（详见 22:43 / 22:08 那两次链路）。
+                            XianyuLive.clear_password_login_failure_backoff(account_id)
+                            log_with_user('info', f"扫码成功后已清除密码登录失败退避: {account_id}", current_user)
                             warning_message = f"真实Cookie已获取，账号任务已切换；为降低再次触发风控的概率，将进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         else:

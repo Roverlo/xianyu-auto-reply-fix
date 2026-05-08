@@ -13085,6 +13085,7 @@ function resetPasswordLoginForm() {
 let qrCodeCheckInterval = null;
 let qrCodeSessionId = null;
 let qrCodeModalEventsBound = false;
+let qrLoginMode = 'standard'; // 'standard' = 原 Playwright；'lite' = 纯 HTTP (cv-cat 风格)
 let qrCodeVerificationState = {
     renderKey: '',
     toastShown: false,
@@ -13092,6 +13093,26 @@ let qrCodeVerificationState = {
     completed: false,
     activeSessionId: null
 };
+
+function getQRLoginEndpoints() {
+    if (qrLoginMode === 'lite') {
+        return {
+            generate: `${apiBase}/qr-login-lite/generate`,
+            checkPrefix: `${apiBase}/qr-login-lite/check/`,
+        };
+    }
+    return {
+        generate: `${apiBase}/qr-login/generate`,
+        checkPrefix: `${apiBase}/qr-login/check/`,
+    };
+}
+
+function applyQRLoginModeChrome() {
+    const titleEl = document.getElementById('qrLoginModalTitleText');
+    if (titleEl) {
+        titleEl.textContent = qrLoginMode === 'lite' ? '轻量扫码登录闲鱼账号' : '扫码登录闲鱼账号';
+    }
+}
 
 function normalizeStaticAssetPath(path) {
     if (!path) {
@@ -13144,7 +13165,9 @@ function initializeQRCodeLoginModal() {
 }
 
 // 显示扫码登录模态框
-function showQRCodeLogin() {
+function showQRCodeLogin(mode = 'standard') {
+    qrLoginMode = mode === 'lite' ? 'lite' : 'standard';
+    applyQRLoginModeChrome();
     const modalElement = initializeQRCodeLoginModal();
     if (!modalElement) {
         showToast('扫码登录弹窗未找到，请刷新页面重试', 'danger');
@@ -13166,7 +13189,8 @@ async function generateQRCode() {
     resetQRCodeVerificationState();
     showQRCodeLoading();
 
-    const response = await fetch(`${apiBase}/qr-login/generate`, {
+    const endpoints = getQRLoginEndpoints();
+    const response = await fetch(endpoints.generate, {
         method: 'POST',
         headers: {
         'Authorization': `Bearer ${authToken}`,
@@ -13250,7 +13274,8 @@ async function checkQRCodeStatus() {
     qrCodeVerificationState.inFlight = true;
 
     try {
-    const response = await fetch(`${apiBase}/qr-login/check/${requestSessionId}`, {
+    const endpoints = getQRLoginEndpoints();
+    const response = await fetch(`${endpoints.checkPrefix}${requestSessionId}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
