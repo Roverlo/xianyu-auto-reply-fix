@@ -24,12 +24,12 @@ ENV TZ=Asia/Shanghai
 ENV DOCKER_ENV=true
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-#更换中科大源
-RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources
+# Use HTTPS Debian mirrors with retries; HTTP and some domestic mirrors are unreliable here.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources
 
 # 安装系统依赖（包括Playwright浏览器依赖）
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         # 基础工具
         nodejs \
         npm \
@@ -69,7 +69,6 @@ RUN apt-get update && \
         libx11-xcb1 \
         libxfixes3 \
         xdg-utils \
-        chromium \
         xvfb \
         x11vnc \
         fluxbox \
@@ -98,7 +97,12 @@ COPY . .
 
 # 安装Playwright浏览器（必须在复制项目文件之后）
 RUN playwright install chromium && \
-    playwright install-deps chromium
+    playwright install-deps chromium && \
+    CHROME_BIN="$(find /ms-playwright -type f -path '*/chrome-linux*/chrome' | head -n 1)" && \
+    test -n "$CHROME_BIN" && \
+    ln -sf "$CHROME_BIN" /usr/bin/chromium && \
+    ln -sf "$CHROME_BIN" /usr/bin/chromium-browser && \
+    ln -sf "$CHROME_BIN" /usr/bin/google-chrome
 
 # 创建必要的目录并设置权限
 RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
