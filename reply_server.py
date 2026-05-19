@@ -6798,6 +6798,7 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
     import time as time_module
     import aiohttp
     from db_manager import db_manager
+    from utils.notification_dispatcher import send_channel_notification
 
     try:
         if data.template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
@@ -6880,16 +6881,28 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
         success_channels = []
         failed_channels = []
 
+        def mask_config_for_log(config_data):
+            if not isinstance(config_data, dict):
+                return config_data
+            masked = {}
+            sensitive_keywords = ('token', 'password', 'secret', 'key')
+            for key, value in config_data.items():
+                if any(keyword in str(key).lower() for keyword in sensitive_keywords):
+                    masked[key] = '<set>' if value else '<empty>'
+                else:
+                    masked[key] = value
+            return masked
+
         for channel in enabled_channels:
             channel_type = channel.get('type', '')
             channel_name = channel.get('name', channel_type)
             config_str = channel.get('config', '{}')
-            logger.info(f"处理通知渠道: name={channel_name}, type={channel_type}, config={config_str}")
+            logger.info(f"处理通知渠道: name={channel_name}, type={channel_type}")
 
             try:
                 import json
                 config_data = json.loads(config_str) if isinstance(config_str, str) else config_str
-                logger.info(f"解析后的配置: {config_data}")
+                logger.info(f"解析后的配置: {mask_config_for_log(config_data)}")
 
                 # 根据渠道类型发送通知
                 if channel_type == 'feishu' or channel_type == 'lark':
@@ -7015,7 +7028,18 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
                                     failed_channels.append(f"{channel_name} (HTTP {resp.status})")
 
                 elif channel_type == 'email':
-                    failed_channels.append(f"{channel_name} (邮件测试暂不支持)")
+                    sent = await send_channel_notification(
+                        'email',
+                        config_data,
+                        f"【测试通知】\n\n{template}",
+                        title='闲鱼管理系统测试通知',
+                        notification_type=data.template_type,
+                        account_id='test',
+                    )
+                    if sent:
+                        success_channels.append(channel_name)
+                    else:
+                        failed_channels.append(f"{channel_name} (邮件发送失败)")
 
                 else:
                     failed_channels.append(f"{channel_name} (不支持的渠道类型)")
