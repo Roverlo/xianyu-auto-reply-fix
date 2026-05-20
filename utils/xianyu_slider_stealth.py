@@ -11816,43 +11816,11 @@ class XianyuSliderStealth:
             finally:
                 # 关闭浏览器。这里不能无限阻塞，否则上层会话会一直卡在 processing。
                 try:
-                    close_errors = []
-
-                    def _close_runtime_resources():
-                        try:
-                            if context:
-                                context.close()
-                        except Exception as close_context_err:
-                            close_errors.append(f"context.close: {close_context_err}")
-
-                        if effective_clean_context and browser:
-                            try:
-                                browser.close()
-                            except Exception as close_browser_err:
-                                close_errors.append(f"browser.close: {close_browser_err}")
-
-                        try:
-                            if playwright:
-                                playwright.stop()
-                        except Exception as stop_playwright_err:
-                            close_errors.append(f"playwright.stop: {stop_playwright_err}")
-
-                    close_thread = threading.Thread(
-                        target=_close_runtime_resources,
-                        name=f"pwd-login-close-{self.pure_user_id}",
-                        daemon=True,
-                    )
-                    close_thread.start()
-                    close_thread.join(timeout=8)
-
-                    if close_thread.is_alive():
-                        logger.warning(f"【{self.pure_user_id}】关闭浏览器超时，改为后台继续清理，避免阻塞密码登录会话收尾")
-                    elif close_errors:
-                        logger.warning(f"【{self.pure_user_id}】关闭浏览器时出现异常: {close_errors}")
-                    elif effective_clean_context:
-                        logger.info(f"【{self.pure_user_id}】浏览器已关闭，干净上下文已销毁")
-                    else:
-                        logger.info(f"【{self.pure_user_id}】浏览器已关闭，缓存已保存")
+                    self.page = page
+                    self.context = context
+                    self.browser = browser
+                    self.playwright = playwright
+                    self.close_browser()
                 except Exception as e:
                     logger.warning(f"【{self.pure_user_id}】关闭浏览器时出错: {e}")
 
