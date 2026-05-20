@@ -74,6 +74,7 @@ PERSISTED_TOKEN_MAX_AGE_SECONDS = max(
     300,
     int(RISK_CONTROL.get('persisted_token_max_age_seconds', min(TOKEN_REFRESH_INTERVAL, 72000)) or min(TOKEN_REFRESH_INTERVAL, 72000)),
 )
+PERSISTED_BACKOFF_SETTING_PREFIX = 'xianyu_login_backoff:'
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
 # 不再需要猴子补丁，所有功能已集成到 XianyuSliderStealth 类中
@@ -737,6 +738,56 @@ class XianyuLive:
         ]
         for cookie_id in expired_cookie_ids:
             cls._password_login_failure_backoff.pop(cookie_id, None)
+            cls._clear_persisted_login_backoff(cookie_id)
+
+    @classmethod
+    def _login_backoff_setting_key(cls, cookie_id: str) -> str:
+        return f"{PERSISTED_BACKOFF_SETTING_PREFIX}{cookie_id}"
+
+    @classmethod
+    def _load_persisted_login_backoff(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
+        if not cookie_id:
+            return None
+        try:
+            raw_value = db_manager.get_system_setting(cls._login_backoff_setting_key(cookie_id))
+            if not raw_value:
+                return None
+            state = json.loads(raw_value)
+            if not isinstance(state, dict):
+                return None
+            if time.time() >= float(state.get('until') or 0):
+                cls._clear_persisted_login_backoff(cookie_id)
+                return None
+            return state
+        except Exception as e:
+            logger.debug(f"【{cookie_id}】读取持久化登录退避失败: {e}")
+            return None
+
+    @classmethod
+    def _persist_login_backoff(cls, cookie_id: str, state: Dict[str, Any]) -> None:
+        if not cookie_id or not state:
+            return
+        try:
+            db_manager.set_system_setting(
+                cls._login_backoff_setting_key(cookie_id),
+                json.dumps(state, ensure_ascii=False),
+                '闲鱼登录/Token恢复退避状态',
+            )
+        except Exception as e:
+            logger.debug(f"【{cookie_id}】写入持久化登录退避失败: {e}")
+
+    @classmethod
+    def _clear_persisted_login_backoff(cls, cookie_id: str) -> None:
+        if not cookie_id:
+            return
+        try:
+            db_manager.set_system_setting(
+                cls._login_backoff_setting_key(cookie_id),
+                '',
+                '闲鱼登录/Token恢复退避状态',
+            )
+        except Exception as e:
+            logger.debug(f"【{cookie_id}】清理持久化登录退避失败: {e}")
 
     @classmethod
     def get_password_login_failure_backoff(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
@@ -744,7 +795,13 @@ class XianyuLive:
         if not cookie_id:
             return None
         cls._cleanup_password_login_failure_backoff()
-        return cls._password_login_failure_backoff.get(cookie_id)
+        state = cls._password_login_failure_backoff.get(cookie_id)
+        if state:
+            return state
+        state = cls._load_persisted_login_backoff(cookie_id)
+        if state:
+            cls._password_login_failure_backoff[cookie_id] = state
+        return state
 
     @classmethod
     def clear_password_login_failure_backoff(cls, cookie_id: str):
@@ -752,6 +809,7 @@ class XianyuLive:
         if not cookie_id:
             return
         cls._password_login_failure_backoff.pop(cookie_id, None)
+        cls._clear_persisted_login_backoff(cookie_id)
 
     @classmethod
     def set_password_login_failure_backoff(cls, cookie_id: str, reason: str, seconds: int):
@@ -762,15 +820,15 @@ class XianyuLive:
         previous_reason = previous_state.get('reason')
         previous_count = int(previous_state.get('consecutive_count', 0) or 0)
         consecutive_count = previous_count + 1 if previous_reason == reason else 1
+        escalation_factor = float(RISK_CONTROL.get('backoff_escalation_factor', 1.5) or 1.5)
         if reason == 'server_overload':
-            actual_seconds = seconds
+            max_cap = max(seconds, int(RISK_CONTROL.get('server_overload_backoff_max_seconds', 1800) or 1800))
         else:
-            escalation_factor = float(RISK_CONTROL.get('backoff_escalation_factor', 1.5) or 1.5)
             max_cap = max(seconds, int(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600))
-            actual_seconds = int(round(min(seconds * (escalation_factor ** max(0, consecutive_count - 1)), max_cap)))
-            actual_seconds = max(seconds, actual_seconds)
+        actual_seconds = int(round(min(seconds * (escalation_factor ** max(0, consecutive_count - 1)), max_cap)))
+        actual_seconds = max(seconds, actual_seconds)
         now = time.time()
-        cls._password_login_failure_backoff[cookie_id] = {
+        state = {
             'until': now + actual_seconds,
             'reason': reason,
             'seconds': actual_seconds,
@@ -778,6 +836,8 @@ class XianyuLive:
             'consecutive_count': consecutive_count,
             'created_at': now,
         }
+        cls._password_login_failure_backoff[cookie_id] = state
+        cls._persist_login_backoff(cookie_id, state)
 
     @staticmethod
     def _is_counted_password_login_failure_reason(reason: str) -> bool:

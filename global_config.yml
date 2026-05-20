@@ -80,6 +80,7 @@ RISK_CONTROL:
   slider_consecutive_pause_seconds: 7200
   hard_risk_backoff_seconds: 1800
   server_overload_backoff_seconds: 600
+  server_overload_backoff_max_seconds: 1800
   persisted_token_max_age_seconds: 72000
   token_refresh_dedup_window_seconds: 60
   token_retry_min_wait_seconds: 180
