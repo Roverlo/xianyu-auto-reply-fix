@@ -12442,7 +12442,10 @@ async function handleRefreshCookie(event) {
 
         if (data.session_id) {
             // 开始轮询检查登录状态
-            showToast('正在验证账号并刷新Cookie，请稍候...', 'info');
+            showToast(
+                appendHeadfulBrowserViewHint('正在验证账号并刷新Cookie，请稍候...', showBrowser),
+                'info'
+            );
             startRefreshCookiePolling(data.session_id, cookieId);
         } else {
             toggleLoading(false);
@@ -12533,11 +12536,17 @@ function startRefreshCookiePolling(sessionId, cookieId) {
             switch (data.status) {
                 case 'processing':
                     // 处理中，更新状态显示
-                    updateRefreshCookieStatus('正在登录中，请稍候...');
+                    updateRefreshCookieStatus(appendHeadfulBrowserViewHint(
+                        data.message || '正在登录中，请稍候...',
+                        data.show_browser === true
+                    ));
                     break;
                 case 'verification_required':
                     // 需要身份验证，显示验证截图或链接
-                    updateRefreshCookieStatus(`需要${getPasswordLoginVerificationTypeLabel(data.verification_type)}，请查看弹出的验证窗口`);
+                    updateRefreshCookieStatus(appendHeadfulBrowserViewHint(
+                        `需要${getPasswordLoginVerificationTypeLabel(data.verification_type)}，请查看验证窗口`,
+                        data.show_browser === true
+                    ));
                     // 使用账号密码登录的验证显示函数
                     showPasswordLoginQRCode(
                         data.screenshot_path || data.verification_url || data.qr_code_url,
@@ -12603,6 +12612,19 @@ let passwordLoginQRModalState = {
     cancelInFlight: false
 };
 
+const HEADFUL_BROWSER_VIEW_HINT = '已开启显示浏览器：Docker 部署下窗口在容器虚拟桌面中，请用 VNC 连接 127.0.0.1:5900 查看。';
+
+function getHeadfulBrowserViewHint(showBrowser) {
+    return showBrowser ? HEADFUL_BROWSER_VIEW_HINT : '';
+}
+
+function appendHeadfulBrowserViewHint(message, showBrowser) {
+    const hint = getHeadfulBrowserViewHint(showBrowser);
+    if (!hint) return message || '';
+    if (!message) return hint;
+    return `${message} ${hint}`;
+}
+
 // 处理账号密码登录表单提交
 async function handlePasswordLogin(event) {
     event.preventDefault();
@@ -12642,6 +12664,9 @@ async function handlePasswordLogin(event) {
         
         if (response.ok && data.success && data.session_id) {
             passwordLoginSessionId = data.session_id;
+            if (showBrowser) {
+                showToast('浏览器窗口已在容器虚拟桌面启动，请用 VNC 连接 127.0.0.1:5900 查看。', 'info');
+            }
             // 开始轮询检查登录状态
             startPasswordLoginCheck();
         } else {
@@ -12706,6 +12731,7 @@ function updatePasswordLoginProgress(data) {
     const progressEl = ensurePasswordLoginProgressElement();
 
     const message = data && data.message ? String(data.message) : '登录处理中，请稍候...';
+    const showBrowser = data && data.show_browser === true;
     const elapsed = data && Number.isFinite(Number(data.elapsed_seconds))
         ? ` ${Number(data.elapsed_seconds)}s`
         : '';
@@ -12714,7 +12740,7 @@ function updatePasswordLoginProgress(data) {
         submitBtn.innerHTML = `<span class="spinner-border spinner-border-sm me-2"></span>${getPasswordLoginStageLabel(data && data.stage)}`;
     }
     if (progressEl) {
-        progressEl.textContent = `${message}${elapsed}`;
+        progressEl.textContent = `${appendHeadfulBrowserViewHint(message, showBrowser)}${elapsed}`;
     }
 }
 

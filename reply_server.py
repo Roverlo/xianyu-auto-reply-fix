@@ -4225,6 +4225,7 @@ def _build_password_login_processing_payload(session_id: str, session: Dict[str,
         'elapsed_seconds': elapsed_seconds,
         'timeout_seconds': PASSWORD_LOGIN_PROCESSING_TIMEOUT_SECONDS,
         'session_id': session_id,
+        'show_browser': bool(session.get('show_browser')),
     }
 
 
