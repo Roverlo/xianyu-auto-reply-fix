@@ -3426,6 +3426,13 @@ function getAboutStatusText(type, value) {
             manual_refresh_browser_stabilizing: '浏览器稳定中',
             post_slider_session_settling: '滑块后稳定中',
             restarted_after_cookie_refresh: '已触发重连',
+            server_overload_rgv587: '平台限流中',
+            qr_login_grace_wait: '扫码保护期',
+            hard_risk_block: '硬风控退避',
+            manual_required: '需人工验证',
+            unknown_risk: '未知风控',
+            password_login_backoff_wait: '退避等待',
+            verification_pending_manual: '等待人工验证',
             captcha_max_retries_exceeded: '滑块重试超限',
             token_expired_recovery_failed: '过期恢复失败',
             token_refresh_failed: '刷新失败',
@@ -3474,6 +3481,8 @@ function getAboutStatusVariant(type, value) {
 
     if (normalized === 'success' || normalized === 'recovered') return 'success';
     if (normalized === 'started' || normalized === 'connecting' || normalized === 'reconnecting') return 'info';
+    if (normalized === 'server_overload_rgv587' || normalized === 'qr_login_grace_wait') return 'warning';
+    if (normalized === 'hard_risk_block' || normalized === 'manual_required' || normalized === 'unknown_risk') return 'danger';
     if (normalized.includes('failed') || normalized.includes('exception') || normalized.includes('error')) return 'danger';
     if (normalized.includes('skipped') || normalized.includes('retry') || normalized.includes('restarted')) return 'warning';
     return 'secondary';

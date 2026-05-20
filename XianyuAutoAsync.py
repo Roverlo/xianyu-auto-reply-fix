@@ -844,7 +844,7 @@ class XianyuLive:
             return False
 
         backoff_reason = failure_backoff.get('reason', 'unknown')
-        if backoff_reason not in {'slider_failed', 'verification_required', 'credentials', 'risk_control'}:
+        if backoff_reason not in {'slider_failed', 'verification_required', 'credentials', 'risk_control', 'server_overload'}:
             return False
 
         remaining_time = failure_backoff.get('remaining_time', 0.0)
@@ -2159,6 +2159,10 @@ class XianyuLive:
         self.hard_risk_backoff_seconds = max(
             300,
             int(RISK_CONTROL.get('hard_risk_backoff_seconds', 7200) or 7200),
+        )
+        self.server_overload_backoff_seconds = max(
+            300,
+            int(RISK_CONTROL.get('server_overload_backoff_seconds', 600) or 600),
         )
         self.last_password_login_backoff_log_time = 0.0
         self.token_refresh_lock = asyncio.Lock()  # 防止多个入口并发刷新 token
@@ -6081,7 +6085,17 @@ class XianyuLive:
             })
             return decision
 
-        hard_keywords = ['被挤爆', '请稍后重试', '稍后再试', '访问过于频繁', '系统繁忙']
+        server_overload_keywords = ['被挤爆', '请稍后重试', '稍后再试', '系统繁忙']
+        if 'RGV587_ERROR' in ret_text and any(keyword in res_text for keyword in server_overload_keywords):
+            decision.update({
+                'risk_category': 'server_overload_rgv587',
+                'reason': 'server_overload_or_rate_limit',
+                'auto_slider_allowed': False,
+                'retry_after_seconds': self.server_overload_backoff_seconds,
+            })
+            return decision
+
+        hard_keywords = ['访问过于频繁', '系统繁忙']
         if any(keyword in res_text for keyword in hard_keywords):
             decision.update({
                 'risk_category': 'hard_risk_block',
@@ -6545,14 +6559,19 @@ class XianyuLive:
 
                     # 检查是否需要进入风控恢复链路；硬风控只退避，不进入自动滑块。
                     if (
-                        risk_decision.get('risk_category') in {'slider_challenge', 'hard_risk_block', 'manual_required'} or
+                        risk_decision.get('risk_category') in {'slider_challenge', 'hard_risk_block', 'manual_required', 'server_overload_rgv587'} or
                         (
                             risk_decision.get('risk_category') == 'unknown_risk' and
                             int(risk_decision.get('retry_after_seconds') or 0) > 0
                         )
                     ):
+                        risk_category = risk_decision.get('risk_category')
                         qr_login_grace = self.get_qr_login_grace(self.cookie_id)
-                        if qr_login_grace and not qr_login_grace.get('captcha_buffer_used'):
+                        if (
+                            qr_login_grace
+                            and not qr_login_grace.get('captcha_buffer_used')
+                            and risk_category != 'server_overload_rgv587'
+                        ):
                             logger.warning(f"【{self.cookie_id}】扫码登录后的首轮Token刷新命中风控，执行一次浏览器侧Cookie稳定化后进入稳定期退避，避免继续挤爆")
                             log_captcha_event(
                                 self.cookie_id,
@@ -6642,13 +6661,16 @@ class XianyuLive:
                             return None
 
                         if not risk_decision.get('auto_slider_allowed') or not allow_auto_slider:
+                            backoff_reason = 'server_overload' if risk_category == 'server_overload_rgv587' else 'risk_control'
                             backoff_state = self._set_hard_risk_backoff(
-                                'risk_control',
+                                backoff_reason,
                                 risk_decision.get('retry_after_seconds') or self.hard_risk_backoff_seconds,
                             )
-                            self.last_token_refresh_status = risk_decision.get('risk_category')
+                            self.last_token_refresh_status = risk_category
                             self.last_token_refresh_error_message = (
-                                f"Token预检命中{risk_decision.get('risk_category')}: {risk_decision.get('reason')}"
+                                "平台服务端限流，稍后自动重试"
+                                if risk_category == 'server_overload_rgv587'
+                                else f"Token预检命中{risk_category}: {risk_decision.get('reason')}"
                             )
                             safe_url = self._redact_url_for_log(risk_decision.get('verification_url'))
                             log_captcha_event(
