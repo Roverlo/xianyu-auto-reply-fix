@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from loguru import logger
 from db_manager import db_manager
 
@@ -106,6 +106,10 @@ class CookieManager:
         finally:
             # 清理实例引用
             self.live_instances.pop(cookie_id, None)
+            current_task = asyncio.current_task()
+            if self.tasks.get(cookie_id) is current_task:
+                self.tasks.pop(cookie_id, None)
+                logger.info(f"【{cookie_id}】已清理结束的任务引用")
             logger.info(f"【{cookie_id}】_run_xianyu方法执行结束")
             # 确保日志被刷新
             try:
@@ -317,14 +321,15 @@ class CookieManager:
         db_manager.save_cookie_status(cookie_id, enabled)
         logger.info(f"更新Cookie状态: {cookie_id} -> {'启用' if enabled else '禁用'}")
 
-        # 如果状态发生变化，需要启动或停止任务
-        if old_status != enabled:
-            if enabled:
-                # 启用账号：启动任务
+        task = self.tasks.get(cookie_id)
+        task_running = bool(task and not task.done())
+
+        # 如果状态发生变化，需要启动或停止任务；若启用状态没变但任务已退出，也要补启动。
+        if enabled:
+            if old_status != enabled or not task_running:
                 self._start_cookie_task(cookie_id)
-            else:
-                # 禁用账号：停止任务
-                self._stop_cookie_task(cookie_id)
+        elif old_status != enabled or task:
+            self._stop_cookie_task(cookie_id)
 
     def get_cookie_status(self, cookie_id: str) -> bool:
         """获取Cookie的启用状态"""
@@ -341,7 +346,11 @@ class CookieManager:
 
     def _start_cookie_task(self, cookie_id: str):
         """启动指定Cookie的任务"""
-        if cookie_id in self.tasks:
+        existing_task = self.tasks.get(cookie_id)
+        if existing_task and existing_task.done():
+            self.tasks.pop(cookie_id, None)
+            logger.info(f"Cookie任务已结束，清理后重新启动: {cookie_id}")
+        elif existing_task:
             logger.warning(f"Cookie任务已存在，跳过启动: {cookie_id}")
             return
 
