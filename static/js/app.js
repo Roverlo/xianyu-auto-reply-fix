@@ -13571,6 +13571,8 @@ function handleQRCodeSuccess(data) {
         cookie_length,
         token_prewarmed,
         task_restarted,
+        server_overload_deferred,
+        retry_after_seconds,
         warning_message
     } = data.account_info;
 
@@ -13589,7 +13591,17 @@ function handleQRCodeSuccess(data) {
 
     // 添加真实cookie获取状态信息
     if (real_cookie_refreshed === true) {
-        if (task_restarted === false) {
+        if (server_overload_deferred === true) {
+            successMessage += '\n✅ 真实Cookie获取并保存成功';
+            if (retry_after_seconds) {
+                successMessage += `\n预计 ${retry_after_seconds} 秒后自动重试 Token 初始化`;
+            }
+            if (warning_message) {
+                successMessage += `\n⚠️ ${warning_message}`;
+            }
+            document.getElementById('statusText').textContent = '登录完成，平台限流中，稍后自动重试';
+            showToast(successMessage, 'warning');
+        } else if (task_restarted === false) {
             successMessage += '\n✅ 真实Cookie已获取';
             if (warning_message) {
                 successMessage += `\n⚠️ ${warning_message}`;

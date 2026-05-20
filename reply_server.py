@@ -6089,11 +6089,31 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     qr_login_grace_minutes = max(5, int(RISK_CONTROL.get('qr_login_grace_minutes', 15) or 15))
                     qr_login_grace_until = int(time.time() + (qr_login_grace_minutes * 60))
                     task_restarted = False
+                    task_deferred_for_server_overload = False
+                    server_overload_backoff_remaining = 0
                     warning_message = None
                     final_cookies = temp_instance.cookies_str or real_cookies
 
                     try:
-                        if cookie_manager.manager:
+                        active_login_backoff = XianyuLive.get_password_login_failure_backoff(account_id)
+                        if active_login_backoff and active_login_backoff.get('reason') == 'server_overload':
+                            server_overload_backoff_remaining = max(
+                                0,
+                                int((active_login_backoff.get('until') or 0) - time.time())
+                            )
+
+                        if server_overload_backoff_remaining > 0:
+                            task_deferred_for_server_overload = True
+                            db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
+                            XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready_deferred_for_server_overload', grace_until=qr_login_grace_until)
+                            if cookie_manager.manager:
+                                cookie_manager.manager.cookies[account_id] = final_cookies
+                            warning_message = (
+                                "真实Cookie已获取并保存；当前仍处于平台Token接口限流退避，"
+                                f"保留原退避并等待约 {server_overload_backoff_remaining} 秒后自动重试，避免扫码后立即再次打到限流"
+                            )
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                        elif cookie_manager.manager:
                             if is_new_account:
                                 cookie_manager.manager.add_cookie(account_id, final_cookies, user_id=user_id)
                                 log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
@@ -6120,7 +6140,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         warning_message = f"真实Cookie已获取，但切换账号任务失败: {str(task_switch_e)}"
                         log_with_user('warning', f"{warning_message}: {account_id}", current_user)
 
-                    if not task_restarted:
+                    if not task_restarted and not task_deferred_for_server_overload:
                         db_manager.set_cookie_qr_login_grace_until(account_id, 0)
                         XianyuLive.clear_qr_login_grace(account_id)
                         if not warning_message:
@@ -6156,6 +6176,24 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                                         'token_prewarmed': False,
                                     })
                                 )
+                            elif task_deferred_for_server_overload:
+                                db_manager.update_risk_control_log(
+                                    log_id=risk_log_id,
+                                    processing_status='success',
+                                    processing_result='扫码登录真实Cookie获取成功；平台Token接口仍在限流，已保存Cookie并保留原退避',
+                                    session_id=risk_session_id,
+                                    trigger_scene='qr_login',
+                                    result_code='qr_cookie_refresh_deferred_server_overload',
+                                    duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                                    event_meta=_build_risk_event_meta({
+                                        'account_id': account_id,
+                                        'is_new_account': is_new_account,
+                                        'task_restarted': task_restarted,
+                                        'server_overload_deferred': True,
+                                        'retry_after_seconds': server_overload_backoff_remaining,
+                                        'token_prewarmed': False,
+                                    })
+                                )
                             else:
                                 db_manager.update_risk_control_log(
                                     log_id=risk_log_id,
@@ -6179,10 +6217,12 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     return {
                         'account_id': account_id,
                         'is_new_account': is_new_account,
-                        'real_cookie_refreshed': task_restarted,  # 回滚时为 False，成功切换时为 True
+                        'real_cookie_refreshed': task_restarted or task_deferred_for_server_overload,
                         'cookie_length': len(final_cookies),
                         'token_prewarmed': False,
                         'task_restarted': task_restarted,
+                        'server_overload_deferred': task_deferred_for_server_overload,
+                        'retry_after_seconds': server_overload_backoff_remaining,
                         'warning_message': warning_message
                     }
                 else:
