@@ -78,7 +78,7 @@ RISK_CONTROL:
   slider_failure_backoff_seconds: 1800
   slider_consecutive_failure_threshold: 2
   slider_consecutive_pause_seconds: 7200
-  hard_risk_backoff_seconds: 7200
+  hard_risk_backoff_seconds: 1800
   token_refresh_dedup_window_seconds: 60
   token_retry_min_wait_seconds: 180
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
