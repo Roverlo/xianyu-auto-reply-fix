@@ -75,6 +75,10 @@ RISK_CONTROL:
   qr_login_grace_minutes: 15
   post_slider_retry_delay_max: 10.0
   post_slider_retry_delay_min: 5.0
+  slider_failure_backoff_seconds: 1800
+  slider_consecutive_failure_threshold: 2
+  slider_consecutive_pause_seconds: 7200
+  hard_risk_backoff_seconds: 7200
   token_refresh_dedup_window_seconds: 60
   token_retry_min_wait_seconds: 180
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时

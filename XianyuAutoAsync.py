@@ -1186,6 +1186,70 @@ class XianyuLive:
             logger.debug(f"【{self.cookie_id}】解析验证链接失败: {self._safe_str(e)}")
             return {'verification_source': text[:120]}
 
+    @staticmethod
+    def _redact_url_for_log(url: str) -> str:
+        text = str(url or '').strip()
+        if not text:
+            return ''
+        try:
+            parsed = urlparse(text)
+            if not parsed.scheme and not parsed.netloc:
+                return text[:160]
+            query = parse_qs(parsed.query or '')
+            safe_query_parts = []
+            for key, values in query.items():
+                value = values[0] if values else ''
+                if key.lower() in {'x5secdata', 'x5sec', 'token', 'smToken'.lower()}:
+                    digest = hashlib.sha256(str(value).encode('utf-8')).hexdigest()[:12] if value else ''
+                    safe_query_parts.append(f"{key}=<redacted,len={len(str(value))},sha={digest}>")
+                else:
+                    safe_query_parts.append(f"{key}={str(value)[:80]}")
+            query_suffix = f"?{'&'.join(safe_query_parts)}" if safe_query_parts else ''
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}{query_suffix}"
+        except Exception:
+            return text[:160]
+
+    @staticmethod
+    def _extract_x5secdata_target(value: str) -> Optional[str]:
+        text = str(value or '')
+        if not text:
+            return None
+        marker = '__bx__'
+        if marker in text:
+            target = text.split(marker, 1)[1].strip()
+            return target or None
+        return None
+
+    @classmethod
+    def _is_token_x5secdata(cls, value: str) -> bool:
+        target = cls._extract_x5secdata_target(value) or ''
+        target_lower = target.lower()
+        return (
+            'h5api.m.goofish.com' in target_lower and
+            'mtop.taobao.idlemessage.pc.login.token' in target_lower
+        )
+
+    def _summarize_x5_cookie_dict(self, cookies_dict: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        cookies = cookies_dict or {}
+        summary: Dict[str, Any] = {}
+        for key in ('x5sec', 'x5secdata', 'x5sectag'):
+            value = cookies.get(key)
+            if not value:
+                summary[key] = {'present': False}
+                continue
+            value_text = str(value)
+            item = {
+                'present': True,
+                'length': len(value_text),
+                'hash': hashlib.sha256(value_text.encode('utf-8')).hexdigest()[:12],
+            }
+            if key == 'x5secdata':
+                target = self._extract_x5secdata_target(value_text)
+                item['target_api'] = target
+                item['is_token_target'] = self._is_token_x5secdata(value_text)
+            summary[key] = item
+        return summary
+
     def _build_risk_event_meta(self, trigger_scene: str = None, verification_url: str = None, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         payload: Dict[str, Any] = {}
         if trigger_scene:
@@ -2044,10 +2108,28 @@ class XianyuLive:
         self.max_captcha_verification_count = 3  # 最大滑块验证次数，防止无限递归
         self.last_slider_success_at = 0.0
         self.last_slider_success_cookie_length = 0
+        self.last_slider_page_state = None
+        self.last_slider_feedback = {}
         self.slider_success_reentry_window = 30
         self.post_slider_token_retry_delay = (
             float(RISK_CONTROL.get('post_slider_retry_delay_min', 5.0) or 5.0),
             float(RISK_CONTROL.get('post_slider_retry_delay_max', 10.0) or 10.0),
+        )
+        self.slider_failure_backoff_seconds = max(
+            60,
+            int(RISK_CONTROL.get('slider_failure_backoff_seconds', 1800) or 1800),
+        )
+        self.slider_consecutive_failure_threshold = max(
+            1,
+            int(RISK_CONTROL.get('slider_consecutive_failure_threshold', 2) or 2),
+        )
+        self.slider_consecutive_pause_seconds = max(
+            self.slider_failure_backoff_seconds,
+            int(RISK_CONTROL.get('slider_consecutive_pause_seconds', 7200) or 7200),
+        )
+        self.hard_risk_backoff_seconds = max(
+            300,
+            int(RISK_CONTROL.get('hard_risk_backoff_seconds', 7200) or 7200),
         )
         self.last_password_login_backoff_log_time = 0.0
         self.token_refresh_lock = asyncio.Lock()  # 防止多个入口并发刷新 token
@@ -5739,6 +5821,7 @@ class XianyuLive:
         """保护性合并 Cookie，避免不完整快照覆盖关键会话字段。"""
         existing = dict(existing_cookies_dict or {})
         incoming = dict(incoming_cookies_dict or {})
+        challenge_scoped_fields = {'x5sec', 'x5secdata', 'x5sectag'}
         existing_count = len(existing)
         incoming_count = len(incoming)
         existing_unb = str(existing.get('unb') or '').strip()
@@ -5751,6 +5834,9 @@ class XianyuLive:
             merged = existing.copy()
             for key, value in incoming.items():
                 merged[key] = value
+            for key in challenge_scoped_fields:
+                if key in existing and key not in incoming:
+                    merged.pop(key, None)
 
         updated_fields = []
         changed_fields = []
@@ -5770,11 +5856,11 @@ class XianyuLive:
             preserved_fields = []
             preserved_protected_fields = []
         else:
-            removed_fields = []
-            preserved_fields = list(would_remove_fields)
+            removed_fields = [key for key in would_remove_fields if key in challenge_scoped_fields]
+            preserved_fields = [key for key in would_remove_fields if key not in removed_fields]
             preserved_protected_fields = [
                 key for key in would_remove_fields
-                if key in PROTECTED_SESSION_COOKIE_FIELDS and existing.get(key)
+                if key in PROTECTED_SESSION_COOKIE_FIELDS and existing.get(key) and key not in removed_fields
             ]
 
         missing_protected_fields = [
@@ -5907,6 +5993,187 @@ class XianyuLive:
             return False
         window = window_seconds or self.slider_success_reentry_window
         return (time.time() - self.last_slider_success_at) <= window
+
+    def _classify_token_risk_response(self, res_json: dict) -> Dict[str, Any]:
+        decision = {
+            'risk_category': 'unknown_risk',
+            'verification_url': None,
+            'target_api': None,
+            'reason': 'unclassified',
+            'auto_slider_allowed': False,
+            'retry_after_seconds': 0,
+        }
+        if not isinstance(res_json, dict):
+            decision['reason'] = 'response_not_dict'
+            return decision
+
+        ret_value = res_json.get('ret') or []
+        ret_text = '|'.join(str(ret) for ret in ret_value)
+        data = res_json.get('data') if isinstance(res_json.get('data'), dict) else {}
+        verification_url = data.get('url') if isinstance(data, dict) else None
+        decision['verification_url'] = verification_url
+
+        if verification_url:
+            try:
+                parsed = urlparse(verification_url)
+                query = parse_qs(parsed.query or '')
+                x5secdata = query.get('x5secdata', [''])[0]
+                decision['target_api'] = self._extract_x5secdata_target(x5secdata)
+            except Exception:
+                decision['target_api'] = None
+
+        res_text = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
+        if 'SUCCESS::调用成功' in ret_text:
+            decision.update({
+                'risk_category': 'token_ok',
+                'reason': 'token_success',
+                'auto_slider_allowed': False,
+            })
+            return decision
+
+        if '令牌过期' in res_text or 'Session过期' in res_text:
+            decision.update({
+                'risk_category': 'session_expired',
+                'reason': 'session_or_token_expired',
+                'auto_slider_allowed': False,
+            })
+            return decision
+
+        manual_keywords = [
+            '二维码', '扫码', '人脸', '身份验证', '短信验证', '设备验证',
+            '账号异常', '账号存在风险', '安全验证',
+        ]
+        if any(keyword in res_text for keyword in manual_keywords):
+            decision.update({
+                'risk_category': 'manual_required',
+                'reason': 'manual_verification_keyword',
+                'auto_slider_allowed': False,
+                'retry_after_seconds': self.hard_risk_backoff_seconds,
+            })
+            return decision
+
+        hard_keywords = ['被挤爆', '请稍后重试', '稍后再试', '访问过于频繁', '系统繁忙']
+        if any(keyword in res_text for keyword in hard_keywords):
+            decision.update({
+                'risk_category': 'hard_risk_block',
+                'reason': 'hard_risk_or_rate_limit_keyword',
+                'auto_slider_allowed': False,
+                'retry_after_seconds': self.hard_risk_backoff_seconds,
+            })
+            return decision
+
+        has_validate_ret = any(keyword in ret_text for keyword in ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR'])
+        has_captcha_url = bool(
+            verification_url and
+            ('punish' in verification_url or 'captcha' in verification_url or 'validate' in verification_url)
+        )
+        has_captcha_action = bool(verification_url and 'action=captcha' in verification_url)
+        if has_validate_ret and has_captcha_url and has_captcha_action:
+            decision.update({
+                'risk_category': 'slider_challenge',
+                'reason': 'validate_ret_with_captcha_url',
+                'auto_slider_allowed': True,
+                'retry_after_seconds': self.slider_failure_backoff_seconds,
+            })
+            return decision
+
+        if has_validate_ret or has_captcha_url:
+            decision.update({
+                'risk_category': 'unknown_risk',
+                'reason': 'risk_response_without_confirmed_slider',
+                'auto_slider_allowed': False,
+                'retry_after_seconds': self.hard_risk_backoff_seconds,
+            })
+            return decision
+
+        decision.update({
+            'risk_category': 'unknown_risk',
+            'reason': 'token_failed_without_known_pattern',
+            'auto_slider_allowed': False,
+            'retry_after_seconds': 0,
+        })
+        return decision
+
+    def _log_token_risk_decision(self, decision: Dict[str, Any], res_json: dict):
+        safe_url = self._redact_url_for_log(decision.get('verification_url'))
+        ret_value = res_json.get('ret', []) if isinstance(res_json, dict) else []
+        log_captcha_event(
+            self.cookie_id,
+            "Token风控分类",
+            None,
+            (
+                f"risk_category={decision.get('risk_category')}, "
+                f"reason={decision.get('reason')}, "
+                f"auto_slider_allowed={decision.get('auto_slider_allowed')}, "
+                f"retry_after_seconds={decision.get('retry_after_seconds')}, "
+                f"target_api={decision.get('target_api')}, "
+                f"url={safe_url}, ret={ret_value}"
+            ),
+        )
+
+    def _set_slider_failure_backoff(self, reason: str = 'slider_failed') -> Dict[str, Any]:
+        base_seconds = self.slider_failure_backoff_seconds
+        previous = XianyuLive.get_password_login_failure_backoff(self.cookie_id) or {}
+        previous_reason = previous.get('reason')
+        previous_count = int(previous.get('consecutive_count', 0) or 0)
+        projected_count = previous_count + 1 if previous_reason == reason else 1
+        if projected_count >= self.slider_consecutive_failure_threshold:
+            base_seconds = self.slider_consecutive_pause_seconds
+        XianyuLive.set_password_login_failure_backoff(self.cookie_id, reason, base_seconds)
+        return XianyuLive.get_password_login_failure_backoff(self.cookie_id) or {}
+
+    def _set_hard_risk_backoff(self, reason: str = 'risk_control', seconds: Optional[int] = None) -> Dict[str, Any]:
+        backoff_seconds = max(300, int(seconds or self.hard_risk_backoff_seconds))
+        XianyuLive.set_password_login_failure_backoff(self.cookie_id, reason, backoff_seconds)
+        return XianyuLive.get_password_login_failure_backoff(self.cookie_id) or {}
+
+    async def _preflight_token_with_candidate_cookies(
+        self,
+        candidate_cookies_str: str,
+        captcha_retry_count: int,
+        manual_refresh_browser_stabilization_used: bool,
+    ) -> Optional[str]:
+        old_cookies_str = self.cookies_str
+        old_cookies_dict = dict(self.cookies or {})
+        preflight_token = None
+        try:
+            self._set_runtime_cookie_state(
+                cookies_str=candidate_cookies_str,
+                source="slider_token_preflight_candidate",
+            )
+            preflight_token = await self._refresh_token_impl(
+                captcha_retry_count,
+                post_slider_session_grace_used=False,
+                allow_password_login_recovery=False,
+                manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
+                post_slider_session_retry_count=0,
+                allow_auto_slider=False,
+            )
+            return preflight_token
+        finally:
+            if not preflight_token:
+                self._set_runtime_cookie_state(
+                    cookies_str=old_cookies_str,
+                    cookies_dict=old_cookies_dict,
+                    source="slider_token_preflight_rollback",
+                )
+
+    def _normalize_slider_page_state(self, success: bool, cookies: Optional[Dict[str, Any]], feedback: Optional[Dict[str, Any]]) -> str:
+        feedback = feedback or {}
+        status = str(feedback.get('status') or '').strip()
+        source = str(feedback.get('source') or '').strip()
+        message = str(feedback.get('message') or '')
+        if status == 'hard_block':
+            return 'hard_block'
+        if 'qr' in source.lower() or '二维码' in message or '身份验证' in message:
+            return 'qr_or_manual'
+        if source == 'slider_missing' or status == 'page_state_changed':
+            return 'slider_missing'
+        if success and cookies:
+            return 'slider_present'
+        if status == 'success':
+            return 'slider_present'
+        return status or source or 'unknown'
 
     async def preflight_token_after_manual_refresh(self) -> str:
         """手动刷新成功后的 token 预检，确认新实例可直接完成初始化。
@@ -6065,7 +6332,8 @@ class XianyuLive:
     async def _refresh_token_impl(self, captcha_retry_count: int = 0, post_slider_session_grace_used: bool = False,
                                   allow_password_login_recovery: bool = True,
                                   manual_refresh_browser_stabilization_used: bool = False,
-                                  post_slider_session_retry_count: int = 0):
+                                  post_slider_session_retry_count: int = 0,
+                                  allow_auto_slider: bool = True):
         """刷新token
 
         Args:
@@ -6239,8 +6507,21 @@ class XianyuLive:
                                     )
                                 return new_token
 
-                    # 检查是否需要滑块验证
-                    if self._need_captcha_verification(res_json):
+                    risk_decision = self._classify_token_risk_response(res_json)
+                    if (
+                        risk_decision.get('risk_category') != 'unknown_risk' or
+                        risk_decision.get('verification_url')
+                    ):
+                        self._log_token_risk_decision(risk_decision, res_json)
+
+                    # 检查是否需要进入风控恢复链路；硬风控只退避，不进入自动滑块。
+                    if (
+                        risk_decision.get('risk_category') in {'slider_challenge', 'hard_risk_block', 'manual_required'} or
+                        (
+                            risk_decision.get('risk_category') == 'unknown_risk' and
+                            int(risk_decision.get('retry_after_seconds') or 0) > 0
+                        )
+                    ):
                         qr_login_grace = self.get_qr_login_grace(self.cookie_id)
                         if qr_login_grace and not qr_login_grace.get('captcha_buffer_used'):
                             logger.warning(f"【{self.cookie_id}】扫码登录后的首轮Token刷新命中风控，执行一次浏览器侧Cookie稳定化后进入稳定期退避，避免继续挤爆")
@@ -6248,7 +6529,7 @@ class XianyuLive:
                                 self.cookie_id,
                                 "扫码登录首轮Token刷新命中风控，执行浏览器侧稳定化后退避",
                                 None,
-                                f"触发场景: Token刷新, ret={res_json.get('ret', [])}"
+                                f"触发场景: Token刷新, risk_category={risk_decision.get('risk_category')}, ret={res_json.get('ret', [])}"
                             )
                             self.update_qr_login_grace(
                                 self.cookie_id,
@@ -6285,7 +6566,7 @@ class XianyuLive:
                                 self.cookie_id,
                                 "手动刷新交接阶段首轮Token预检命中风控，先执行浏览器侧稳定化",
                                 None,
-                                f"触发场景: Token刷新, ret={res_json.get('ret', [])}"
+                                f"触发场景: Token刷新, risk_category={risk_decision.get('risk_category')}, ret={res_json.get('ret', [])}"
                             )
                             before_x5_snapshot = self._build_x5_cookie_snapshot(cookie_string=transient_recovery_cookies_str)
                             self._log_x5_cookie_snapshot("手动刷新交接稳定化前的x5票据", cookie_string=transient_recovery_cookies_str)
@@ -6314,6 +6595,7 @@ class XianyuLive:
                                     allow_password_login_recovery=allow_password_login_recovery,
                                     manual_refresh_browser_stabilization_used=True,
                                     post_slider_session_retry_count=post_slider_session_retry_count,
+                                    allow_auto_slider=allow_auto_slider,
                                 )
                             logger.warning(f"【{self.cookie_id}】手动刷新交接阶段浏览器稳定化失败，继续进入滑块验证")
 
@@ -6330,17 +6612,78 @@ class XianyuLive:
                             notification_sent = True
                             return None
 
-                        logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
+                        if not risk_decision.get('auto_slider_allowed') or not allow_auto_slider:
+                            backoff_state = self._set_hard_risk_backoff(
+                                'risk_control',
+                                risk_decision.get('retry_after_seconds') or self.hard_risk_backoff_seconds,
+                            )
+                            self.last_token_refresh_status = risk_decision.get('risk_category')
+                            self.last_token_refresh_error_message = (
+                                f"Token预检命中{risk_decision.get('risk_category')}: {risk_decision.get('reason')}"
+                            )
+                            safe_url = self._redact_url_for_log(risk_decision.get('verification_url'))
+                            log_captcha_event(
+                                self.cookie_id,
+                                "Token风控未进入自动滑块",
+                                False,
+                                (
+                                    f"risk_category={risk_decision.get('risk_category')}, "
+                                    f"reason={risk_decision.get('reason')}, "
+                                    f"backoff_seconds={backoff_state.get('seconds')}, "
+                                    f"target_api={risk_decision.get('target_api')}, url={safe_url}"
+                                ),
+                            )
+                            risk_log_id = self._create_risk_log(
+                                event_type='token_risk_control',
+                                session_id=self._new_risk_session_id('risk'),
+                                trigger_scene='token_refresh',
+                                result_code=risk_decision.get('risk_category'),
+                                event_description='Token预检命中不可自动滑块风控',
+                                processing_status='failed',
+                                error_message=self.last_token_refresh_error_message[:200],
+                                event_meta=self._build_risk_event_meta(
+                                    trigger_scene='token_refresh',
+                                    verification_url=risk_decision.get('verification_url'),
+                                    extra={
+                                        'cookie_id': self.cookie_id,
+                                        'risk_category': risk_decision.get('risk_category'),
+                                        'reason': risk_decision.get('reason'),
+                                        'target_api': risk_decision.get('target_api'),
+                                        'auto_slider_allowed': bool(risk_decision.get('auto_slider_allowed')),
+                                        'backoff_seconds': backoff_state.get('seconds'),
+                                    },
+                                ),
+                            )
+                            if risk_log_id:
+                                logger.info(f"【{self.cookie_id}】不可自动滑块风控已记录，ID: {risk_log_id}")
+                            notification_sent = True
+                            return None
+
+                        logger.warning(f"【{self.cookie_id}】检测到真实滑块候选，开始两阶段处理...")
 
                         # 记录滑块验证检测到日志文件
-                        verification_url = res_json.get('data', {}).get('url', 'Token刷新时检测')
-                        log_captcha_event(self.cookie_id, "检测到滑块验证", None, f"触发场景: Token刷新, URL: {verification_url}")
+                        verification_url = risk_decision.get('verification_url') or res_json.get('data', {}).get('url', 'Token刷新时检测')
+                        safe_verification_url = self._redact_url_for_log(verification_url)
+                        log_captcha_event(
+                            self.cookie_id,
+                            "检测到滑块验证",
+                            None,
+                            (
+                                f"触发场景: Token刷新, risk_category={risk_decision.get('risk_category')}, "
+                                f"target_api={risk_decision.get('target_api')}, URL: {safe_verification_url}"
+                            ),
+                        )
                         captcha_trigger_scene = 'token_refresh'
                         captcha_session_id = self._new_risk_session_id('slider')
                         captcha_event_meta = self._build_risk_event_meta(
                             trigger_scene=captcha_trigger_scene,
                             verification_url=verification_url,
-                            extra={'cookie_id': self.cookie_id}
+                            extra={
+                                'cookie_id': self.cookie_id,
+                                'risk_category': risk_decision.get('risk_category'),
+                                'target_api': risk_decision.get('target_api'),
+                                'auto_slider_allowed': True,
+                            }
                         )
 
                         # 添加风控日志记录
@@ -6351,7 +6694,7 @@ class XianyuLive:
                                 session_id=captcha_session_id,
                                 trigger_scene=captcha_trigger_scene,
                                 result_code='slider_captcha_detected',
-                                event_description='检测到滑块验证（Token刷新）',
+                                event_description='检测到滑块验证候选（Token刷新）',
                                 processing_status='processing',
                                 event_meta=captcha_event_meta,
                             )
@@ -6363,62 +6706,131 @@ class XianyuLive:
                         try:
                             # 尝试通过滑块验证获取新的cookies
                             captcha_start_time = time.time()
-                            new_cookies_str = await self._handle_captcha_verification(res_json)
+                            new_cookies_str = await self._handle_captcha_verification(
+                                res_json,
+                                initial_cookies_str=transient_recovery_cookies_str,
+                            )
                             captcha_duration = time.time() - captcha_start_time
+                            page_state = self.last_slider_page_state or 'unknown'
+                            slider_feedback = dict(self.last_slider_feedback or {})
 
                             if new_cookies_str:
-                                logger.info(f"【{self.cookie_id}】滑块验证成功，准备重启实例...")
+                                logger.info(f"【{self.cookie_id}】滑块挑战已获取候选Cookie，开始目标Token预检...")
 
-                                # 更新风控日志为成功状态
+                                # 先记录挑战cookie获取成功，但不把它当作最终登录恢复成功。
                                 if 'log_id' in locals() and log_id:
                                     self._update_risk_log(
                                         log_id,
                                         session_id=captcha_session_id,
                                         trigger_scene=captcha_trigger_scene,
-                                        result_code='slider_captcha_success',
-                                        processing_result='滑块验证成功，已获取新Cookie',
-                                        processing_status='success',
+                                        result_code='challenge_cookie_obtained',
+                                        processing_result='滑块挑战已获取候选Cookie，等待Token预检',
+                                        processing_status='processing',
                                         duration_ms=max(0, int(captcha_duration * 1000)),
                                         event_meta=self._build_risk_event_meta(
                                             trigger_scene=captcha_trigger_scene,
                                             verification_url=verification_url,
                                             extra={
                                                 'cookie_id': self.cookie_id,
+                                                'risk_category': risk_decision.get('risk_category'),
+                                                'page_state': page_state,
+                                                'target_api': risk_decision.get('target_api'),
                                                 'cookie_length': len(new_cookies_str),
+                                                'x5_summary': self._summarize_x5_cookie_dict(trans_cookies(new_cookies_str)),
+                                                'token_preflight_result': 'pending',
                                             },
                                         ),
                                     )
 
-                                # 重启实例（cookies已在_handle_captcha_verification中更新到数据库）
-                                # await self._restart_instance()
-
                                 # 给浏览器回写票据与数据库落盘留一个稳定窗口，避免刚过块就立即重新命中Session过期
                                 settle_delay = random.uniform(*self.post_slider_token_retry_delay)
                                 logger.info(
-                                    f"【{self.cookie_id}】滑块成功后进入稳定窗口 {settle_delay:.2f}s，再重新尝试Token刷新"
+                                    f"【{self.cookie_id}】滑块候选Cookie进入稳定窗口 {settle_delay:.2f}s，再执行Token预检"
                                 )
                                 await asyncio.sleep(settle_delay)
-                                self._reload_latest_cookies_from_db("滑块成功后的稳定窗口")
                                 log_captcha_event(
                                     self.cookie_id,
-                                    "滑块成功后重新进入Token刷新",
+                                    "滑块候选Cookie后执行Token预检",
                                     None,
-                                    f"类型: token_reentry_after_slider_success, captcha_retry_count={captcha_retry_count + 1}"
+                                    f"类型: token_preflight_after_challenge_cookie, page_state={page_state}, captcha_retry_count={captcha_retry_count + 1}"
                                 )
 
-                                # 重新尝试刷新token（递归调用，但有深度限制）
-                                return await self._refresh_token_impl(
+                                token = await self._preflight_token_with_candidate_cookies(
+                                    new_cookies_str,
                                     captcha_retry_count + 1,
-                                    post_slider_session_grace_used=False,
-                                    allow_password_login_recovery=allow_password_login_recovery,
-                                    manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
-                                    post_slider_session_retry_count=0,
+                                    manual_refresh_browser_stabilization_used,
                                 )
+                                if token:
+                                    await self.update_config_cookies()
+                                    self._mark_slider_success_recovery(self.cookies_str)
+                                    self._mark_pending_slider_success_notice("token_refresh")
+                                    XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
+                                    if 'log_id' in locals() and log_id:
+                                        self._update_risk_log(
+                                            log_id,
+                                            session_id=captcha_session_id,
+                                            trigger_scene=captcha_trigger_scene,
+                                            result_code='slider_captcha_success',
+                                            processing_result='滑块候选Cookie通过目标Token预检，登录会话已恢复',
+                                            processing_status='success',
+                                            duration_ms=max(0, int((time.time() - captcha_start_time) * 1000)),
+                                            event_meta=self._build_risk_event_meta(
+                                                trigger_scene=captcha_trigger_scene,
+                                                verification_url=verification_url,
+                                                extra={
+                                                    'cookie_id': self.cookie_id,
+                                                    'risk_category': risk_decision.get('risk_category'),
+                                                    'page_state': page_state,
+                                                    'target_api': risk_decision.get('target_api'),
+                                                    'cookie_length': len(self.cookies_str or ''),
+                                                    'x5_summary': self._summarize_x5_cookie_dict(self.cookies),
+                                                    'token_preflight_result': 'success',
+                                                },
+                                            ),
+                                        )
+                                    logger.info(f"【{self.cookie_id}】滑块后Token预检成功，Cookie已落库")
+                                    return token
+
+                                if self.last_token_refresh_status in {'hard_risk_block', 'manual_required', 'unknown_risk'}:
+                                    backoff_state = self._set_hard_risk_backoff('risk_control', self.hard_risk_backoff_seconds)
+                                else:
+                                    backoff_state = self._set_slider_failure_backoff('slider_failed')
+                                self.last_token_refresh_status = "slider_token_preflight_failed"
+                                self.last_token_refresh_error_message = "滑块候选Cookie未通过目标Token预检"
+                                if 'log_id' in locals() and log_id:
+                                    self._update_risk_log(
+                                        log_id,
+                                        session_id=captcha_session_id,
+                                        trigger_scene=captcha_trigger_scene,
+                                        result_code='slider_token_preflight_failed',
+                                        processing_result='滑块候选Cookie未通过目标Token预检',
+                                        processing_status='failed',
+                                        error_message=self.last_token_refresh_error_message,
+                                        duration_ms=max(0, int((time.time() - captcha_start_time) * 1000)),
+                                        event_meta=self._build_risk_event_meta(
+                                            trigger_scene=captcha_trigger_scene,
+                                            verification_url=verification_url,
+                                            extra={
+                                                'cookie_id': self.cookie_id,
+                                                'risk_category': risk_decision.get('risk_category'),
+                                                'page_state': page_state,
+                                                'target_api': risk_decision.get('target_api'),
+                                                'x5_summary': self._summarize_x5_cookie_dict(trans_cookies(new_cookies_str)),
+                                                'token_preflight_result': self.last_token_refresh_status,
+                                                'backoff_seconds': backoff_state.get('seconds'),
+                                            },
+                                        ),
+                                    )
+                                notification_sent = True
+                                return None
                             else:
                                 logger.error(f"【{self.cookie_id}】滑块验证失败")
-                                XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'slider_failed', 600)
+                                backoff_state = self._set_slider_failure_backoff('slider_failed')
                                 self.last_token_refresh_error_message = "滑块验证失败，未获取到新Cookie"
-                                logger.warning(f"【{self.cookie_id}】已进入滑块失败退避期: slider_failed, 600秒")
+                                logger.warning(
+                                    f"【{self.cookie_id}】已进入滑块失败退避期: slider_failed, "
+                                    f"{backoff_state.get('seconds')}秒, consecutive={backoff_state.get('consecutive_count')}"
+                                )
 
                                 # 更新风控日志为失败状态
                                 if 'log_id' in locals() and log_id:
@@ -6434,7 +6846,15 @@ class XianyuLive:
                                         event_meta=self._build_risk_event_meta(
                                             trigger_scene=captcha_trigger_scene,
                                             verification_url=verification_url,
-                                            extra={'cookie_id': self.cookie_id},
+                                            extra={
+                                                'cookie_id': self.cookie_id,
+                                                'risk_category': risk_decision.get('risk_category'),
+                                                'page_state': page_state,
+                                                'slider_feedback': slider_feedback,
+                                                'target_api': risk_decision.get('target_api'),
+                                                'backoff_seconds': backoff_state.get('seconds'),
+                                                'consecutive_count': backoff_state.get('consecutive_count'),
+                                            },
                                         ),
                                     )
                                 
@@ -6443,9 +6863,12 @@ class XianyuLive:
                         except Exception as captcha_e:
                             logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
                             self._clear_pending_slider_success_notice("滑块验证处理异常")
-                            XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'slider_failed', 600)
+                            backoff_state = self._set_slider_failure_backoff('slider_failed')
                             self.last_token_refresh_error_message = self._safe_str(captcha_e)
-                            logger.warning(f"【{self.cookie_id}】滑块验证异常后进入退避期: slider_failed, 600秒")
+                            logger.warning(
+                                f"【{self.cookie_id}】滑块验证异常后进入退避期: slider_failed, "
+                                f"{backoff_state.get('seconds')}秒"
+                            )
 
                             # 更新风控日志为异常状态
                             captcha_duration = time.time() - captcha_start_time if 'captcha_start_time' in locals() else 0
@@ -6462,7 +6885,13 @@ class XianyuLive:
                                     event_meta=self._build_risk_event_meta(
                                         trigger_scene=captcha_trigger_scene,
                                         verification_url=verification_url,
-                                        extra={'cookie_id': self.cookie_id},
+                                        extra={
+                                            'cookie_id': self.cookie_id,
+                                            'risk_category': risk_decision.get('risk_category'),
+                                            'page_state': self.last_slider_page_state,
+                                            'target_api': risk_decision.get('target_api'),
+                                            'backoff_seconds': backoff_state.get('seconds'),
+                                        },
                                     ),
                                 )
                             
@@ -6547,6 +6976,7 @@ class XianyuLive:
                                     allow_password_login_recovery=allow_password_login_recovery,
                                     manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
                                     post_slider_session_retry_count=post_slider_session_retry_count,
+                                    allow_auto_slider=allow_auto_slider,
                                 )
 
                             if (
@@ -6579,6 +7009,7 @@ class XianyuLive:
                                     allow_password_login_recovery=allow_password_login_recovery,
                                     manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
                                     post_slider_session_retry_count=settle_retry_attempt,
+                                    allow_auto_slider=allow_auto_slider,
                                 )
 
                             refresh_success = False
@@ -6617,6 +7048,11 @@ class XianyuLive:
                             if not refresh_success:
                                 if allow_password_login_recovery and not self._is_account_pause_status(self.last_token_refresh_status):
                                     self.last_token_refresh_status = "token_expired_recovery_failed"
+                                    backoff_state = self._set_hard_risk_backoff('risk_control', self.hard_risk_backoff_seconds)
+                                    logger.warning(
+                                        f"【{self.cookie_id}】Session恢复失败，进入认证恢复退避: "
+                                        f"{backoff_state.get('seconds')}秒"
+                                    )
                                 self._clear_pending_slider_success_notice("恢复流程失败")
                                 # 标记已发送通知，避免重复通知
                                 notification_sent = True
@@ -6627,9 +7063,10 @@ class XianyuLive:
                                 return await self._refresh_token_impl(
                                     captcha_retry_count,
                                     post_slider_session_grace_used=False,
-                                    allow_password_login_recovery=allow_password_login_recovery,
+                                    allow_password_login_recovery=False,
                                     manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
                                     post_slider_session_retry_count=0,
+                                    allow_auto_slider=allow_auto_slider,
                                 )
                                 
                                 # 刷新失败时继续执行原有的失败处理逻辑
@@ -6696,54 +7133,28 @@ class XianyuLive:
             if not isinstance(res_json, dict):
                 return False
 
-            # 记录res_json内容到日志文件
-            import json
-            res_json_str = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
-            log_captcha_event(self.cookie_id, "检查滑块验证响应", None, f"res_json内容: {res_json_str}")
-
-            # 检查返回的错误信息
-            ret_value = res_json.get('ret', [])
-            if not ret_value:
-                return False
-
-            # 检查是否包含需要验证的关键词
-            captcha_keywords = [
-                'FAIL_SYS_USER_VALIDATE',  # 用户验证失败
-                'RGV587_ERROR',            # 风控错误
-                '哎哟喂,被挤爆啦',          # 被挤爆了
-                '哎哟喂，被挤爆啦',         # 被挤爆了（中文逗号）
-                '挤爆了',                  # 挤爆了
-                '请稍后重试',              # 请稍后重试
-                'punish?x5secdata',        # 惩罚页面
-                'captcha',                 # 验证码
-            ]
-
-            error_msg = str(ret_value[0]) if ret_value else ''
-
-            # 检查错误信息是否包含需要验证的关键词
-            for keyword in captcha_keywords:
-                if keyword in error_msg:
-                    logger.info(f"【{self.cookie_id}】检测到需要滑块验证的关键词: {keyword}")
-                    return True
-
-            # 检查data字段中是否包含验证URL
-            data = res_json.get('data', {})
-            if isinstance(data, dict) and 'url' in data:
-                url = data.get('url', '')
-                if 'punish' in url or 'captcha' in url or 'validate' in url:
-                    logger.info(f"【{self.cookie_id}】检测到验证URL: {url}")
-                    return True
-
-            return False
+            decision = self._classify_token_risk_response(res_json)
+            should_auto_slider = (
+                decision.get('risk_category') == 'slider_challenge' and
+                bool(decision.get('auto_slider_allowed'))
+            )
+            logger.info(
+                f"【{self.cookie_id}】滑块验证兼容判断: "
+                f"risk_category={decision.get('risk_category')}, "
+                f"reason={decision.get('reason')}, auto_slider_allowed={should_auto_slider}"
+            )
+            return should_auto_slider
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】检查是否需要滑块验证时出错: {self._safe_str(e)}")
             return False
 
-    async def _handle_captcha_verification(self, res_json: dict) -> str:
-        """处理滑块验证，返回新的cookies字符串"""
+    async def _handle_captcha_verification(self, res_json: dict, initial_cookies_str: Optional[str] = None) -> str:
+        """处理滑块验证，返回候选 cookies 字符串；最终成功由目标 token 预检确认。"""
         try:
             logger.info(f"【{self.cookie_id}】开始处理滑块验证...")
+            self.last_slider_page_state = None
+            self.last_slider_feedback = {}
 
             if self.is_manual_refresh_active(self.cookie_id, allow_handoff_recovery=True):
                 logger.warning(f"【{self.cookie_id}】手动刷新进行中，取消自动滑块处理")
@@ -6768,7 +7179,7 @@ class XianyuLive:
                 logger.info(f"【{self.cookie_id}】未找到验证URL，认为不需要滑块验证，返回正常")
                 return None
 
-            logger.info(f"【{self.cookie_id}】验证URL: {verification_url}")
+            logger.info(f"【{self.cookie_id}】验证URL: {self._redact_url_for_log(verification_url)}")
 
             # 使用滑块验证器（独立实例，解决并发冲突）
             try:
@@ -6784,7 +7195,7 @@ class XianyuLive:
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
                     headless=not show_browser,
-                    initial_cookies=self.cookies_str,
+                    initial_cookies=initial_cookies_str or self.cookies_str,
                     proxy=self.proxy_config,
                     use_account_persistent_profile=True,
                 )
@@ -6793,9 +7204,14 @@ class XianyuLive:
 
                 # 直接使用异步方法执行滑块验证（避免 ThreadPoolExecutor 导致的 Playwright 初始化问题）
                 success, cookies = await slider_stealth.async_run(verification_url)
+                feedback = dict(getattr(slider_stealth, 'last_verification_feedback', {}) or {})
+                self.last_slider_feedback = feedback
+                self.last_slider_page_state = self._normalize_slider_page_state(success, cookies, feedback)
 
                 if success and cookies:
-                    logger.info(f"【{self.cookie_id}】滑块验证成功，获取到新的cookies")
+                    logger.info(
+                        f"【{self.cookie_id}】滑块挑战返回候选cookies，page_state={self.last_slider_page_state}"
+                    )
 
                     current_cookies_dict = trans_cookies(self.cookies_str)
                     x5sec_cookies = {}
@@ -6806,7 +7222,8 @@ class XianyuLive:
                         if cookie_name_lower.startswith('x5') or 'x5sec' in cookie_name_lower:
                             x5sec_cookies[cookie_name] = cookie_value
 
-                    logger.info(f"【{self.cookie_id}】找到{len(x5sec_cookies)}个x5相关cookies: {list(x5sec_cookies.keys())}")
+                    x5_summary = self._summarize_x5_cookie_dict(x5sec_cookies)
+                    logger.info(f"【{self.cookie_id}】找到{len(x5sec_cookies)}个x5相关cookies: {x5_summary}")
 
                     merge_result = self.protected_merge_cookie_dicts(current_cookies_dict, cookies)
                     updated_cookies = merge_result['merged_cookies_dict']
@@ -6846,54 +7263,18 @@ class XianyuLive:
                         logger.error(f"【{self.cookie_id}】滑块验证后的Cookie仍缺失核心字段，放弃写回数据库: {', '.join(missing_required_fields)}")
                         return None
 
-                    # 自动更新数据库中的cookie
-                    try:
-                        # 备份原有cookies
-                        old_cookies_str = self.cookies_str
-                        old_cookies_dict = self.cookies.copy()
-
-                        # 更新当前实例的cookies（使用合并后的cookies）
-                        self._set_runtime_cookie_state(
-                            cookies_str=cookies_str,
-                            cookies_dict=updated_cookies,
-                            source="slider_success",
-                        )
-
-                        # 更新数据库中的cookies
-                        await self.update_config_cookies()
-                        logger.info(f"【{self.cookie_id}】滑块验证成功后，数据库cookies已自动更新")
-                        self._mark_slider_success_recovery(cookies_str)
-                        self._mark_pending_slider_success_notice("token_refresh")
-                        XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
-                        logger.info(f"【{self.cookie_id}】滑块验证成功后，已清理密码登录失败退避状态")
-
-                        # 记录成功更新到日志文件，包含关键字段变化和x5相关cookie信息
-                        x5sec_cookies_str = "; ".join([f"{k}={v}" for k, v in x5sec_cookies.items()]) if x5sec_cookies else "无"
-                        log_captcha_event(self.cookie_id, "滑块验证成功并自动更新数据库", True,
-                            f"原有{len(current_cookies_dict)}个cookie项, 浏览器快照{len(cookies)}个, 合并后{len(updated_cookies)}个, 变更字段{len(changed_fields)}个, 新增字段{len(new_fields)}个, 保护保留{len(preserved_protected_fields)}个, 实际移除{len(removed_fields)}个, x5 cookies: {x5sec_cookies_str}")
-
-                    except Exception as update_e:
-                        logger.error(f"【{self.cookie_id}】自动更新数据库cookies失败: {self._safe_str(update_e)}")
-
-                        # 回滚cookies
-                        self._set_runtime_cookie_state(
-                            cookies_str=old_cookies_str,
-                            cookies_dict=old_cookies_dict,
-                            source="slider_success_rollback",
-                        )
-
-                        # 记录更新失败到日志文件，包含获取到的x5 cookies
-                        x5sec_cookies_str = "; ".join([f"{k}={v}" for k, v in x5sec_cookies.items()]) if x5sec_cookies else "无"
-                        log_captcha_event(self.cookie_id, "滑块验证成功但数据库更新失败", False,
-                            f"更新异常: {self._safe_str(update_e)[:100]}, 变更字段{len(changed_fields)}个, 新增字段{len(new_fields)}个, 保护保留{len(preserved_protected_fields)}个, 获取到的x5 cookies: {x5sec_cookies_str}")
-
-                        # 发送更新失败通知
-                        await self.send_token_refresh_notification(
-                            f"滑块验证成功但数据库更新失败: {self._safe_str(update_e)}",
-                            "captcha_success_db_update_failed"
-                        )
-
-                        return None
+                    log_captcha_event(
+                        self.cookie_id,
+                        "滑块挑战获取候选Cookie",
+                        None,
+                        (
+                            f"原有{len(current_cookies_dict)}个cookie项, 浏览器快照{len(cookies)}个, "
+                            f"合并后{len(updated_cookies)}个, 变更字段{len(changed_fields)}个, "
+                            f"新增字段{len(new_fields)}个, 保护保留{len(preserved_protected_fields)}个, "
+                            f"实际移除{len(removed_fields)}个, page_state={self.last_slider_page_state}, "
+                            f"x5_summary={x5_summary}"
+                        ),
+                    )
 
                     return cookies_str
                 else:
@@ -6901,7 +7282,7 @@ class XianyuLive:
 
                     # 记录滑块验证失败到日志文件
                     log_captcha_event(self.cookie_id, "滑块验证失败", False,
-                        f"XianyuSliderStealth执行失败, 环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}")
+                        f"XianyuSliderStealth执行失败, page_state={self.last_slider_page_state}, 环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}")
 
                     # 发送通知（检查WebSocket连接状态）
                     # 只有在WebSocket未连接时才发送通知，已连接说明可能是暂时性问题
@@ -6916,7 +7297,7 @@ class XianyuLive:
                     else:
                         logger.warning(f"【{self.cookie_id}】WebSocket未连接，发送滑块验证失败通知")
                         await self.send_token_refresh_notification(
-                            f"滑块验证失败，需要手动处理。验证URL: {verification_url}",
+                            f"滑块验证失败，需要手动处理。验证URL: {self._redact_url_for_log(verification_url)}",
                             "captcha_verification_failed"
                         )
                     return None
@@ -6931,7 +7312,7 @@ class XianyuLive:
 
                 # 发送通知
                 await self.send_token_refresh_notification(
-                    f"滑块验证功能不可用，请安装Playwright。验证URL: {verification_url}",
+                    f"滑块验证功能不可用，请安装Playwright。验证URL: {self._redact_url_for_log(verification_url)}",
                     "captcha_dependency_missing"
                 )
                 return None
@@ -6956,7 +7337,7 @@ class XianyuLive:
                 else:
                     logger.warning(f"【{self.cookie_id}】WebSocket未连接，发送滑块验证执行异常通知")
                     await self.send_token_refresh_notification(
-                        f"滑块验证执行异常，需要手动处理。验证URL: {verification_url}",
+                        f"滑块验证执行异常，需要手动处理。验证URL: {self._redact_url_for_log(verification_url)}",
                         "captcha_execution_error"
                     )
                 return None
@@ -7331,6 +7712,7 @@ class XianyuLive:
             if not username or not password:
                 logger.warning(f"【{self.cookie_id}】未配置用户名或密码，跳过密码登录刷新")
                 self.last_token_refresh_error_message = "未配置用户名或密码，无法自动刷新Cookie"
+                XianyuLive.set_password_login_failure_backoff(self.cookie_id, 'credentials', self.hard_risk_backoff_seconds)
                 await self.send_token_refresh_notification(
                     f"检测到{trigger_reason}，但未配置用户名或密码，无法自动刷新Cookie",
                     "no_credentials"
@@ -7432,7 +7814,7 @@ class XianyuLive:
             
             if result:
                 logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
-                logger.info(f"【{self.cookie_id}】Cookie内容: {result}")
+                logger.info(f"【{self.cookie_id}】Cookie摘要: {self._summarize_cookie_string(self._serialize_cookies(result))}")
                 XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
                 
                 # 打印密码登录获取的Cookie字段详情
