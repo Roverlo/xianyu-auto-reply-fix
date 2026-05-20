@@ -12671,6 +12671,53 @@ function startPasswordLoginCheck() {
     checkPasswordLoginStatus();
 }
 
+function getPasswordLoginStageLabel(stage) {
+    const stageMap = {
+        starting: '启动中...',
+        browser_started: '打开页面...',
+        opening_login_page: '打开页面...',
+        detecting_login_form: '识别中...',
+        submitting_credentials: '提交中...',
+        auto_slider: '滑块中...',
+        auto_slider_retry: '重试中...',
+        auto_slider_passed: '确认中...',
+        auto_slider_failed: '处理失败'
+    };
+    return stageMap[String(stage || '').trim()] || '处理中...';
+}
+
+function ensurePasswordLoginProgressElement() {
+    let progressEl = document.getElementById('passwordLoginProgressText');
+    if (progressEl) return progressEl;
+
+    const submitBtn = document.querySelector('#passwordLoginFormElement button[type="submit"]');
+    if (!submitBtn || !submitBtn.parentElement) return null;
+
+    progressEl = document.createElement('div');
+    progressEl.id = 'passwordLoginProgressText';
+    progressEl.className = 'small text-muted mt-2';
+    progressEl.setAttribute('aria-live', 'polite');
+    submitBtn.parentElement.appendChild(progressEl);
+    return progressEl;
+}
+
+function updatePasswordLoginProgress(data) {
+    const submitBtn = document.querySelector('#passwordLoginFormElement button[type="submit"]');
+    const progressEl = ensurePasswordLoginProgressElement();
+
+    const message = data && data.message ? String(data.message) : '登录处理中，请稍候...';
+    const elapsed = data && Number.isFinite(Number(data.elapsed_seconds))
+        ? ` ${Number(data.elapsed_seconds)}s`
+        : '';
+    if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = `<span class="spinner-border spinner-border-sm me-2"></span>${getPasswordLoginStageLabel(data && data.stage)}`;
+    }
+    if (progressEl) {
+        progressEl.textContent = `${message}${elapsed}`;
+    }
+}
+
 // 检查账号密码登录状态
 async function checkPasswordLoginStatus() {
     if (!passwordLoginSessionId || passwordLoginPollingState.completed || passwordLoginPollingState.inFlight) return;
@@ -12696,7 +12743,7 @@ async function checkPasswordLoginStatus() {
             
             switch (data.status) {
                 case 'processing':
-                    // 处理中，继续等待
+                    updatePasswordLoginProgress(data);
                     break;
                 case 'verification_required':
                     // 需要身份验证，显示验证截图或链接
@@ -13079,6 +13126,10 @@ function resetPasswordLoginForm() {
     if (submitBtn) {
         submitBtn.disabled = false;
         submitBtn.innerHTML = '<i class="bi bi-box-arrow-in-right me-1"></i>开始登录';
+    }
+    const progressEl = document.getElementById('passwordLoginProgressText');
+    if (progressEl) {
+        progressEl.remove();
     }
 }
 

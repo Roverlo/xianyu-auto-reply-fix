@@ -804,6 +804,7 @@ password_login_locks = defaultdict(lambda: asyncio.Lock())
 manual_cookie_import_sessions = {}  # {session_id: {'account_id': str, 'status': str, 'verification_url': str, 'screenshot_path': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 manual_cookie_import_locks = defaultdict(lambda: asyncio.Lock())
 PASSWORD_LOGIN_TERMINAL_STATUSES = {'success', 'failed', 'cancelled'}
+PASSWORD_LOGIN_PROCESSING_TIMEOUT_SECONDS = int(os.environ.get('XY_PASSWORD_LOGIN_TIMEOUT_SECONDS', '300'))
 
 # ── 轻量扫码登录(qr_login_lite)会话表 ───────────────────────────
 # value: {state, qr_data_url, error_message, account_info, started_at, finished, user_id}
@@ -4207,6 +4208,26 @@ def _set_password_login_session_status(session_id: str, status: str, **fields):
     return True
 
 
+def _build_password_login_processing_payload(session_id: str, session: Dict[str, Any], current_time: Optional[float] = None) -> Dict[str, Any]:
+    current_time = current_time or time.time()
+    elapsed_seconds = max(0, int(current_time - float(session.get('timestamp') or current_time)))
+    slider_instance = session.get('slider_instance')
+    stage = str(getattr(slider_instance, 'password_login_stage', '') or session.get('stage') or 'processing')
+    stage_message = (
+        str(getattr(slider_instance, 'password_login_stage_message', '') or '').strip()
+        or str(session.get('message') or '').strip()
+        or '登录处理中，请稍候...'
+    )
+    return {
+        'status': 'processing',
+        'message': stage_message,
+        'stage': stage,
+        'elapsed_seconds': elapsed_seconds,
+        'timeout_seconds': PASSWORD_LOGIN_PROCESSING_TIMEOUT_SECONDS,
+        'session_id': session_id,
+    }
+
+
 def _finalize_password_login_session_failure(
     session_id: str,
     error_message: str,
@@ -5389,6 +5410,23 @@ async def check_password_login_status(
             return {'status': 'forbidden', 'message': '无权限访问该会话'}
         
         status = session['status']
+        if status == 'processing':
+            elapsed_seconds = current_time - float(session.get('timestamp') or current_time)
+            if elapsed_seconds > PASSWORD_LOGIN_PROCESSING_TIMEOUT_SECONDS:
+                timeout_message = (
+                    f"账号密码登录处理超过 {PASSWORD_LOGIN_PROCESSING_TIMEOUT_SECONDS} 秒仍未完成，"
+                    "已自动结束本次登录。请稍后重试，或改用扫码登录/手动刷新 Cookie。"
+                )
+                _finalize_password_login_session_failure(
+                    session_id,
+                    timeout_message,
+                    result_code='password_login_processing_timeout',
+                    event_meta={
+                        'elapsed_seconds': int(elapsed_seconds),
+                        'timeout_seconds': PASSWORD_LOGIN_PROCESSING_TIMEOUT_SECONDS,
+                    },
+                )
+                status = 'failed'
         
         if status == 'verification_required':
             # 需要身份验证
@@ -5426,10 +5464,7 @@ async def check_password_login_status(
             }
         else:
             # 处理中
-            return {
-                'status': 'processing',
-                'message': '登录处理中，请稍候...'
-            }
+            return _build_password_login_processing_payload(session_id, session, current_time)
         
     except Exception as e:
         log_with_user('error', f"检查账号密码登录状态异常: {str(e)}", current_user)
