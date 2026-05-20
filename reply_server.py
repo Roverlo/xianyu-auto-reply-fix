@@ -243,7 +243,8 @@ def _normalize_dashboard_announcement_entry(payload: Any) -> Optional[Dict[str, 
     end_at = _parse_announcement_datetime(payload.get('end_at'))
     title = str(payload.get('title') or '').strip()
     message = str(payload.get('message') or '').strip()
-    if not title and not message:
+    summary = str(payload.get('summary') or payload.get('brief') or payload.get('short_message') or '').strip()
+    if not title and not message and not summary:
         return None
 
     level = str(payload.get('level') or 'info').strip().lower()
@@ -281,6 +282,7 @@ def _normalize_dashboard_announcement_entry(payload: Any) -> Optional[Dict[str, 
         'status': status,
         'level': level,
         'title': title,
+        'summary': summary,
         'message': message,
         'action_text': action_text,
         'action_type': action_type,

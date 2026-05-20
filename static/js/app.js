@@ -574,6 +574,8 @@ function renderDashboardAnnouncement() {
         : 'info';
     const title = String(currentAnnouncement.title || '').trim();
     const message = String(currentAnnouncement.message || '').trim();
+    const summary = String(currentAnnouncement.summary || currentAnnouncement.brief || currentAnnouncement.short_message || '').trim();
+    const displayMessage = summary || message;
     const actionText = String(currentAnnouncement.action_type ? (currentAnnouncement.action_text || '') : '').trim();
     const dismissible = currentAnnouncement.dismissible !== false;
 
@@ -592,7 +594,7 @@ function renderDashboardAnnouncement() {
                 </span>
                 <span class="dashboard-announcement-body">
                     ${title ? `<span class="dashboard-announcement-title">${escapeHtml(title)}</span>` : ''}
-                    ${message ? `<span class="dashboard-announcement-message">${escapeHtml(message)}</span>` : ''}
+                    ${displayMessage ? `<span class="dashboard-announcement-message">${escapeHtml(displayMessage)}</span>` : ''}
                 </span>
             </button>
             <div class="dashboard-announcement-actions">

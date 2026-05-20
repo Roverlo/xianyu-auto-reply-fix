@@ -3330,19 +3330,47 @@ class XianyuSliderStealth:
         """滑块验证成功后获取cookie"""
         try:
             logger.info(f"【{self.pure_user_id}】开始获取滑块验证成功后的页面cookie...")
-            
+
             # 检查当前页面URL
             current_url = self.page.url
             logger.info(f"【{self.pure_user_id}】当前页面URL: {current_url}")
-            
+
             # 检查页面标题
             page_title = self.page.title()
             logger.info(f"【{self.pure_user_id}】当前页面标题: {page_title}")
-            
+
+            # 滑块拦截页常在通过后把浏览器跳到 www.taobao.com，导致新的 _m_h5_tk 落在
+            # .taobao.com 域；后续再去签 h5api.m.goofish.com 的接口就会被网关回 FAIL_SYS_ILLEGAL_ACCESS。
+            # 主动回访一次 goofish 主域，让网关在 .goofish.com 域上重发 H5 token，再做快照。
+            try:
+                current_host = (urlparse(current_url).hostname or '').lower()
+            except Exception:
+                current_host = ''
+            if 'goofish.com' not in current_host:
+                try:
+                    self.page.goto(
+                        'https://www.goofish.com/',
+                        wait_until='domcontentloaded',
+                        timeout=8000,
+                    )
+                    time.sleep(1.5)
+                    logger.info(
+                        f"【{self.pure_user_id}】滑块通过后已回访 goofish 主域，"
+                        f"等待 .goofish.com 域重新颁发 _m_h5_tk"
+                    )
+                except Exception as goto_e:
+                    logger.warning(
+                        f"【{self.pure_user_id}】回访 goofish 主域失败，仍按当前页 cookie 继续: {goto_e}"
+                    )
+
             # 等待一下确保cookie完全更新
             time.sleep(1)
-            
-            new_cookies = self._snapshot_context_cookies(self.context, page=self.page)
+
+            new_cookies = self._snapshot_context_cookies(
+                self.context,
+                page=self.page,
+                preferred_domain_suffixes=('goofish.com',),
+            )
 
             if new_cookies:
                 logger.info(f"【{self.pure_user_id}】滑块验证成功后已获取cookie，共{len(new_cookies)}个cookie")
@@ -3549,8 +3577,56 @@ class XianyuSliderStealth:
                 except Exception:
                     pass
 
-    def _snapshot_context_cookies(self, context=None, page=None) -> Dict[str, str]:
-        """快照浏览器上下文中的所有 Cookie，返回 {name: value} 字典。"""
+    def _flatten_cookies_by_domain_preference(
+        self,
+        raw_cookies,
+        preferred_domain_suffixes=None,
+    ) -> Dict[str, str]:
+        """将 [{name, value, domain, ...}] 压扁为 {name: value}。
+
+        当 preferred_domain_suffixes 非空时，同名 Cookie 在多个域共存时优先取
+        domain 命中后缀的版本；其它情况下保持原行为（列表顺序后者覆盖前者）。
+        """
+        if not raw_cookies:
+            return {}
+        if not preferred_domain_suffixes:
+            return {c['name']: c['value'] for c in raw_cookies if c.get('name')}
+
+        suffixes = tuple(s.lstrip('.').lower() for s in preferred_domain_suffixes if s)
+        by_name: Dict[str, dict] = {}
+        for c in raw_cookies:
+            name = c.get('name')
+            if not name:
+                continue
+            existing = by_name.get(name)
+            if existing is None:
+                by_name[name] = c
+                continue
+            existing_domain = (existing.get('domain') or '').lstrip('.').lower()
+            new_domain = (c.get('domain') or '').lstrip('.').lower()
+            existing_hit = any(existing_domain.endswith(s) for s in suffixes)
+            new_hit = any(new_domain.endswith(s) for s in suffixes)
+            if new_hit and not existing_hit:
+                by_name[name] = c
+            elif existing_hit and not new_hit:
+                pass  # 保留首选域版本
+            else:
+                by_name[name] = c  # 都命中或都不命中：沿用原"后者覆盖"行为
+        return {c['name']: c['value'] for c in by_name.values()}
+
+    def _snapshot_context_cookies(
+        self,
+        context=None,
+        page=None,
+        preferred_domain_suffixes=None,
+    ) -> Dict[str, str]:
+        """快照浏览器上下文中的所有 Cookie，返回 {name: value} 字典。
+
+        Args:
+            preferred_domain_suffixes: 可选；同名 Cookie 跨域共存时优先选 domain
+                命中这些后缀的版本（默认 None，行为不变）。仅 _get_cookies_after_success
+                之类需要"按目标域取真值"的调用方使用，其它调用方保持默认。
+        """
         try:
             current_context = context or self.context
             if not current_context:
@@ -3559,7 +3635,9 @@ class XianyuSliderStealth:
             playwright_cookies = {}
             try:
                 raw = current_context.cookies()
-                playwright_cookies = {c['name']: c['value'] for c in raw} if raw else {}
+                playwright_cookies = self._flatten_cookies_by_domain_preference(
+                    raw, preferred_domain_suffixes
+                )
             except Exception as playwright_e:
                 logger.debug(f"【{self.pure_user_id}】Playwright Cookie 快照失败: {playwright_e}")
 

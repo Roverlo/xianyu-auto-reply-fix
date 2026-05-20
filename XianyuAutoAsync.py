@@ -15418,14 +15418,42 @@ class XianyuLive:
 
                 create_time = int(message_1.get("5", 0))
                 message_10 = message_1["10"]
-                send_user_name = message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
                 send_user_id = message_10.get("senderUserId", "unknown")
-                send_message = message_10.get("reminderContent", "")
-                # 直接从已解出的 chat payload 拿 messageId，传给 dedupe 链路避免重复解同步包
-                dedupe_message_id = self._extract_message_id_from_chat_payload(message_1, message_10)
 
                 chat_id_raw = message_1.get("2", "")
                 chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
+
+                sender_nick_raw = str(message_10.get("senderNick") or '').strip()
+                if sender_nick_raw:
+                    send_user_name = sender_nick_raw
+                else:
+                    # senderNick 缺失时仅使用 reminderTitle 兜底，且必须过滤系统文案
+                    # （例如 "买家已拍下，待付款"、"等待你发货"、"工作台通知" 等订单状态/卡片标题），
+                    # 否则会被当作买家昵称写入 chat_messages.sender_name 并污染会话列表与通知。
+                    reminder_title_raw = str(message_10.get("reminderTitle") or '').strip()
+                    sanitized_reminder = self._sanitize_buyer_nick(
+                        reminder_title_raw,
+                        source="reminderTitle",
+                        message_meta=message_10,
+                        log_prefix=f"【{self.cookie_id}】[{msg_id}]"
+                    ) if reminder_title_raw else None
+                    if not sanitized_reminder and send_user_id and send_user_id != "unknown":
+                        # 兜底：从本地历史聊天记录里找一个干净的买家昵称
+                        try:
+                            from db_manager import db_manager as _db_lookup
+                            recovered_nick = _db_lookup._lookup_buyer_nick_from_chat_messages(
+                                self.cookie_id, chat_id_raw or chat_id, send_user_id
+                            )
+                            if recovered_nick:
+                                sanitized_reminder = recovered_nick
+                        except Exception as _lookup_err:
+                            logger.debug(
+                                f"【{self.cookie_id}】[{msg_id}] 历史买家昵称兜底查询失败: {self._safe_str(_lookup_err)}"
+                            )
+                    send_user_name = sanitized_reminder or "未知用户"
+                send_message = message_10.get("reminderContent", "")
+                # 直接从已解出的 chat payload 拿 messageId，传给 dedupe 链路避免重复解同步包
+                dedupe_message_id = self._extract_message_id_from_chat_payload(message_1, message_10)
 
             except Exception as e:
                 logger.error(f"【{self.cookie_id}】[{msg_id}] ❌ 提取聊天消息信息失败: {self._safe_str(e)}")
