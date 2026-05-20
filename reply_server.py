@@ -6102,7 +6102,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                             # 表现为"扫码完成但 WS 起不来"（详见 22:43 / 22:08 那两次链路）。
                             XianyuLive.clear_password_login_failure_backoff(account_id)
                             log_with_user('info', f"扫码成功后已清除密码登录失败退避: {account_id}", current_user)
-                            warning_message = f"真实Cookie已获取，账号任务已切换；为降低再次触发风控的概率，将进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token"
+                            warning_message = f"真实Cookie已获取，账号任务已切换；将立即尝试正常初始化Token，若首轮Token预检命中风控再进入 {qr_login_grace_minutes} 分钟稳定期"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         else:
                             warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
@@ -6133,7 +6133,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         try:
                             if task_restarted:
                                 processing_result = '扫码登录真实Cookie获取成功，账号任务已启动'
-                                processing_result += f'；已进入 {qr_login_grace_minutes} 分钟稳定期，稳定期内不自动预热Token'
+                                processing_result += f'；将先执行正常Token初始化，命中风控时再退避 {qr_login_grace_minutes} 分钟'
                                 db_manager.update_risk_control_log(
                                     log_id=risk_log_id,
                                     processing_status='success',

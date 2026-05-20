@@ -557,7 +557,23 @@ class XianyuLive:
         cls._cleanup_qr_login_grace_state()
         state = cls._qr_login_grace_state.get(cookie_id)
         if not state:
-            return None
+            try:
+                account_info = db_manager.get_cookie_details(cookie_id) or {}
+                grace_until = int(account_info.get('qr_login_grace_until') or 0)
+            except Exception as e:
+                logger.warning(f"【{cookie_id}】读取扫码登录保护窗口失败: {e}")
+                return None
+            remaining = int(grace_until - time.time())
+            if remaining <= 0:
+                return None
+            state = {
+                'timestamp': time.time(),
+                'captcha_buffer_used': False,
+                'browser_stabilized': False,
+                'stage': 'restored_from_db',
+                'grace_until': grace_until,
+            }
+            cls._qr_login_grace_state[cookie_id] = state
         if time.time() - state.get('timestamp', 0) > cls._qr_login_grace_ttl:
             cls._qr_login_grace_state.pop(cookie_id, None)
             return None
@@ -749,6 +765,12 @@ class XianyuLive:
     def _compute_token_retry_wait_seconds(self, current_time: Optional[float] = None) -> int:
         current_time = current_time or time.time()
         min_wait = max(60, int(RISK_CONTROL.get('token_retry_min_wait_seconds', 180) or 180))
+        if getattr(self, 'last_token_refresh_status', None) == "qr_login_grace_wait":
+            self._consume_qr_login_grace_period_if_expired(current_time)
+            remaining = self._get_qr_login_grace_remaining_seconds(current_time)
+            if remaining > 0:
+                return max(min_wait, remaining)
+
         backoff = self._get_active_password_login_failure_backoff(current_time)
         if backoff:
             remaining = max(0, int(backoff.get('remaining_time', 0) or 0))
@@ -1799,10 +1821,17 @@ class XianyuLive:
         if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
             return max(300, self._compute_token_retry_wait_seconds(current_time))
 
-        if self._is_in_qr_login_grace_period(current_time):
-            return max(60, self._get_qr_login_grace_remaining_seconds(current_time))
+        if self._get_active_password_login_failure_backoff(current_time):
+            return max(60, self._compute_token_retry_wait_seconds(current_time))
 
-        if getattr(self, 'last_token_refresh_status', None) in {"password_login_backoff_wait", "verification_pending_manual", "qr_login_grace_wait"}:
+        last_refresh_status = getattr(self, 'last_token_refresh_status', None)
+        if last_refresh_status == "qr_login_grace_wait":
+            self._consume_qr_login_grace_period_if_expired(current_time)
+            remaining = self._get_qr_login_grace_remaining_seconds(current_time)
+            if remaining > 0:
+                return max(60, remaining)
+
+        if last_refresh_status in {"password_login_backoff_wait", "verification_pending_manual"}:
             return max(60, self._compute_token_retry_wait_seconds(current_time))
 
         # WebSocket意外断开 - 短延迟
@@ -12119,9 +12148,8 @@ class XianyuLive:
                         await self._interruptible_sleep(300)
                         continue
 
-                    if self._should_defer_auth_recovery_for_qr_grace(current_time):
-                        await self._interruptible_sleep(max(60, self._get_qr_login_grace_remaining_seconds(current_time)))
-                        continue
+                    # 扫码后的保护窗口只限制激进恢复；会话保活仍应先跑轻量探测。
+                    self._consume_qr_login_grace_period_if_expired(current_time)
 
                     effective_keepalive_interval = self._get_effective_keepalive_interval()
                     if current_time - self.last_session_keepalive_time >= effective_keepalive_interval:
@@ -12133,6 +12161,14 @@ class XianyuLive:
 
                         keepalive_status = getattr(self, 'last_session_keepalive_status', None)
                         if keepalive_status == "auth_failed":
+                            if getattr(self, 'last_token_refresh_status', None) == "qr_login_grace_wait":
+                                self._consume_qr_login_grace_period_if_expired(current_time)
+                                remaining = self._get_qr_login_grace_remaining_seconds(current_time)
+                                if remaining > 0:
+                                    logger.warning(f"【{self.cookie_id}】扫码登录稳定期中，轻量保活鉴权仍失败，暂缓重型Token恢复，剩余 {remaining} 秒")
+                                    await self._interruptible_sleep(max(60, remaining))
+                                    continue
+
                             logger.warning(f"【{self.cookie_id}】轻量保活鉴权失败，尝试执行重型Token恢复流程")
                             new_token = await self.refresh_token()
                             if new_token:
@@ -12255,8 +12291,9 @@ class XianyuLive:
         # 如果没有token或者token过期，获取新token
         token_refresh_attempted = False
         if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
-            if self._should_defer_auth_recovery_for_qr_grace():
-                raise InitAuthError(self.last_token_refresh_error_message or "扫码登录稳定期中，暂缓初始化Token预检")
+            if self._is_in_qr_login_grace_period():
+                remaining = self._get_qr_login_grace_remaining_seconds()
+                logger.info(f"【{self.cookie_id}】扫码登录保护窗口中，仍执行首轮Token初始化；若命中风控再退避，剩余窗口 {remaining} 秒")
 
             logger.info(f"【{self.cookie_id}】获取初始token...")
             token_refresh_attempted = True
