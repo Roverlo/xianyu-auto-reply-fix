@@ -3647,6 +3647,14 @@ function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
         };
     }
 
+    if (runtimeStatus?.token_refresh_status === 'server_overload_rgv587') {
+        return {
+            tone: 'warning',
+            title: runtimeStatus?.has_current_token ? 'Token 可用，刷新限流中' : '平台限流等待中',
+            note: runtimeStatus?.token_refresh_error_message || '闲鱼 Token 接口返回 RGV587/被挤爆，系统已暂停激进恢复，稍后自动重试。',
+        };
+    }
+
     if (!runtimeStatus?.ws_ready || !runtimeStatus?.session_ready || !runtimeStatus?.has_current_token || !runtimeStatus?.message_stream_ready) {
         return {
             tone: 'warning',
@@ -3713,6 +3721,10 @@ function renderAboutRuntimeStatus(runtimeStatus) {
         : readinessSignalItems.some(item => item.ready)
             ? 'warning'
             : 'danger';
+    const tokenRefreshNote = [
+        `最近刷新：${tokenRefreshDisplay}`,
+        runtimeStatus.token_refresh_error_message,
+    ].filter(Boolean).join(' · ');
 
     statusContainer.innerHTML = `
         <div class="account-diagnostics-status-shell">
@@ -3746,7 +3758,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
                         ${buildAboutRuntimeStatusItem({
                             label: 'Token 刷新状态',
                             value: buildAboutStatusBadge('token', runtimeStatus.token_refresh_status),
-                            note: `最近刷新：${tokenRefreshDisplay}`,
+                            note: tokenRefreshNote,
                             tone: tokenTone,
                             richValue: true,
                             accent: 'token',

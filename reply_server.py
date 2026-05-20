@@ -3316,6 +3316,9 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'token_refresh_exception',
         'token_init_failed',
     }
+    token_refresh_degraded_statuses = {
+        'server_overload_rgv587',
+    }
     session_display_status = session_keepalive_status
     session_display_note = None
     if (
@@ -3343,6 +3346,10 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         and token_refresh_status not in token_explicit_failure_statuses
         and (
             recent_token_success
+            or (
+                token_refresh_status in token_refresh_degraded_statuses
+                and _is_runtime_timestamp_recent(token_refreshed_at, token_ready_window)
+            )
             or (ws_ready and token_refresh_status in (None, 'success', 'started'))
             or (
                 token_refresh_status is None

@@ -69,6 +69,11 @@ REQUIRED_SESSION_COOKIE_FIELDS = (
     't',
     'cna',
 )
+PERSISTED_TOKEN_SETTING_PREFIX = 'xianyu_access_token_cache:'
+PERSISTED_TOKEN_MAX_AGE_SECONDS = max(
+    300,
+    int(RISK_CONTROL.get('persisted_token_max_age_seconds', min(TOKEN_REFRESH_INTERVAL, 72000)) or min(TOKEN_REFRESH_INTERVAL, 72000)),
+)
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
 # 不再需要猴子补丁，所有功能已集成到 XianyuSliderStealth 类中
@@ -341,6 +346,79 @@ class XianyuLive:
         if not cookie_id:
             return
         cls._auth_prewarmed_tokens.pop(cookie_id, None)
+
+    @classmethod
+    def _persisted_token_setting_key(cls, cookie_id: str) -> str:
+        return f"{PERSISTED_TOKEN_SETTING_PREFIX}{str(cookie_id or '').strip()}"
+
+    @classmethod
+    def load_persisted_access_token(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
+        """读取本地持久化的短期 accessToken，避免进程重启后立刻打 Token 接口。"""
+        cleaned_cookie_id = str(cookie_id or '').strip()
+        if not cleaned_cookie_id:
+            return None
+
+        raw_value = db_manager.get_system_setting(cls._persisted_token_setting_key(cleaned_cookie_id))
+        if not raw_value:
+            return None
+
+        try:
+            payload_text = db_manager._decrypt_secret(raw_value)
+            payload = json.loads(payload_text)
+        except Exception as exc:
+            logger.warning(f"【{cleaned_cookie_id}】本地Token缓存解析失败，已忽略: {exc}")
+            return None
+
+        token = str(payload.get('token') or '').strip()
+        cached_at = float(payload.get('cached_at') or 0)
+        if not token or cached_at <= 0:
+            return None
+
+        age_seconds = time.time() - cached_at
+        if age_seconds < 0 or age_seconds > PERSISTED_TOKEN_MAX_AGE_SECONDS:
+            logger.info(
+                f"【{cleaned_cookie_id}】本地Token缓存已过期，age={age_seconds:.1f}s, "
+                f"max={PERSISTED_TOKEN_MAX_AGE_SECONDS}s"
+            )
+            cls.clear_persisted_access_token(cleaned_cookie_id)
+            return None
+
+        return {
+            'token': token,
+            'timestamp': cached_at,
+            'source': payload.get('source') or 'persisted_cache',
+        }
+
+    @classmethod
+    def save_persisted_access_token(cls, cookie_id: str, token: str, source: str = 'token_refresh') -> bool:
+        """加密保存最近一次成功的 accessToken，供同机重启短期复用。"""
+        cleaned_cookie_id = str(cookie_id or '').strip()
+        cleaned_token = str(token or '').strip()
+        if not cleaned_cookie_id or not cleaned_token:
+            return False
+
+        payload = {
+            'token': cleaned_token,
+            'cached_at': time.time(),
+            'source': source,
+        }
+        encrypted_payload = db_manager._encrypt_secret(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+        return db_manager.set_system_setting(
+            cls._persisted_token_setting_key(cleaned_cookie_id),
+            encrypted_payload,
+            '短期缓存的闲鱼IM accessToken，用于重启后降低Token接口风控压力',
+        )
+
+    @classmethod
+    def clear_persisted_access_token(cls, cookie_id: str):
+        cleaned_cookie_id = str(cookie_id or '').strip()
+        if not cleaned_cookie_id:
+            return
+        db_manager.set_system_setting(
+            cls._persisted_token_setting_key(cleaned_cookie_id),
+            '',
+            '短期缓存的闲鱼IM accessToken，用于重启后降低Token接口风控压力',
+        )
 
     @classmethod
     def _cleanup_manual_refresh_state(cls):
@@ -684,10 +762,13 @@ class XianyuLive:
         previous_reason = previous_state.get('reason')
         previous_count = int(previous_state.get('consecutive_count', 0) or 0)
         consecutive_count = previous_count + 1 if previous_reason == reason else 1
-        escalation_factor = float(RISK_CONTROL.get('backoff_escalation_factor', 1.5) or 1.5)
-        max_cap = max(seconds, int(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600))
-        actual_seconds = int(round(min(seconds * (escalation_factor ** max(0, consecutive_count - 1)), max_cap)))
-        actual_seconds = max(seconds, actual_seconds)
+        if reason == 'server_overload':
+            actual_seconds = seconds
+        else:
+            escalation_factor = float(RISK_CONTROL.get('backoff_escalation_factor', 1.5) or 1.5)
+            max_cap = max(seconds, int(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600))
+            actual_seconds = int(round(min(seconds * (escalation_factor ** max(0, consecutive_count - 1)), max_cap)))
+            actual_seconds = max(seconds, actual_seconds)
         now = time.time()
         cls._password_login_failure_backoff[cookie_id] = {
             'until': now + actual_seconds,
@@ -774,6 +855,8 @@ class XianyuLive:
         backoff = self._get_active_password_login_failure_backoff(current_time)
         if backoff:
             remaining = max(0, int(backoff.get('remaining_time', 0) or 0))
+            if backoff.get('reason') == 'server_overload':
+                return max(min_wait, remaining)
             return max(min_wait, remaining + 60)
         return max(min_wait, int(self.token_retry_interval or min_wait))
 
@@ -848,19 +931,30 @@ class XianyuLive:
             return False
 
         remaining_time = failure_backoff.get('remaining_time', 0.0)
+        display_status = (
+            "server_overload_rgv587"
+            if backoff_reason == "server_overload" else
+            "password_login_backoff_wait"
+        )
+        display_message = (
+            f"平台服务端限流，剩余{remaining_time:.1f}秒后自动重试"
+            if backoff_reason == "server_overload" else
+            f"登录恢复退避中，剩余{remaining_time:.1f}秒"
+        )
+
         should_log = (
-            self.last_token_refresh_status != "password_login_backoff_wait" or
+            self.last_token_refresh_status != display_status or
             (current_time - getattr(self, 'last_password_login_backoff_log_time', 0.0)) >= 30
         )
         if should_log:
             logger.warning(
-                f"【{self.cookie_id}】密码登录失败退避中（原因: {backoff_reason}），"
+                f"【{self.cookie_id}】登录恢复退避中（原因: {backoff_reason}），"
                 f"直接跳过本次token刷新，还需等待 {remaining_time:.1f} 秒"
             )
             self.last_password_login_backoff_log_time = current_time
 
-        self.last_token_refresh_status = "password_login_backoff_wait"
-        self.last_token_refresh_error_message = f"密码登录失败退避中，剩余{remaining_time:.1f}秒"
+        self.last_token_refresh_status = display_status
+        self.last_token_refresh_error_message = display_message
         return True
 
     @staticmethod
@@ -2080,9 +2174,19 @@ class XianyuLive:
         if prewarmed_token_info:
             self.current_token = prewarmed_token_info.get('token')
             self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
+            self.last_token_refresh_status = "success"
             logger.info(
                 f"【{cookie_id}】已复用认证预热token，来源: {prewarmed_token_info.get('source') or 'unknown'}"
             )
+        else:
+            persisted_token_info = self.load_persisted_access_token(self.cookie_id)
+            if persisted_token_info:
+                self.current_token = persisted_token_info.get('token')
+                self.last_token_refresh_time = persisted_token_info.get('timestamp', time.time())
+                self.last_token_refresh_status = "success"
+                logger.info(
+                    f"【{cookie_id}】已复用本地Token缓存，来源: {persisted_token_info.get('source') or 'persisted_cache'}"
+                )
 
         # 通知防重复机制
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
@@ -6529,6 +6633,7 @@ class XianyuLive:
                                 new_token = res_json['data']['accessToken']
                                 self.current_token = new_token
                                 self.last_token_refresh_time = time.time()
+                                self.save_persisted_access_token(self.cookie_id, new_token)
 
                                 # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
                                 self.last_message_received_time = 0
@@ -16185,6 +16290,8 @@ class XianyuLive:
                             # 开始初始化
                             await self.init(websocket)
                             logger.info(f"【{self.cookie_id}】WebSocket初始化完成！")
+                            if self.current_token:
+                                self.save_persisted_access_token(self.cookie_id, self.current_token, source='websocket_init_success')
 
                             # 初始化完成后才设置为已连接状态
                             self._set_connection_state(ConnectionState.CONNECTED, "初始化完成，连接就绪")
@@ -16304,7 +16411,14 @@ class XianyuLive:
 
                 except InitAuthError as e:
                     error_msg = self._safe_str(e)
-                    self.current_token = None
+                    previous_token = self.current_token
+                    previous_token_time = self.last_token_refresh_time
+                    if 'server_overload_rgv587' in error_msg and previous_token:
+                        logger.warning(f"【{self.cookie_id}】初始化遇到平台限流，保留当前Token缓存等待下次重试")
+                    else:
+                        self.current_token = None
+                        if previous_token and previous_token_time > 0:
+                            self.clear_persisted_access_token(self.cookie_id)
                     self.connection_failures = 0
                     init_auth_state = self.record_init_auth_failure(self.cookie_id, error_msg)
                     self.init_auth_failures = int(init_auth_state.get('count', 0))
