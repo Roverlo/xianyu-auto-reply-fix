@@ -84,6 +84,12 @@ RISK_CONTROL:
   persisted_token_max_age_seconds: 72000
   token_refresh_dedup_window_seconds: 60
   token_retry_min_wait_seconds: 180
+  pending_order_reconcile_enabled: true
+  pending_order_reconcile_interval_seconds: 120
+  pending_order_reconcile_boot_delay_seconds: 30
+  pending_order_reconcile_max_orders: 20
+  pending_order_reconcile_max_order_age_minutes: 1440
+  pending_order_reconcile_notice_cooldown_seconds: 1800
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
 TOKEN_RETRY_INTERVAL: 600
 SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟

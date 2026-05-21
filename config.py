@@ -143,6 +143,12 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'token_refresh_dedup_window_seconds': 60,
     'token_retry_min_wait_seconds': 180,
     'max_post_slider_session_retries': 1,
+    'pending_order_reconcile_enabled': True,
+    'pending_order_reconcile_interval_seconds': 120,
+    'pending_order_reconcile_boot_delay_seconds': 30,
+    'pending_order_reconcile_max_orders': 20,
+    'pending_order_reconcile_max_order_age_minutes': 1440,
+    'pending_order_reconcile_notice_cooldown_seconds': 1800,
 })
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):

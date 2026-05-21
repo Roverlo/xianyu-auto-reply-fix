@@ -1,6 +1,7 @@
 import unittest
+from unittest import mock
 
-from XianyuAutoAsync import XianyuLive
+from XianyuAutoAsync import ConnectionState, XianyuLive
 
 
 class _FakeTokenRefreshResponse:
@@ -63,6 +64,7 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         live.last_init_failure_reason = "old_reason"
         live.last_init_failure_type = "old_type"
         live._skip_db_cookie_reload_for_token_refresh = True
+        live.pending_slider_success_notice = None
 
         create_session_called = False
 
@@ -75,6 +77,7 @@ class XianyuTokenRefreshRequestTest(unittest.IsolatedAsyncioTestCase):
         live._extract_set_cookie_updates = lambda headers: {}
         live._build_cookie_string_with_updates = lambda cookie_string, updates: cookie_string
         live._need_captcha_verification = lambda _payload: False
+        live.save_persisted_access_token = lambda *_args, **_kwargs: True
         live._consume_pending_slider_success_notice = lambda: False
         live.clear_qr_login_grace = lambda *_args, **_kwargs: None
         live.clear_init_auth_failure_state = lambda *_args, **_kwargs: None

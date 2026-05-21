@@ -107,8 +107,9 @@ class RiskControlLogicTest(unittest.TestCase):
         self.live.cookie_id = "test-cookie"
         self.live.hard_risk_backoff_seconds = 7200
         self.live.slider_failure_backoff_seconds = 1800
+        self.live.server_overload_backoff_seconds = 600
 
-    def test_beijibao_response_is_hard_risk_not_slider(self):
+    def test_beijibao_response_is_server_overload_not_slider(self):
         response = {
             "ret": [
                 "FAIL_SYS_USER_VALIDATE",
@@ -125,7 +126,7 @@ class RiskControlLogicTest(unittest.TestCase):
 
         decision = self.live._classify_token_risk_response(response)
 
-        self.assertEqual(decision["risk_category"], "hard_risk_block")
+        self.assertEqual(decision["risk_category"], "server_overload_rgv587")
         self.assertFalse(decision["auto_slider_allowed"])
         self.assertFalse(self.live._need_captcha_verification(response))
 

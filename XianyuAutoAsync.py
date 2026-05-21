@@ -8,7 +8,7 @@ import os
 import random
 import secrets
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from urllib.parse import parse_qs, urlparse
 from loguru import logger
@@ -1741,6 +1741,379 @@ class XianyuLive:
         finally:
             logger.info(f"【{self.cookie_id}】业务流看门狗已退出")
 
+    def _is_websocket_ready_for_delivery(self) -> bool:
+        ws = getattr(self, 'ws', None)
+        if not ws or getattr(ws, 'closed', False):
+            return False
+        return getattr(self, 'connection_state', None) == ConnectionState.CONNECTED
+
+    def _parse_db_utc_timestamp(self, value: Any) -> Optional[datetime]:
+        text = str(value or '').strip()
+        if not text:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(text[:19], fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
+
+    def _is_history_order_too_old_for_reconcile(self, order: Dict[str, Any]) -> bool:
+        anchor = (
+            order.get('platform_paid_at') or
+            order.get('platform_created_at') or
+            order.get('created_at')
+        )
+        anchor_dt = self._parse_db_utc_timestamp(anchor)
+        if not anchor_dt:
+            return False
+        age_seconds = max(0, (datetime.now(timezone.utc) - anchor_dt).total_seconds())
+        return age_seconds > self.pending_order_reconcile_max_order_age_minutes * 60
+
+    def _extract_history_order_text_values(self, value: Any, *, max_values: int = 300):
+        stack = [value]
+        visited = 0
+        while stack and visited < max_values:
+            visited += 1
+            current = stack.pop()
+            if isinstance(current, dict):
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+            elif current is not None:
+                yield str(current)
+
+    def _normalize_history_chat_id(self, value: Any) -> Optional[str]:
+        text = str(value or '').strip()
+        if not text:
+            return None
+        if text.endswith('@goofish'):
+            text = text.split('@')[0].strip()
+        if not text or text in {'0', '-1', 'unknown', 'None', 'null'}:
+            return None
+        if len(text) < 5 or len(text) > 30:
+            return None
+        return text
+
+    def _extract_chat_id_from_history_payload(self, payload: Any) -> Optional[str]:
+        if not payload:
+            return None
+
+        stack = [payload]
+        checked = 0
+        key_candidates = {
+            'sid', 'sessionid', 'session_id', 'chatid', 'chat_id',
+            'cid', 'conversationid', 'conversation_id',
+        }
+        while stack and checked < 600:
+            checked += 1
+            current = stack.pop()
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    key_text = str(key or '').lower()
+                    if key_text in key_candidates:
+                        normalized = self._normalize_history_chat_id(value)
+                        if normalized:
+                            return normalized
+                    stack.append(value)
+            elif isinstance(current, list):
+                stack.extend(current)
+
+        for text in self._extract_history_order_text_values(payload):
+            for pattern in (
+                r'(?i)(?:sid|sessionId|session_id|chatId|chat_id|cid|conversationId|conversation_id)[=:/%22"]+([0-9A-Za-z_-]{5,30})',
+                r'\b([0-9]{5,30})@goofish\b',
+            ):
+                match = re.search(pattern, text)
+                if match:
+                    normalized = self._normalize_history_chat_id(match.group(1))
+                    if normalized:
+                        return normalized
+        return None
+
+    def _lookup_recent_chat_id_for_history_order(self, order: Dict[str, Any]) -> Optional[str]:
+        buyer_id = self._normalize_buyer_id_value(order.get('buyer_id'))
+        item_id = str(order.get('item_id') or '').strip()
+        if not buyer_id:
+            return None
+        try:
+            with db_manager.lock:
+                cursor = db_manager.conn.cursor()
+                params = [self.cookie_id, buyer_id]
+                item_filter = ''
+                if item_id:
+                    item_filter = " AND (item_id = ? OR item_id IS NULL OR item_id = '')"
+                    params.append(item_id)
+                cursor.execute(f'''
+                    SELECT chat_id
+                    FROM chat_messages
+                    WHERE cookie_id = ? AND sender_id = ?{item_filter}
+                    ORDER BY datetime(created_at) DESC, id DESC
+                    LIMIT 1
+                ''', params)
+                row = cursor.fetchone()
+            if row:
+                return self._normalize_history_chat_id(row[0])
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】待发货补偿按聊天记录查会话失败: {self._safe_str(exc)}")
+        return None
+
+    def _resolve_history_order_chat_id(self, order: Dict[str, Any], detail: Dict[str, Any] = None) -> Optional[str]:
+        for payload in (order, order.get('raw_source'), detail):
+            chat_id = self._extract_chat_id_from_history_payload(payload)
+            if chat_id:
+                return chat_id
+
+        local_order = None
+        order_id = str(order.get('order_id') or '').strip()
+        if order_id:
+            try:
+                local_order = db_manager.get_order_by_id(order_id)
+            except Exception:
+                local_order = None
+        if local_order:
+            chat_id = self._normalize_history_chat_id(local_order.get('sid'))
+            if chat_id:
+                return chat_id
+
+        return self._lookup_recent_chat_id_for_history_order(order)
+
+    def _persist_history_order_candidate(self, order: Dict[str, Any], detail: Dict[str, Any] = None,
+                                         chat_id: str = None) -> bool:
+        merged = dict(order or {})
+        if isinstance(detail, dict):
+            for key in (
+                'spec_name', 'spec_value', 'spec_name_2', 'spec_value_2',
+                'quantity', 'amount', 'order_status',
+                'platform_created_at', 'platform_paid_at', 'platform_completed_at',
+            ):
+                if detail.get(key) not in (None, ''):
+                    merged[key] = detail.get(key)
+
+        order_id = str(merged.get('order_id') or '').strip()
+        if not order_id:
+            return False
+
+        return db_manager.insert_or_update_order(
+            order_id=order_id,
+            item_id=str(merged.get('item_id') or '').strip() or None,
+            buyer_id=self._normalize_buyer_id_value(merged.get('buyer_id')),
+            buyer_nick=merged.get('buyer_nick'),
+            sid=chat_id or merged.get('sid'),
+            spec_name=merged.get('spec_name'),
+            spec_value=merged.get('spec_value'),
+            spec_name_2=merged.get('spec_name_2'),
+            spec_value_2=merged.get('spec_value_2'),
+            quantity=str(merged.get('quantity')) if merged.get('quantity') not in (None, '') else None,
+            amount=str(merged.get('amount')) if merged.get('amount') not in (None, '') else None,
+            order_status=merged.get('order_status'),
+            cookie_id=self.cookie_id,
+            platform_created_at=merged.get('platform_created_at'),
+            platform_paid_at=merged.get('platform_paid_at'),
+            platform_completed_at=merged.get('platform_completed_at'),
+        )
+
+    async def _notify_pending_order_reconcile_issue(self, order: Dict[str, Any], reason: str,
+                                                    chat_id: str = None) -> None:
+        order_id = str(order.get('order_id') or '').strip()
+        notice_key = f"{order_id}:{reason}"
+        now = time.time()
+        last_notice = self.pending_order_reconcile_notice_times.get(notice_key, 0)
+        if now - last_notice < self.pending_order_reconcile_notice_cooldown:
+            return
+        self.pending_order_reconcile_notice_times[notice_key] = now
+        await self.send_delivery_failure_notification(
+            send_user_name=order.get('buyer_nick') or '买家',
+            send_user_id=order.get('buyer_id') or 'unknown',
+            item_id=order.get('item_id') or 'unknown',
+            error_message=reason,
+            chat_id=chat_id,
+            order_id=order_id or None,
+        )
+
+    async def _fetch_recent_history_orders_for_reconcile(self) -> Tuple[Dict[str, Any], str]:
+        from utils.order_history_sync import OrderHistoryPageFetcher
+
+        fetcher = OrderHistoryPageFetcher(
+            self.cookies_str,
+            cookie_id_for_log=self.cookie_id,
+            headless=True,
+        )
+        try:
+            result = await fetcher.fetch_recent_orders(max_orders=self.pending_order_reconcile_max_orders)
+            latest_cookie = fetcher.cookie_string
+            return result, latest_cookie
+        finally:
+            await fetcher.close()
+
+    async def _reconcile_pending_orders_once(self) -> Dict[str, int]:
+        if not self.pending_order_reconcile_enabled:
+            return {'scanned': 0, 'pending': 0, 'delivered': 0, 'skipped': 0}
+        if not self._is_websocket_ready_for_delivery():
+            return {'scanned': 0, 'pending': 0, 'delivered': 0, 'skipped': 0}
+        if self.pending_order_reconcile_lock.locked():
+            logger.info(f"【{self.cookie_id}】待发货补偿巡检仍在执行，跳过本轮")
+            return {'scanned': 0, 'pending': 0, 'delivered': 0, 'skipped': 0}
+
+        async with self.pending_order_reconcile_lock:
+            result, latest_cookie = await self._fetch_recent_history_orders_for_reconcile()
+            if latest_cookie and latest_cookie != self.cookies_str:
+                self._set_runtime_cookie_state(cookies_str=latest_cookie, source='pending_order_reconcile')
+
+            orders = result.get('orders') or []
+            pending_orders = [
+                order for order in orders
+                if str(order.get('order_status') or '').strip() == 'pending_ship'
+            ]
+            stats = {'scanned': len(orders), 'pending': len(pending_orders), 'delivered': 0, 'skipped': 0}
+
+            if not pending_orders:
+                logger.debug(f"【{self.cookie_id}】待发货补偿巡检完成: scanned={len(orders)}, pending=0")
+                return stats
+
+            logger.warning(
+                f"【{self.cookie_id}】待发货补偿巡检发现 {len(pending_orders)} 笔平台待发货订单，"
+                f"scanned={len(orders)}"
+            )
+
+            for order in pending_orders:
+                order_id = str(order.get('order_id') or '').strip()
+                item_id = str(order.get('item_id') or '').strip()
+                buyer_id = self._normalize_buyer_id_value(order.get('buyer_id'))
+                if not order_id or not item_id or not self._is_trustworthy_buyer_id(buyer_id):
+                    stats['skipped'] += 1
+                    reason = '待发货补偿发现订单但关键字段不完整，已跳过'
+                    self._persist_history_order_candidate(order)
+                    self._record_delivery_log(
+                        order_id=order_id or None,
+                        item_id=item_id or None,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        status='skipped',
+                        reason=reason,
+                        channel='reconcile',
+                    )
+                    await self._notify_pending_order_reconcile_issue(order, reason)
+                    continue
+
+                if self._is_history_order_too_old_for_reconcile(order):
+                    stats['skipped'] += 1
+                    reason = '待发货补偿发现超出年龄窗口的订单，已跳过'
+                    self._persist_history_order_candidate(order)
+                    self._record_delivery_log(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        status='skipped',
+                        reason=reason,
+                        channel='reconcile',
+                    )
+                    await self._notify_pending_order_reconcile_issue(order, reason)
+                    continue
+
+                if self.is_lock_held(order_id) or not self.can_auto_delivery(order_id):
+                    stats['skipped'] += 1
+                    logger.info(f"【{self.cookie_id}】待发货补偿跳过已在处理/冷却订单: order_id={order_id}")
+                    continue
+
+                detail = None
+                try:
+                    detail = await self.fetch_order_detail_info(
+                        order_id,
+                        item_id,
+                        buyer_id,
+                        force_refresh=True,
+                    )
+                except Exception as detail_error:
+                    logger.warning(
+                        f"【{self.cookie_id}】待发货补偿强刷订单详情失败，继续使用列表信息: "
+                        f"order_id={order_id}, error={self._safe_str(detail_error)}"
+                    )
+
+                latest_status = str((detail or {}).get('order_status') or order.get('order_status') or '').strip()
+                chat_id = self._resolve_history_order_chat_id(order, detail)
+                self._persist_history_order_candidate(order, detail=detail, chat_id=chat_id)
+
+                if latest_status != 'pending_ship':
+                    stats['skipped'] += 1
+                    logger.info(
+                        f"【{self.cookie_id}】待发货补偿二次确认后订单已非待发货，跳过: "
+                        f"order_id={order_id}, status={latest_status or 'unknown'}"
+                    )
+                    continue
+
+                if not chat_id:
+                    stats['skipped'] += 1
+                    reason = '待发货补偿发现平台待发货订单，但缺少会话ID，无法安全自动发货'
+                    self._record_delivery_log(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        buyer_nick=order.get('buyer_nick'),
+                        status='skipped',
+                        reason=reason,
+                        channel='reconcile',
+                    )
+                    await self._notify_pending_order_reconcile_issue(order, reason)
+                    continue
+
+                if not self._is_websocket_ready_for_delivery():
+                    stats['skipped'] += 1
+                    logger.warning(f"【{self.cookie_id}】待发货补偿准备发货时WebSocket不可用，停止本轮")
+                    break
+
+                logger.warning(
+                    f"【{self.cookie_id}】待发货补偿触发自动发货: "
+                    f"order_id={order_id}, item_id={item_id}, buyer_id={buyer_id}, chat_id={chat_id}"
+                )
+                await self._handle_simple_message_auto_delivery(
+                    websocket=self.ws,
+                    order_id=order_id,
+                    item_id=item_id,
+                    user_id=buyer_id,
+                    chat_id=chat_id,
+                    msg_time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                    msg_id=f"pending-order-reconcile-{order_id}",
+                )
+                stats['delivered'] += 1
+
+            return stats
+
+    async def pending_order_reconcile_loop(self):
+        """Periodically reconcile pending_ship orders missed by the websocket stream."""
+        try:
+            if self.pending_order_reconcile_boot_delay > 0:
+                await self._interruptible_sleep(self.pending_order_reconcile_boot_delay)
+
+            while True:
+                try:
+                    from cookie_manager import manager as cookie_manager
+                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                        logger.info(f"【{self.cookie_id}】账号已禁用，停止待发货补偿巡检")
+                        break
+
+                    if not self.pending_order_reconcile_enabled:
+                        await self._interruptible_sleep(300)
+                        continue
+
+                    stats = await self._reconcile_pending_orders_once()
+                    if stats.get('pending') or stats.get('delivered') or stats.get('skipped'):
+                        logger.info(f"【{self.cookie_id}】待发货补偿巡检结果: {stats}")
+
+                    await self._interruptible_sleep(self.pending_order_reconcile_interval)
+                except asyncio.CancelledError:
+                    logger.info(f"【{self.cookie_id}】待发货补偿巡检收到取消信号")
+                    raise
+                except Exception as e:
+                    logger.error(f"【{self.cookie_id}】待发货补偿巡检异常: {self._safe_str(e)}")
+                    await self._interruptible_sleep(min(self.pending_order_reconcile_interval, 60))
+        except asyncio.CancelledError:
+            logger.info(f"【{self.cookie_id}】待发货补偿巡检已取消")
+            raise
+        finally:
+            logger.info(f"【{self.cookie_id}】待发货补偿巡检已退出")
+
     def _reset_background_tasks(self):
         """直接重置后台任务引用，不等待取消（用于快速重连）
         
@@ -1780,6 +2153,9 @@ class XianyuLive:
         if self.stream_watchdog_task:
             status = "已完成" if self.stream_watchdog_task.done() else "运行中"
             other_tasks_status.append(f"业务流看门狗({status})")
+        if self.pending_order_reconcile_task:
+            status = "已完成" if self.pending_order_reconcile_task.done() else "运行中"
+            other_tasks_status.append(f"待发货补偿巡检({status})")
         
         if other_tasks_status:
             logger.info(f"【{self.cookie_id}】其他任务继续运行（不依赖WebSocket）: {', '.join(other_tasks_status)}")
@@ -1823,6 +2199,12 @@ class XianyuLive:
                     tasks_to_cancel.append(("业务流看门狗", self.stream_watchdog_task))
                 else:
                     logger.debug(f"【{self.cookie_id}】业务流看门狗已完成，跳过")
+
+            if self.pending_order_reconcile_task:
+                if not self.pending_order_reconcile_task.done():
+                    tasks_to_cancel.append(("待发货补偿巡检", self.pending_order_reconcile_task))
+                else:
+                    logger.debug(f"【{self.cookie_id}】待发货补偿巡检已完成，跳过")
             
             if not tasks_to_cancel:
                 logger.info(f"【{self.cookie_id}】没有后台任务需要取消（所有任务已完成或不存在）")
@@ -1832,6 +2214,7 @@ class XianyuLive:
                 self.cleanup_task = None
                 self.cookie_refresh_task = None
                 self.stream_watchdog_task = None
+                self.pending_order_reconcile_task = None
                 return
             
             logger.info(f"【{self.cookie_id}】开始取消 {len(tasks_to_cancel)} 个未完成的后台任务...")
@@ -1967,6 +2350,7 @@ class XianyuLive:
             self.cleanup_task = None
             self.cookie_refresh_task = None
             self.stream_watchdog_task = None
+            self.pending_order_reconcile_task = None
             logger.info(f"【{self.cookie_id}】后台任务引用已全部重置")
 
     def _calculate_retry_delay(self, error_msg: str) -> int:
@@ -2229,6 +2613,30 @@ class XianyuLive:
         self.stream_watchdog_trigger_times = deque(maxlen=8)
         self.message_stream_notification_window = max(self.message_stream_watchdog_timeout * 2, 3600)
         self.message_stream_notification_cooldown = max(self.message_stream_watchdog_timeout, 1800)
+        self.pending_order_reconcile_task = None
+        self.pending_order_reconcile_lock = asyncio.Lock()
+        self.pending_order_reconcile_enabled = bool(RISK_CONTROL.get('pending_order_reconcile_enabled', True))
+        self.pending_order_reconcile_interval = max(
+            30,
+            int(RISK_CONTROL.get('pending_order_reconcile_interval_seconds', 120) or 120),
+        )
+        self.pending_order_reconcile_boot_delay = max(
+            0,
+            int(RISK_CONTROL.get('pending_order_reconcile_boot_delay_seconds', 30) or 30),
+        )
+        self.pending_order_reconcile_max_orders = max(
+            1,
+            min(int(RISK_CONTROL.get('pending_order_reconcile_max_orders', 20) or 20), 100),
+        )
+        self.pending_order_reconcile_max_order_age_minutes = max(
+            1,
+            int(RISK_CONTROL.get('pending_order_reconcile_max_order_age_minutes', 1440) or 1440),
+        )
+        self.pending_order_reconcile_notice_cooldown = max(
+            300,
+            int(RISK_CONTROL.get('pending_order_reconcile_notice_cooldown_seconds', 1800) or 1800),
+        )
+        self.pending_order_reconcile_notice_times = {}
 
         prewarmed_token_info = self.pop_auth_prewarmed_token(self.cookie_id)
         if prewarmed_token_info:
@@ -16402,6 +16810,14 @@ class XianyuLive:
                             else:
                                 logger.info(f"【{self.cookie_id}】业务流看门狗任务已在运行，跳过启动")
 
+                            if self.pending_order_reconcile_enabled:
+                                if not self.pending_order_reconcile_task or self.pending_order_reconcile_task.done():
+                                    logger.info(f"【{self.cookie_id}】启动待发货补偿巡检任务...")
+                                    self.pending_order_reconcile_task = asyncio.create_task(self.pending_order_reconcile_loop())
+                                    tasks_started.append("待发货补偿巡检")
+                                else:
+                                    logger.info(f"【{self.cookie_id}】待发货补偿巡检任务已在运行，跳过启动")
+
                             # 启动消息队列工作协程（高性能消息处理）
                             if self.message_queue_enabled:
                                 await self._start_message_queue_workers()
@@ -16410,7 +16826,7 @@ class XianyuLive:
                             # 记录所有后台任务状态
                             if tasks_started:
                                 logger.info(f"【{self.cookie_id}】✅ 新启动的任务: {', '.join(tasks_started)}")
-                            logger.info(f"【{self.cookie_id}】✅ 所有后台任务状态: 心跳(已启动), 会话保活({'运行中' if self.token_refresh_task and not self.token_refresh_task.done() else '已启动'}), 暂停清理({'运行中' if self.cleanup_task and not self.cleanup_task.done() else '已启动'}), Cookie刷新({'运行中' if self.cookie_refresh_task and not self.cookie_refresh_task.done() else '已启动'}), 业务流看门狗({'运行中' if self.stream_watchdog_task and not self.stream_watchdog_task.done() else '已启动'})")
+                            logger.info(f"【{self.cookie_id}】✅ 所有后台任务状态: 心跳(已启动), 会话保活({'运行中' if self.token_refresh_task and not self.token_refresh_task.done() else '已启动'}), 暂停清理({'运行中' if self.cleanup_task and not self.cleanup_task.done() else '已启动'}), Cookie刷新({'运行中' if self.cookie_refresh_task and not self.cookie_refresh_task.done() else '已启动'}), 业务流看门狗({'运行中' if self.stream_watchdog_task and not self.stream_watchdog_task.done() else '已启动'}), 待发货补偿巡检({'运行中' if self.pending_order_reconcile_task and not self.pending_order_reconcile_task.done() else '已启动' if self.pending_order_reconcile_enabled else '未启用'})")
                             
                             logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
                             logger.info(f"【{self.cookie_id}】WebSocket连接状态正常，等待服务器消息...")
@@ -16671,6 +17087,7 @@ class XianyuLive:
                         self.cleanup_task = None
                         self.cookie_refresh_task = None
                         self.stream_watchdog_task = None
+                        self.pending_order_reconcile_task = None
                         logger.warning(f"【{self.cookie_id}】清理失败，已强制重置所有任务引用")
                         # 使用可中断的sleep，并定期输出日志
                         logger.info(f"【{self.cookie_id}】清理失败后开始等待 {retry_delay} 秒...")
@@ -16714,7 +17131,8 @@ class XianyuLive:
                 self.token_refresh_task and not self.token_refresh_task.done(),
                 self.cleanup_task and not self.cleanup_task.done(),
                 self.cookie_refresh_task and not self.cookie_refresh_task.done(),
-                self.stream_watchdog_task and not self.stream_watchdog_task.done()
+                self.stream_watchdog_task and not self.stream_watchdog_task.done(),
+                self.pending_order_reconcile_task and not self.pending_order_reconcile_task.done()
             ])
             
             if has_pending_tasks:
@@ -16736,6 +17154,7 @@ class XianyuLive:
                     self.cleanup_task = None
                     self.cookie_refresh_task = None
                     self.stream_watchdog_task = None
+                    self.pending_order_reconcile_task = None
             else:
                 logger.info(f"【{self.cookie_id}】所有后台任务已清理完成，跳过重复清理")
                 # 确保任务引用被重置
@@ -16744,6 +17163,7 @@ class XianyuLive:
                 self.cleanup_task = None
                 self.cookie_refresh_task = None
                 self.stream_watchdog_task = None
+                self.pending_order_reconcile_task = None
             
             # 清理所有后台任务
             if self.background_tasks:
