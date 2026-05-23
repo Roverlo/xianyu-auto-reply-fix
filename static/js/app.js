@@ -3639,19 +3639,19 @@ function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
         };
     }
 
-    if (runtimeStatus?.connection_state === 'connecting' || runtimeStatus?.connection_state === 'reconnecting') {
-        return {
-            tone: 'info',
-            title: '连接正在恢复',
-            note: '主链路还在波动，先观察连接状态与最近消息时间是否继续推进。',
-        };
-    }
-
     if (runtimeStatus?.token_refresh_status === 'server_overload_rgv587') {
         return {
             tone: 'warning',
             title: runtimeStatus?.has_current_token ? 'Token 可用，刷新限流中' : '平台限流等待中',
             note: runtimeStatus?.token_refresh_error_message || '闲鱼 Token 接口返回 RGV587/被挤爆，系统已暂停激进恢复，稍后自动重试。',
+        };
+    }
+
+    if (runtimeStatus?.connection_state === 'connecting' || runtimeStatus?.connection_state === 'reconnecting') {
+        return {
+            tone: 'info',
+            title: '连接正在恢复',
+            note: '主链路还在波动，先观察连接状态与最近消息时间是否继续推进。',
         };
     }
 

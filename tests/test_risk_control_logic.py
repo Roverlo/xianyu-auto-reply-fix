@@ -164,6 +164,24 @@ class RiskControlLogicTest(unittest.TestCase):
         self.assertTrue(XianyuLive._is_token_x5secdata(token_ticket))
         self.assertFalse(XianyuLive._is_token_x5secdata(recommend_ticket))
 
+    def test_image_probe_failure_with_valid_web_session_does_not_recommend_relogin(self):
+        result = {
+            "valid": False,
+            "confirm_api": None,
+            "web_session_api": True,
+            "image_api": False,
+            "details": ["图片上传API: 返回登录页面"],
+            "inconclusive": False,
+            "relogin_recommended": True,
+        }
+
+        normalized = self.live._normalize_cookie_validation_result(result)
+
+        self.assertTrue(normalized["valid"])
+        self.assertIsNone(normalized["image_api"])
+        self.assertTrue(normalized["inconclusive"])
+        self.assertFalse(normalized["relogin_recommended"])
+
 
 if __name__ == "__main__":
     unittest.main()

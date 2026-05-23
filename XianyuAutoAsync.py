@@ -735,10 +735,33 @@ class XianyuLive:
             cookie_id
             for cookie_id, state in cls._password_login_failure_backoff.items()
             if now >= state.get('until', 0)
+            and not cls._should_keep_expired_backoff_history(state, now)
         ]
         for cookie_id in expired_cookie_ids:
             cls._password_login_failure_backoff.pop(cookie_id, None)
             cls._clear_persisted_login_backoff(cookie_id)
+
+    @classmethod
+    def _should_keep_expired_backoff_history(cls, state: Optional[Dict[str, Any]], now: Optional[float] = None) -> bool:
+        """保留短期平台限流历史，用于连续退避递增；不代表退避仍然生效。"""
+        if not isinstance(state, dict):
+            return False
+        if str(state.get('reason') or '').strip() != 'server_overload':
+            return False
+
+        now = now or time.time()
+        try:
+            created_at = float(state.get('created_at') or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        if created_at <= 0:
+            return False
+
+        history_seconds = max(
+            int(RISK_CONTROL.get('server_overload_backoff_max_seconds', 1800) or 1800) * 2,
+            int(RISK_CONTROL.get('server_overload_backoff_seconds', 600) or 600) * 2,
+        )
+        return (now - created_at) <= history_seconds
 
     @classmethod
     def _login_backoff_setting_key(cls, cookie_id: str) -> str:
@@ -755,7 +778,10 @@ class XianyuLive:
             state = json.loads(raw_value)
             if not isinstance(state, dict):
                 return None
-            if time.time() >= float(state.get('until') or 0):
+            now = time.time()
+            if now >= float(state.get('until') or 0):
+                if cls._should_keep_expired_backoff_history(state, now):
+                    return state
                 cls._clear_persisted_login_backoff(cookie_id)
                 return None
             return state
@@ -1931,6 +1957,77 @@ class XianyuLive:
             order_id=order_id or None,
         )
 
+    def _pending_order_reconcile_backoff_remaining(self) -> float:
+        backoff_until = float(getattr(self, 'pending_order_reconcile_backoff_until', 0) or 0)
+        return max(0.0, backoff_until - time.time())
+
+    def _is_pending_order_reconcile_session_expired_error(self, error: Exception) -> bool:
+        error_kind = str(getattr(error, 'kind', '') or '').lower()
+        if error_kind == 'session_expired':
+            return True
+
+        error_text = self._safe_str(error).lower()
+        session_markers = (
+            'fail_sys_session_expired',
+            'fail_sys_token_expired',
+            'fail_sys_token_exoired',
+            'session expired',
+            'mini_login',
+            'passport.goofish.com',
+        )
+        return any(marker in error_text for marker in session_markers)
+
+    def _enter_pending_order_reconcile_backoff(self, reason: str, seconds: int) -> int:
+        backoff_seconds = max(1, int(seconds or 0))
+        self.pending_order_reconcile_backoff_until = time.time() + backoff_seconds
+        self.pending_order_reconcile_last_error_kind = reason
+        return backoff_seconds
+
+    def _clear_pending_order_reconcile_backoff(self) -> None:
+        if getattr(self, 'pending_order_reconcile_backoff_until', 0):
+            logger.info(
+                f"[{self.cookie_id}] pending-order reconcile recovered; clearing "
+                f"backoff={getattr(self, 'pending_order_reconcile_last_error_kind', None) or 'unknown'}"
+            )
+        self.pending_order_reconcile_backoff_until = 0.0
+        self.pending_order_reconcile_last_error_kind = None
+        if getattr(self, 'last_token_refresh_status', None) == 'history_session_expired':
+            self.last_token_refresh_status = 'success'
+            self.last_token_refresh_error_message = None
+
+    async def _handle_pending_order_reconcile_fetch_error(self, error: Exception) -> Dict[str, int]:
+        stats = {'scanned': 0, 'pending': 0, 'delivered': 0, 'skipped': 0}
+        if self._is_pending_order_reconcile_session_expired_error(error):
+            backoff_seconds = self._enter_pending_order_reconcile_backoff(
+                'session_expired',
+                getattr(self, 'pending_order_reconcile_session_expired_backoff', 1800),
+            )
+            self.last_token_refresh_status = 'history_session_expired'
+            self.last_token_refresh_error_message = self._safe_str(error)[:240]
+            try:
+                self._reload_latest_cookies_from_db("pending order reconcile session expired")
+            except Exception as reload_error:
+                logger.debug(
+                    f"[{self.cookie_id}] pending-order reconcile db cookie reload skipped: "
+                    f"{self._safe_str(reload_error)}"
+                )
+            logger.warning(
+                f"[{self.cookie_id}] pending-order reconcile paused: order history session expired; "
+                f"retry_after={backoff_seconds}s; realtime websocket delivery remains active; "
+                f"error={self._safe_str(error)}"
+            )
+            return stats
+
+        backoff_seconds = self._enter_pending_order_reconcile_backoff(
+            str(getattr(error, 'kind', '') or 'fetch_error'),
+            getattr(self, 'pending_order_reconcile_error_backoff', 300),
+        )
+        logger.error(
+            f"[{self.cookie_id}] pending-order reconcile fetch failed; retry_after={backoff_seconds}s; "
+            f"error={self._safe_str(error)}"
+        )
+        return stats
+
     async def _fetch_recent_history_orders_for_reconcile(self) -> Tuple[Dict[str, Any], str]:
         from utils.order_history_sync import OrderHistoryPageFetcher
 
@@ -1951,12 +2048,19 @@ class XianyuLive:
             return {'scanned': 0, 'pending': 0, 'delivered': 0, 'skipped': 0}
         if not self._is_websocket_ready_for_delivery():
             return {'scanned': 0, 'pending': 0, 'delivered': 0, 'skipped': 0}
+        if self._pending_order_reconcile_backoff_remaining() > 0:
+            return {'scanned': 0, 'pending': 0, 'delivered': 0, 'skipped': 0}
         if self.pending_order_reconcile_lock.locked():
             logger.info(f"【{self.cookie_id}】待发货补偿巡检仍在执行，跳过本轮")
             return {'scanned': 0, 'pending': 0, 'delivered': 0, 'skipped': 0}
 
         async with self.pending_order_reconcile_lock:
-            result, latest_cookie = await self._fetch_recent_history_orders_for_reconcile()
+            try:
+                result, latest_cookie = await self._fetch_recent_history_orders_for_reconcile()
+            except Exception as fetch_error:
+                return await self._handle_pending_order_reconcile_fetch_error(fetch_error)
+
+            self._clear_pending_order_reconcile_backoff()
             if latest_cookie and latest_cookie != self.cookies_str:
                 self._set_runtime_cookie_state(cookies_str=latest_cookie, source='pending_order_reconcile')
 
@@ -2637,6 +2741,16 @@ class XianyuLive:
             int(RISK_CONTROL.get('pending_order_reconcile_notice_cooldown_seconds', 1800) or 1800),
         )
         self.pending_order_reconcile_notice_times = {}
+        self.pending_order_reconcile_session_expired_backoff = max(
+            300,
+            int(RISK_CONTROL.get('pending_order_reconcile_session_expired_backoff_seconds', 1800) or 1800),
+        )
+        self.pending_order_reconcile_error_backoff = max(
+            60,
+            int(RISK_CONTROL.get('pending_order_reconcile_error_backoff_seconds', 300) or 300),
+        )
+        self.pending_order_reconcile_backoff_until = 0.0
+        self.pending_order_reconcile_last_error_kind = None
 
         prewarmed_token_info = self.pop_auth_prewarmed_token(self.cookie_id)
         if prewarmed_token_info:
@@ -7140,11 +7254,30 @@ class XianyuLive:
                     ):
                         risk_category = risk_decision.get('risk_category')
                         qr_login_grace = self.get_qr_login_grace(self.cookie_id)
-                        if (
-                            qr_login_grace
-                            and not qr_login_grace.get('captcha_buffer_used')
-                            and risk_category != 'server_overload_rgv587'
-                        ):
+                        if qr_login_grace and not qr_login_grace.get('captcha_buffer_used'):
+                            if risk_category == 'server_overload_rgv587':
+                                retry_seconds = int(risk_decision.get('retry_after_seconds') or self.server_overload_backoff_seconds)
+                                backoff_state = self._set_hard_risk_backoff('server_overload', retry_seconds)
+                                self.update_qr_login_grace(
+                                    self.cookie_id,
+                                    captcha_buffer_used=True,
+                                    server_overload_seen_at=time.time(),
+                                )
+                                self.last_token_refresh_status = risk_category
+                                self.last_token_refresh_error_message = (
+                                    f"扫码登录后Token接口平台限流，暂不继续滑块，等待{int(backoff_state.get('seconds') or retry_seconds)}秒后自动重试"
+                                )
+                                log_captcha_event(
+                                    self.cookie_id,
+                                    "扫码登录首轮Token刷新遇到平台限流，跳过自动滑块",
+                                    False,
+                                    (
+                                        f"risk_category={risk_category}, reason={risk_decision.get('reason')}, "
+                                        f"backoff_seconds={backoff_state.get('seconds')}, target_api={risk_decision.get('target_api')}"
+                                    )
+                                )
+                                return None
+
                             logger.warning(f"【{self.cookie_id}】扫码登录后的首轮Token刷新命中风控，执行一次浏览器侧Cookie稳定化后进入稳定期退避，避免继续挤爆")
                             log_captcha_event(
                                 self.cookie_id,
@@ -8606,6 +8739,31 @@ class XianyuLive:
             if recovery_lock_acquired:
                 XianyuLive.release_auth_recovery_lock(self.cookie_id, recovery_lock_owner)
 
+    def _normalize_cookie_validation_result(self, result: dict) -> dict:
+        if result.get('image_api') is False and result.get('web_session_api') is True:
+            logger.warning(
+                f"[{self.cookie_id}] image upload probe failed while web session is valid; "
+                f"keeping cookie usable and skipping automatic relogin for this probe"
+            )
+            result['valid'] = True
+            result['image_api'] = None
+            result['inconclusive'] = True
+            result['relogin_recommended'] = False
+            details = result.get('details')
+            if isinstance(details, list):
+                details.append("validation: image upload degraded while web session is valid")
+        elif result.get('image_api') is False:
+            result['valid'] = False
+        elif result.get('web_session_api') is False and result.get('image_api') is not True:
+            result['valid'] = False
+        elif result.get('web_session_api') is False and result.get('image_api') is True:
+            logger.warning(f"【{self.cookie_id}】❌ 网页登录态与图片上传校验结果不一致，按严格策略判定Cookie失效")
+            result['valid'] = False
+            details = result.get('details')
+            if isinstance(details, list):
+                details.append("校验结果: 网页登录态与图片上传结果不一致")
+        return result
+
     async def _verify_cookie_validity(self) -> dict:
         """验证Cookie的有效性，通过实际调用API测试
         
@@ -8852,12 +9010,22 @@ class XianyuLive:
                             result['relogin_recommended'] = False
                         result['details'].append(f"图片上传API: 服务端异常，结果不确定 (HTTP {uploader.last_http_status})")
                     elif error_type == 'auth' and error_message == '返回登录页面':
-                        logger.warning(
-                            f"【{self.cookie_id}】❌ 图片上传接口返回登录页，按旧版严格策略判定Cookie失效"
-                        )
-                        result['image_api'] = False
-                        result['valid'] = False
-                        result['details'].append("图片上传API: 返回登录页面")
+                        if result['web_session_api'] is True:
+                            logger.warning(
+                                f"[{self.cookie_id}] image upload probe returned login page, "
+                                f"but web session is valid; treating upload as degraded"
+                            )
+                            result['image_api'] = None
+                            result['inconclusive'] = True
+                            result['relogin_recommended'] = False
+                            result['details'].append("图片上传API: 返回登录页面，但网页登录态有效，按降级处理")
+                        else:
+                            logger.warning(
+                                f"【{self.cookie_id}】❌ 图片上传接口返回登录页，且网页登录态未确认有效，判定Cookie失效"
+                            )
+                            result['image_api'] = False
+                            result['valid'] = False
+                            result['details'].append("图片上传API: 返回登录页面")
                     else:
                         # 明确认证/会话异常才视为Cookie失效
                         logger.warning(f"【{self.cookie_id}】❌ 图片上传API验证失败: {error_message}")
@@ -8891,14 +9059,7 @@ class XianyuLive:
                     result['relogin_recommended'] = False
                 result['details'].append(f"图片上传API: 验证异常，结果不确定 - {error_str[:50]}")
         
-        if result['image_api'] is False:
-            result['valid'] = False
-        elif result['web_session_api'] is False and result['image_api'] is not True:
-            result['valid'] = False
-        elif result['web_session_api'] is False and result['image_api'] is True:
-            logger.warning(f"【{self.cookie_id}】❌ 网页登录态与图片上传校验结果不一致，按严格策略判定Cookie失效")
-            result['valid'] = False
-            result['details'].append("校验结果: 网页登录态与图片上传结果不一致")
+        result = self._normalize_cookie_validation_result(result)
 
         # 汇总结果
         if result['valid']:

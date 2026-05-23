@@ -149,6 +149,8 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'pending_order_reconcile_max_orders': 20,
     'pending_order_reconcile_max_order_age_minutes': 1440,
     'pending_order_reconcile_notice_cooldown_seconds': 1800,
+    'pending_order_reconcile_session_expired_backoff_seconds': 1800,
+    'pending_order_reconcile_error_backoff_seconds': 300,
 })
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):

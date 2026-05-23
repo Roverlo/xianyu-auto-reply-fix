@@ -58,6 +58,8 @@ def _install_import_stubs():
         "pending_order_reconcile_max_orders": 20,
         "pending_order_reconcile_max_order_age_minutes": 1440,
         "pending_order_reconcile_notice_cooldown_seconds": 1800,
+        "pending_order_reconcile_session_expired_backoff_seconds": 1800,
+        "pending_order_reconcile_error_backoff_seconds": 300,
     }
     sys.modules["config"] = config
 
@@ -131,11 +133,18 @@ class PendingOrderReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.live.connection_state = ConnectionState.CONNECTED
         self.live.pending_order_reconcile_enabled = True
         self.live.pending_order_reconcile_lock = asyncio.Lock()
-        self.live.pending_order_reconcile_max_order_age_minutes = 1440
+        self.live.pending_order_reconcile_max_order_age_minutes = 10080
         self.live.pending_order_reconcile_notice_cooldown = 300
         self.live.pending_order_reconcile_notice_times = {}
+        self.live.pending_order_reconcile_session_expired_backoff = 1800
+        self.live.pending_order_reconcile_error_backoff = 300
+        self.live.pending_order_reconcile_backoff_until = 0
+        self.live.pending_order_reconcile_last_error_kind = None
+        self.live.last_token_refresh_status = None
+        self.live.last_token_refresh_error_message = None
         self.live._safe_str = str
         self.live._set_runtime_cookie_state = lambda *args, **kwargs: False
+        self.live._reload_latest_cookies_from_db = lambda *args, **kwargs: False
         self.live.can_auto_delivery = lambda _order_id: True
         self.live.is_lock_held = lambda _order_id: False
 
@@ -223,6 +232,38 @@ class PendingOrderReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(logs[0]["order_id"], "ORDER-2")
         self.assertEqual(logs[0]["status"], "skipped")
         self.assertEqual(notices[0][0]["order_id"], "ORDER-2")
+
+    async def test_reconcile_session_expired_enters_backoff_without_delivery(self):
+        class SessionExpiredError(RuntimeError):
+            kind = "session_expired"
+
+        fetch_count = 0
+        deliveries = []
+
+        async def fetch_orders():
+            nonlocal fetch_count
+            fetch_count += 1
+            raise SessionExpiredError("FAIL_SYS_SESSION_EXPIRED::Session expired")
+
+        async def delivery(**kwargs):
+            deliveries.append(kwargs)
+
+        self.live._fetch_recent_history_orders_for_reconcile = fetch_orders
+        self.live._handle_simple_message_auto_delivery = delivery
+
+        stats = await self.live._reconcile_pending_orders_once()
+
+        self.assertEqual(stats, {"scanned": 0, "pending": 0, "delivered": 0, "skipped": 0})
+        self.assertEqual(fetch_count, 1)
+        self.assertEqual(deliveries, [])
+        self.assertEqual(self.live.pending_order_reconcile_last_error_kind, "session_expired")
+        self.assertGreater(self.live.pending_order_reconcile_backoff_until, 0)
+        self.assertEqual(self.live.last_token_refresh_status, "history_session_expired")
+
+        stats = await self.live._reconcile_pending_orders_once()
+
+        self.assertEqual(stats, {"scanned": 0, "pending": 0, "delivered": 0, "skipped": 0})
+        self.assertEqual(fetch_count, 1)
 
 
 if __name__ == "__main__":

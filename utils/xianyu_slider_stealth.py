@@ -264,6 +264,24 @@ class PasswordLoginVerificationError(Exception):
     """账号密码登录流程中的可识别验证错误。"""
 
 
+def _is_browser_warmup_server_overload_hint(verification_hint: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(verification_hint, dict):
+        return False
+
+    ret_values = verification_hint.get('ret') or []
+    if isinstance(ret_values, (list, tuple, set)):
+        ret_summary = " ".join(str(item) for item in ret_values if item is not None)
+    else:
+        ret_summary = str(ret_values or '')
+
+    summary = f"{ret_summary} {verification_hint.get('summary') or ''}"
+    if 'RGV587_ERROR' not in summary:
+        return False
+
+    server_overload_keywords = ('被挤爆', '请稍后重试', '稍后再试', '系统繁忙')
+    return any(keyword in summary for keyword in server_overload_keywords)
+
+
 class VerificationFrameWrapper:
     def __init__(self, original_frame, verification_type='unknown', verify_url=None, screenshot_path=None):
         self._original_frame = original_frame
@@ -4453,6 +4471,18 @@ class XianyuSliderStealth:
         if not verification_url or not context:
             return None
 
+        if _is_browser_warmup_server_overload_hint(verification_hint):
+            logger.warning(
+                f"【{self.pure_user_id}】浏览器业务预热命中平台限流，跳过验证页滑块接管: {verification_url}"
+            )
+            self.last_login_error = "平台Token接口限流，稍后自动重试"
+            self.last_verification_feedback = {
+                "status": "hard_block",
+                "source": "browser_cookie_warmup_server_overload",
+                "message": self.last_login_error,
+            }
+            return None
+
         if cookies_dict.get('havana_lgc2_77'):
             return None
 
@@ -5529,6 +5559,11 @@ class XianyuSliderStealth:
         )
         if warmup_hint_result is not None:
             return warmup_hint_result
+        if (
+            getattr(self, 'last_login_error', '') == "平台Token接口限流，稍后自动重试"
+            and (self.last_verification_feedback or {}).get('source') == 'browser_cookie_warmup_server_overload'
+        ):
+            return self._fail_login(self.last_login_error)
 
         pending_identity_error_before = self.last_login_error
         pending_identity_result = self._handle_pending_identity_verification_state(
