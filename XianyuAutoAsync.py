@@ -472,6 +472,7 @@ class XianyuLive:
                 'handoff_started_at': now,
                 'expires_at': expires_at,
                 'slider_failed_bypass_used': state.get('slider_failed_bypass_used', False),
+                'server_overload_bypass_used': state.get('server_overload_bypass_used', False),
                 'previous_cookie_refresh_enabled': state.get('previous_cookie_refresh_enabled', previous_cookie_refresh_enabled),
             })
             cls._manual_refresh_state[cookie_id] = state
@@ -493,6 +494,21 @@ class XianyuLive:
             if state.get('slider_failed_bypass_used'):
                 return False
             state['slider_failed_bypass_used'] = True
+            state['updated_at'] = time.time()
+            return True
+
+    @classmethod
+    def consume_manual_refresh_server_overload_bypass(cls, cookie_id: str) -> bool:
+        if not cookie_id:
+            return False
+        cls._cleanup_manual_refresh_state()
+        with cls._manual_refresh_lock:
+            state = cls._manual_refresh_state.get(cookie_id)
+            if not state or state.get('phase') != 'handoff_recovery':
+                return False
+            if state.get('server_overload_bypass_used'):
+                return False
+            state['server_overload_bypass_used'] = True
             state['updated_at'] = time.time()
             return True
 
@@ -996,6 +1012,13 @@ class XianyuLive:
         ):
             logger.warning(
                 f"【{self.cookie_id}】检测到最近刚通过滑块或处于刷新交接恢复窗口，忽略一次旧的 slider_failed 退避并继续尝试恢复"
+            )
+            XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
+            return None
+
+        if backoff_reason == 'server_overload' and self.consume_manual_refresh_server_overload_bypass(self.cookie_id):
+            logger.warning(
+                f"【{self.cookie_id}】处于手动刷新交接恢复窗口，忽略一次旧的 server_overload 退避并执行真实Token预检"
             )
             XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
             return None

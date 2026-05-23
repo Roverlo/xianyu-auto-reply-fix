@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 class _Logger:
@@ -108,6 +109,10 @@ class RiskControlLogicTest(unittest.TestCase):
         self.live.hard_risk_backoff_seconds = 7200
         self.live.slider_failure_backoff_seconds = 1800
         self.live.server_overload_backoff_seconds = 600
+        self.live.last_token_refresh_status = None
+        self.live.last_password_login_backoff_log_time = 0.0
+        XianyuLive._password_login_failure_backoff = {}
+        XianyuLive._manual_refresh_state = {}
 
     def test_beijibao_response_is_server_overload_not_slider(self):
         response = {
@@ -181,6 +186,19 @@ class RiskControlLogicTest(unittest.TestCase):
         self.assertIsNone(normalized["image_api"])
         self.assertTrue(normalized["inconclusive"])
         self.assertFalse(normalized["relogin_recommended"])
+
+    def test_manual_refresh_handoff_bypasses_old_server_overload_backoff_once(self):
+        with patch.object(XianyuLive, "_persist_login_backoff", lambda *_args, **_kwargs: None), \
+                patch.object(XianyuLive, "_clear_persisted_login_backoff", lambda *_args, **_kwargs: None):
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            self.assertTrue(self.live._should_skip_token_refresh_for_login_backoff())
+
+            XianyuLive.mark_manual_refresh_handoff("test-cookie", ttl=120)
+            self.assertFalse(self.live._should_skip_token_refresh_for_login_backoff())
+            self.assertIsNone(XianyuLive.get_password_login_failure_backoff("test-cookie"))
+
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            self.assertTrue(self.live._should_skip_token_refresh_for_login_backoff())
 
 
 if __name__ == "__main__":
