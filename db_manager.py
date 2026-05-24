@@ -8207,6 +8207,11 @@ Cookie数量: {cookie_count}
         lower_result = processing_result.lower()
 
         if event_type == 'slider_captcha':
+            if str(log_info.get('result_code') or '').strip() in {
+                'password_login_slider_action_passed',
+                'password_login_slider_success',
+            }:
+                return '滑块动作已通过，继续确认登录态'
             if '滑块验证成功' in processing_result:
                 return '滑块验证成功，已获取新Cookie'
 
@@ -8725,7 +8730,7 @@ Cookie数量: {cookie_count}
                 cursor.execute(
                     f'''
                     SELECT
-                        COALESCE(SUM(CASE WHEN event_type = 'slider_captcha' AND processing_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+                        COALESCE(SUM(CASE WHEN event_type = 'slider_captcha' AND processing_status = 'success' AND COALESCE(result_code, '') NOT IN ('password_login_slider_action_passed', 'password_login_slider_success') THEN 1 ELSE 0 END), 0) AS success_count,
                         COALESCE(SUM(CASE WHEN ((event_type = 'slider_captcha' AND processing_status = 'failed') OR result_code = 'password_login_slider_failed') THEN 1 ELSE 0 END), 0) AS failure_count,
                         COALESCE(SUM(CASE WHEN event_type = 'slider_captcha' AND processing_status = 'processing' THEN 1 ELSE 0 END), 0) AS processing_count,
                         COUNT(DISTINCT CASE WHEN (event_type = 'slider_captcha' OR result_code = 'password_login_slider_failed') THEN cookie_id END) AS accounts_with_sessions
@@ -8766,9 +8771,9 @@ Cookie数量: {cookie_count}
 
                 if total_sessions > 0:
                     if normalized_range == 'all':
-                        summary_text = '已包含全部时间的滑块成功/失败，并将账密刷新中的滑块失败计入失败次数'
+                        summary_text = '已包含全部时间的滑块恢复成功/失败；账密流程中仅“滑块动作通过”的记录不计入恢复成功'
                     else:
-                        summary_text = f'已按{range_label}范围统计滑块成功/失败，并将账密刷新中的滑块失败计入失败次数'
+                        summary_text = f'已按{range_label}范围统计滑块恢复成功/失败；账密流程中仅“滑块动作通过”的记录不计入恢复成功'
                 else:
                     summary_text = '暂无滑块验证记录' if normalized_range == 'all' else f'{range_label}暂无滑块验证记录'
 
@@ -8781,7 +8786,7 @@ Cookie数量: {cookie_count}
                     'processing_count': processing_count,
                     'completed_sessions': completed_sessions,
                     'success_rate': success_rate,
-                    'recent_success': _fetch_recent_datetime("event_type = ? AND processing_status = ?", ['slider_captcha', 'success']),
+                    'recent_success': _fetch_recent_datetime("event_type = ? AND processing_status = ? AND COALESCE(result_code, '') NOT IN (?, ?)", ['slider_captcha', 'success', 'password_login_slider_action_passed', 'password_login_slider_success']),
                     'recent_failure': _fetch_recent_datetime("((event_type = ? AND processing_status = ?) OR result_code = ?)", ['slider_captcha', 'failed', 'password_login_slider_failed']),
                     'accounts_with_sessions': accounts_with_sessions,
                     'accounts_with_failures': accounts_with_sessions,

@@ -482,7 +482,7 @@
                     <i class="bi bi-key me-2"></i>
                     <span class="fw-bold">账密登录</span>
                     <br>
-                    <small class="opacity-75">需填写账号密码，成功后自动保存</small>
+                    <small class="opacity-75">备用获取 Cookie，仍需通过风控</small>
                   </button>
                   <button type="button" class="btn btn-outline-warning btn-lg flex-fill refresh-cookie-btn" onclick="toggleRefreshCookieForm()" style="max-width: 300px;">
                     <i class="bi bi-arrow-repeat me-2"></i>
@@ -501,14 +501,14 @@
             </div>
 
             <div class="text-center text-muted small mb-4">
-              建议优先使用扫码登录或账密登录添加账号，并尽快配置账密。未配置账密时，账号掉线后部分风控与恢复场景可能无法继续处理；如遇掉线，可优先尝试扫码登录或手动刷新 Cookie。
+              建议优先使用扫码登录添加账号，并尽快配置账密作为 Cookie 过期后的备用恢复方式。账密登录不能绕过平台风控，也不能保证 Token 或 WebSocket 长连接恢复；如遇掉线，可优先尝试扫码登录或手动刷新 Cookie。
             </div>
 
             <!-- 账号密码登录表单（默认隐藏） -->
             <div id="passwordLoginForm" style="display: none;">
               <div class="alert alert-info">
                 <i class="bi bi-info-circle me-2"></i>
-                <strong>提示：</strong>用于新增账号或重新获取 Cookie，登录成功后会自动保存账密。登录过程中可能出现滑块或人脸验证，请耐心等待。
+                <strong>提示：</strong>用于新增账号或重新获取 Cookie，登录成功后会自动保存账密。系统会在拿到 Cookie 后继续验证目标 Token，只有 Token 可用才会视为恢复成功；登录过程中可能出现滑块或人脸验证。
               </div>
               <form id="passwordLoginFormElement" class="row g-3">
                 <div class="col-md-4">
@@ -580,7 +580,7 @@
             <div id="refreshCookieForm" style="display: none;">
               <div class="alert alert-warning">
                 <i class="bi bi-exclamation-triangle me-2"></i>
-                <strong>提示：</strong>用于已有账号的手动账密刷新。本流程会读取该账号已保存的用户名和密码，并刷新当前账号 Cookie。
+                <strong>提示：</strong>用于已有账号的手动账密刷新。本流程会读取该账号已保存的用户名和密码，获取 Cookie 后继续做 Token 预检；若平台限流或风控未通过，不会视为恢复成功。
               </div>
               <form id="refreshCookieFormElement" class="row g-3">
                 <div class="col-md-6">
@@ -5149,13 +5149,13 @@
             <div class="mb-3">
               <label class="form-label">用户名</label>
               <input type="text" class="form-control" id="editAccountUsername" placeholder="输入用户名（可选）">
-              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复</div>
+              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复；不能绕过平台风控</div>
             </div>
             
             <div class="mb-3">
               <label class="form-label">密码</label>
               <input type="password" class="form-control" id="editAccountPassword" placeholder="输入密码（可选）">
-              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复</div>
+              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复；Token 预检通过后才算恢复成功</div>
             </div>
             
             <div class="mb-3">

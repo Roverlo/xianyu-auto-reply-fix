@@ -6908,6 +6908,7 @@ class XianyuLive:
                 manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
                 post_slider_session_retry_count=0,
                 allow_auto_slider=False,
+                reload_cookies_from_db=False,
             )
             return preflight_token
         finally:
@@ -7093,7 +7094,8 @@ class XianyuLive:
                                   allow_password_login_recovery: bool = True,
                                   manual_refresh_browser_stabilization_used: bool = False,
                                   post_slider_session_retry_count: int = 0,
-                                  allow_auto_slider: bool = True):
+                                  allow_auto_slider: bool = True,
+                                  reload_cookies_from_db: bool = True):
         """刷新token
 
         Args:
@@ -7140,7 +7142,10 @@ class XianyuLive:
             # 【重要】在刷新token前，先从数据库重新加载最新的cookie
             # 这样即使用户已经手动更新了cookie，代码也会使用最新的cookie
             logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
-            self._reload_latest_cookies_from_db("token刷新前")
+            if reload_cookies_from_db:
+                self._reload_latest_cookies_from_db("token刷新前")
+            else:
+                logger.info(f"【{self.cookie_id}】本次Token刷新使用候选Cookie预检，跳过数据库Cookie重载")
 
             # 生成更精确的时间戳
             timestamp = str(int(time.time() * 1000))
@@ -7381,6 +7386,7 @@ class XianyuLive:
                                     manual_refresh_browser_stabilization_used=True,
                                     post_slider_session_retry_count=post_slider_session_retry_count,
                                     allow_auto_slider=allow_auto_slider,
+                                    reload_cookies_from_db=reload_cookies_from_db,
                                 )
                             logger.warning(f"【{self.cookie_id}】手动刷新交接阶段浏览器稳定化失败，继续进入滑块验证")
 
@@ -7765,6 +7771,7 @@ class XianyuLive:
                                     manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
                                     post_slider_session_retry_count=post_slider_session_retry_count,
                                     allow_auto_slider=allow_auto_slider,
+                                    reload_cookies_from_db=reload_cookies_from_db,
                                 )
 
                             if (
@@ -7798,6 +7805,7 @@ class XianyuLive:
                                     manual_refresh_browser_stabilization_used=manual_refresh_browser_stabilization_used,
                                     post_slider_session_retry_count=settle_retry_attempt,
                                     allow_auto_slider=allow_auto_slider,
+                                    reload_cookies_from_db=reload_cookies_from_db,
                                 )
 
                             refresh_success = False
@@ -8629,7 +8637,44 @@ class XianyuLive:
                 # 将cookie字典转换为字符串格式
                 new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
                 logger.info(f"【{self.cookie_id}】Cookie字符串摘要: {self._summarize_cookie_string(new_cookies_str)}")
-                
+
+                preflight_token = await self._preflight_token_with_candidate_cookies(
+                    new_cookies_str,
+                    captcha_retry_count=0,
+                    manual_refresh_browser_stabilization_used=False,
+                )
+                if not preflight_token:
+                    preflight_error = self.last_token_refresh_error_message or "密码登录Cookie未通过目标Token预检"
+                    self.last_token_refresh_status = "password_login_token_preflight_failed"
+                    self.last_token_refresh_error_message = preflight_error
+                    backoff_state = self._set_hard_risk_backoff('risk_control', self.hard_risk_backoff_seconds)
+                    logger.warning(
+                        f"【{self.cookie_id}】密码登录已获取Cookie，但Token预检失败，不更新数据库: {preflight_error}"
+                    )
+                    if refresh_risk_log_id:
+                        self._update_risk_log(
+                            refresh_risk_log_id,
+                            session_id=risk_session_id,
+                            trigger_scene=trigger_scene,
+                            result_code='password_login_token_preflight_failed',
+                            processing_status='failed',
+                            error_message=preflight_error[:200],
+                            duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
+                            event_meta=self._build_risk_event_meta(
+                                trigger_scene=trigger_scene,
+                                extra={
+                                    **base_event_meta,
+                                    'token_preflight_result': 'failed',
+                                    'cookie_length': len(new_cookies_str),
+                                    'backoff_seconds': backoff_state.get('seconds'),
+                                },
+                            ),
+                        )
+                    return False
+
+                validated_cookies_str = self.cookies_str or new_cookies_str
+                logger.info(f"【{self.cookie_id}】密码登录Cookie已通过目标Token预检，准备落库并重启任务")
+
                 # 记录密码登录时间，防止重复登录
                 XianyuLive._last_password_login_time[self.cookie_id] = time.time()
                 logger.warning(f"【{self.cookie_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} 秒")
@@ -8648,7 +8693,7 @@ class XianyuLive:
                     logger.warning(f"【{self.cookie_id}】发送通知失败: {self._safe_str(notify_e)}")
                 
                 # 更新cookies并重启任务
-                update_success = await self._update_cookies_and_restart(new_cookies_str)
+                update_success = await self._update_cookies_and_restart(validated_cookies_str)
                 
                 if update_success:
                     logger.info(f"【{self.cookie_id}】Cookie更新并重启任务成功")
@@ -8660,9 +8705,16 @@ class XianyuLive:
                             trigger_scene=trigger_scene,
                             result_code='cookie_refresh_success',
                             processing_status='success',
-                            processing_result='密码登录刷新Cookie成功，实例已重启',
+                            processing_result='密码登录Cookie通过Token预检，实例已重启',
                             duration_ms=max(0, int((time.time() - risk_log_started_at) * 1000)),
-                            event_meta=self._build_risk_event_meta(trigger_scene=trigger_scene, extra=base_event_meta),
+                            event_meta=self._build_risk_event_meta(
+                                trigger_scene=trigger_scene,
+                                extra={
+                                    **base_event_meta,
+                                    'token_preflight_result': 'success',
+                                    'cookie_length': len(validated_cookies_str),
+                                },
+                            ),
                         )
                     return True
                 else:

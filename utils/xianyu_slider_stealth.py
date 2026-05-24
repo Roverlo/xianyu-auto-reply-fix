@@ -1262,20 +1262,27 @@ class XianyuSliderStealth:
             if isinstance(extra_meta, dict):
                 merged_event_meta.update({key: value for key, value in extra_meta.items() if value is not None})
 
+            if success:
+                result_code = 'password_login_slider_action_passed'
+                raw_processing_result = processing_result or f'{flow_label}中的滑块动作已通过，继续确认登录态'
+                final_processing_result = (
+                    str(raw_processing_result)
+                    .replace('滑块验证自动处理成功', '滑块动作已通过，继续确认登录态')
+                    .replace('滑块验证成功', '滑块动作已通过，继续确认登录态')
+                )
+                final_error_message = None
+                event_description = f'{flow_label}中的滑块动作已通过，继续确认登录态'
+                merged_event_meta['token_preflight_result'] = merged_event_meta.get('token_preflight_result') or 'not_checked_in_slider_step'
+            else:
+                result_code = 'password_login_slider_failed'
+                final_processing_result = processing_result or f'{flow_label}中的滑块验证失败'
+                final_error_message = error_message or '滑块验证失败，请稍后重试'
+                event_description = f'{flow_label}中的滑块验证自动处理失败'
+
             final_event_meta = self._build_risk_event_meta(
                 verification_url=final_verification_url,
                 extra=merged_event_meta,
             )
-
-            result_code = 'password_login_slider_success' if success else 'password_login_slider_failed'
-            if success:
-                final_processing_result = processing_result or f'{flow_label}中的滑块验证成功'
-                final_error_message = None
-                event_description = f'{flow_label}中的滑块验证已自动处理成功'
-            else:
-                final_processing_result = processing_result or f'{flow_label}中的滑块验证失败'
-                final_error_message = error_message or '滑块验证失败，请稍后重试'
-                event_description = f'{flow_label}中的滑块验证自动处理失败'
 
             duration_ms = None
             started_at = slider_risk_log.get('started_at')
