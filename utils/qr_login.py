@@ -49,6 +49,36 @@ class NotLoginError(Exception):
     """未登录错误"""
 
 
+def _mask_login_token(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return value
+    text = str(value)
+    if len(text) <= 12:
+        return "***"
+    return f"{text[:6]}...{text[-4:]}"
+
+
+def _mask_qr_content(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return value
+    return re.sub(r"(lgToken=)[^&]+", r"\1***", str(value))
+
+
+def _safe_qr_response_for_log(results: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        safe_results = json.loads(json.dumps(results, ensure_ascii=False))
+    except Exception:
+        return {"type": type(results).__name__}
+
+    data = (safe_results.get("content") or {}).get("data") or {}
+    if isinstance(data, dict):
+        if "codeContent" in data:
+            data["codeContent"] = _mask_qr_content(data.get("codeContent"))
+        if "lgToken" in data:
+            data["lgToken"] = _mask_login_token(data.get("lgToken"))
+    return safe_results
+
+
 class QRLoginSession:
     """二维码登录会话"""
 
@@ -515,11 +545,11 @@ class QRLoginManager:
                     params=login_params,
                     headers=self.headers
                 )
-                logger.debug(f"[调试] 获取二维码接口原始响应: {resp.text}")
+                logger.debug(f"[调试] 获取二维码接口响应: status={resp.status_code}, length={len(resp.text)}")
 
                 try:
                     results = resp.json()
-                    logger.debug(f"[调试] 获取二维码接口解析后: {json.dumps(results, ensure_ascii=False)}")
+                    logger.debug(f"[调试] 获取二维码接口解析后: {json.dumps(_safe_qr_response_for_log(results), ensure_ascii=False)}")
                 except Exception as e:
                     logger.exception("二维码接口返回不是JSON")
                     raise GetLoginQRCodeError(f"二维码接口返回异常: {resp.text}")
@@ -574,7 +604,8 @@ class QRLoginManager:
                     return {
                         'success': True,
                         'session_id': session_id,
-                        'qr_code_url': qr_data_url
+                        'qr_code_url': qr_data_url,
+                        'expires_in': session.expire_time
                     }
                 else:
                     raise GetLoginQRCodeError("获取登录二维码失败")
@@ -684,30 +715,16 @@ class QRLoginManager:
                     if session.status == 'success':
                         logger.info(f"扫码登录API轮询响应返回前，会话已由其他链路成功: {session_id}")
                         break
-                    qrcode_status = (
-                        resp.json()
-                        .get("content", {})
-                        .get("data", {})
-                        .get("qrCodeStatus")
-                    )
+                    response_data = resp.json()
+                    qdata = (response_data.get("content", {}) or {}).get("data", {}) or {}
+                    qrcode_status = str(qdata.get("qrCodeStatus") or "").strip().upper()
 
                     if qrcode_status == "CONFIRMED":
                         # 登录确认
-                        if (
-                            resp.json()
-                            .get("content", {})
-                            .get("data", {})
-                            .get("iframeRedirect")
-                            is True
-                        ):
+                        if qdata.get("iframeRedirect") is True:
                             # 账号被风控，需要手机验证
                             session.status = 'verification_required'
-                            iframe_url = (
-                                resp.json()
-                                .get("content", {})
-                                .get("data", {})
-                                .get("iframeRedirectUrl")
-                            )
+                            iframe_url = qdata.get("iframeRedirectUrl")
                             session.verification_url = iframe_url
                             session.expire_time = max(session.expire_time, 600)
                             self._merge_session_cookies(session, resp.cookies)
@@ -717,7 +734,6 @@ class QRLoginManager:
                             continue
                         else:
                             self._merge_session_cookies(session, resp.cookies)
-                            qdata = resp.json().get("content", {}).get("data", {}) or {}
                             login_token = (
                                 qdata.get("token")
                                 or qdata.get("lgToken")
@@ -748,19 +764,25 @@ class QRLoginManager:
                             logger.info(f"二维码已过期: {session_id}")
                             break
 
-                    elif qrcode_status == "SCANED":
+                    elif qrcode_status in ("SCANED", "SCANNED"):
                         # 二维码已被扫描，等待确认
                         if session.status == 'waiting':
                             session.status = 'scanned'
                             logger.info(f"二维码已扫描，等待确认: {session_id}")
-                    else:
-                        # 用户取消确认
+                    elif qrcode_status in ("CANCELLED", "CANCELED", "CANCEL", "FAIL", "FAILED"):
                         if session.status == 'verification_required':
                             logger.info(f"扫码状态 {qrcode_status}，但验证流程仍在进行，继续等待: {session_id}")
                         else:
                             session.status = 'cancelled'
-                            logger.info(f"用户取消登录: {session_id}")
+                            logger.info(f"用户取消登录: {session_id}, status={qrcode_status}")
                             break
+                    else:
+                        if session.status == 'verification_required':
+                            logger.info(f"扫码状态 {qrcode_status}，但验证流程仍在进行，继续等待: {session_id}")
+                        elif not qrcode_status:
+                            logger.debug(f"二维码状态为空，继续等待: {session_id}")
+                        else:
+                            logger.warning(f"未知二维码状态 {qrcode_status}，继续等待: {session_id}")
 
                     await asyncio.sleep(0.8)  # 每0.8秒检查一次
 

@@ -5720,6 +5720,32 @@ async def delete_account_face_verification_screenshot(
 
 # ========================= 扫码登录相关接口 =========================
 
+def _summarize_qr_status_info(status_info: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(status_info, dict):
+        return {'type': type(status_info).__name__}
+
+    cookies = status_info.get('cookies') or ''
+    summary = {
+        'status': status_info.get('status'),
+        'session_id': status_info.get('session_id'),
+        'unb': status_info.get('unb'),
+        'has_cookies': bool(cookies),
+        'cookie_length': len(cookies) if isinstance(cookies, str) else 0,
+    }
+    if status_info.get('message'):
+        summary['message'] = status_info.get('message')
+    if status_info.get('account_info'):
+        account_info = status_info.get('account_info') or {}
+        summary['account_info'] = {
+            'account_id': account_info.get('account_id'),
+            'is_new_account': account_info.get('is_new_account'),
+            'real_cookie_refreshed': account_info.get('real_cookie_refreshed'),
+            'token_prewarmed': account_info.get('token_prewarmed'),
+            'task_restarted': account_info.get('task_restarted'),
+        }
+    return summary
+
+
 @app.post("/qr-login/generate")
 async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_user)):
     """生成扫码登录二维码"""
@@ -5798,9 +5824,9 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
 
             # 获取会话状态
             status_info = qr_login_manager.get_session_status(session_id)
-            log_with_user('info', f"获取会话状态1111111: {status_info}", current_user)
+            log_with_user('debug', f"扫码登录会话状态: {_summarize_qr_status_info(status_info)}", current_user)
             if status_info['status'] == 'success':
-                log_with_user('info', f"获取会话状态22222222: {status_info}", current_user)
+                log_with_user('info', f"扫码登录会话已成功: {_summarize_qr_status_info(status_info)}", current_user)
 
                 # 检查是否已经在后台处理中
                 if session_id in qr_check_processed and qr_check_processed[session_id].get('processing'):
@@ -5815,7 +5841,13 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
 
                 # 获取 Cookie 信息
                 cookies_info = qr_login_manager.get_session_cookies(session_id)
-                log_with_user('info', f"获取会话Cookie: {cookies_info}", current_user)
+                log_with_user(
+                    'info',
+                    f"获取扫码登录会话Cookie: has_cookies={bool(cookies_info)}, "
+                    f"cookie_length={len(cookies_info.get('cookies', '')) if isinstance(cookies_info, dict) else 0}, "
+                    f"unb={(cookies_info or {}).get('unb') if isinstance(cookies_info, dict) else None}",
+                    current_user,
+                )
 
                 if cookies_info:
                     # 异步处理 Cookie（不阻塞当前请求）
@@ -5904,7 +5936,7 @@ async def _run_qr_login_lite(session_id: str, current_user: Dict[str, Any]):
         # cv-cat 内部 qrCodeStatus → 前端可识别的 state
         normalized = (raw or '').strip().upper()
         state['raw_qr_status'] = normalized
-        if normalized == 'SCANNED':
+        if normalized in ('SCANED', 'SCANNED'):
             state['state'] = 'scanned'
         elif normalized == 'CONFIRMED':
             state['state'] = 'confirmed'

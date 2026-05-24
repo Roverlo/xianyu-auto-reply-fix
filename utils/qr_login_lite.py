@@ -51,6 +51,7 @@ _PASSPORT_HEADERS = {
 
 _STATUS_DESC = {
     "NEW": "等待扫码",
+    "SCANED": "已扫码，待手机确认",
     "SCANNED": "已扫码，待手机确认",
     "CONFIRMED": "已确认",
     "EXPIRED": "二维码已过期",
@@ -257,7 +258,7 @@ def qrcode_login_lite(
             qdata = (resp.json().get("content") or {}).get("data") or {}
         except ValueError:
             qdata = {}
-        status = qdata.get("qrCodeStatus", "")
+        status = str(qdata.get("qrCodeStatus") or "").strip().upper()
 
         if status != last_status:
             remaining = max(0, int(deadline - time.time()))

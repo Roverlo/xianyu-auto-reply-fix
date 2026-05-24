@@ -13275,6 +13275,7 @@ function resetPasswordLoginForm() {
 
 let qrCodeCheckInterval = null;
 let qrCodeSessionId = null;
+let qrCodeGenerationSeq = 0;
 let qrCodeModalEventsBound = false;
 let qrLoginMode = 'standard'; // 'standard' = 原 Playwright；'lite' = 纯 HTTP (cv-cat 风格)
 let qrCodeVerificationState = {
@@ -13323,6 +13324,31 @@ function resetQRCodeVerificationState() {
     qrCodeVerificationState.activeSessionId = null;
 }
 
+function setQRCodeGeneratingState(isGenerating) {
+    const refreshBtn = document.getElementById('refreshQRBtn');
+    if (!refreshBtn) {
+        return;
+    }
+
+    refreshBtn.disabled = isGenerating;
+    refreshBtn.innerHTML = isGenerating
+        ? '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>生成中...'
+        : '<i class="bi bi-arrow-clockwise me-1"></i>重新生成二维码';
+}
+
+function getQRCodeLoadingMarkup() {
+    return `
+    <div class="spinner-border text-success mb-3" role="status" style="width: 3rem; height: 3rem;">
+        <span class="visually-hidden">生成二维码中...</span>
+    </div>
+    <p class="text-muted fs-5 mb-2">正在生成二维码...</p>
+    <div class="alert alert-warning border-0 bg-light-warning d-inline-block qr-loading-tip">
+        <i class="bi bi-clock me-2 text-warning"></i>
+        <small class="text-warning fw-bold">二维码生成较慢，请耐心等待</small>
+    </div>
+    `;
+}
+
 function closeQRCodeLoginModal(delay = 3000) {
     setTimeout(() => {
         const modalElement = document.getElementById('qrCodeLoginModal');
@@ -13369,17 +13395,20 @@ function showQRCodeLogin(mode = 'standard') {
     modal.show();
 }
 
-// 刷新二维码（兼容旧函数名）
-async function refreshQRCode() {
-    await generateQRCode();
-}
-
 // 生成二维码
 async function generateQRCode() {
-    try {
+    const generationId = ++qrCodeGenerationSeq;
+
+    if (qrCodeCheckInterval) {
+        clearInterval(qrCodeCheckInterval);
+        qrCodeCheckInterval = null;
+    }
+    qrCodeSessionId = null;
     resetQRCodeVerificationState();
     showQRCodeLoading();
+    setQRCodeGeneratingState(true);
 
+    try {
     const endpoints = getQRLoginEndpoints();
     const response = await fetch(endpoints.generate, {
         method: 'POST',
@@ -13389,8 +13418,15 @@ async function generateQRCode() {
         }
     });
 
+    if (generationId !== qrCodeGenerationSeq) {
+        return;
+    }
+
     if (response.ok) {
         const data = await response.json();
+        if (generationId !== qrCodeGenerationSeq) {
+        return;
+        }
         if (data.success) {
         qrCodeSessionId = data.session_id;
         qrCodeVerificationState.activeSessionId = data.session_id;
@@ -13403,16 +13439,33 @@ async function generateQRCode() {
         showQRCodeError('生成二维码失败');
     }
     } catch (error) {
+    if (generationId !== qrCodeGenerationSeq) {
+        return;
+    }
     console.error('生成二维码失败:', error);
     showQRCodeError('网络错误，请重试');
+    } finally {
+    if (generationId === qrCodeGenerationSeq) {
+        setQRCodeGeneratingState(false);
+    }
     }
 }
 
 // 显示二维码加载状态
 function showQRCodeLoading() {
-    resetQRCodeVerificationState();
-    document.getElementById('qrCodeContainer').style.display = 'block';
-    document.getElementById('qrCodeImage').style.display = 'none';
+    const container = document.getElementById('qrCodeContainer');
+    if (container) {
+    container.innerHTML = getQRCodeLoadingMarkup();
+    container.style.display = 'block';
+    }
+    const imageContainer = document.getElementById('qrCodeImage');
+    if (imageContainer) {
+    imageContainer.style.display = 'none';
+    }
+    const qrCodeImg = document.getElementById('qrCodeImg');
+    if (qrCodeImg) {
+    qrCodeImg.removeAttribute('src');
+    }
     document.getElementById('statusText').textContent = '正在生成二维码，请耐心等待...';
     document.getElementById('statusSpinner').style.display = 'none';
 
@@ -13427,17 +13480,20 @@ function showQRCodeLoading() {
 function showQRCodeImage(qrCodeUrl) {
     document.getElementById('qrCodeContainer').style.display = 'none';
     document.getElementById('qrCodeImage').style.display = 'block';
-    document.getElementById('qrCodeImg').src = qrCodeUrl;
+    const qrCodeImg = document.getElementById('qrCodeImg');
+    qrCodeImg.removeAttribute('src');
+    qrCodeImg.src = qrCodeUrl;
     document.getElementById('statusText').textContent = '等待扫码...';
     document.getElementById('statusSpinner').style.display = 'none';
 }
 
 // 显示二维码错误
 function showQRCodeError(message) {
+    qrCodeVerificationState.completed = true;
     document.getElementById('qrCodeContainer').innerHTML = `
     <div class="text-danger">
         <i class="bi bi-exclamation-triangle fs-1 mb-3"></i>
-        <p>${message}</p>
+        <p>${escapeHtml(message || '生成二维码失败')}</p>
     </div>
     `;
     document.getElementById('qrCodeImage').style.display = 'none';
@@ -13539,7 +13595,9 @@ async function checkQRCodeStatus() {
     } catch (error) {
     console.error('检查二维码状态失败:', error);
     } finally {
-    qrCodeVerificationState.inFlight = false;
+    if (requestSessionId === qrCodeVerificationState.activeSessionId) {
+        qrCodeVerificationState.inFlight = false;
+    }
     }
 }
 
@@ -13735,17 +13793,18 @@ function handleQRCodeSuccess(data) {
 
 // 清理二维码检查
 function clearQRCodeCheck() {
+    qrCodeGenerationSeq += 1;
     if (qrCodeCheckInterval) {
     clearInterval(qrCodeCheckInterval);
     qrCodeCheckInterval = null;
     }
     qrCodeSessionId = null;
     resetQRCodeVerificationState();
+    setQRCodeGeneratingState(false);
 }
 
 // 刷新二维码
 function refreshQRCode() {
-    clearQRCodeCheck();
     generateQRCode();
 }
 
