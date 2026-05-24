@@ -17,6 +17,7 @@ let aboutDiagnosticsAccounts = [];
 let aboutDiagnosticsInitialized = false;
 let dashboardRuntimeRetryTimer = null;
 let aboutRuntimeRetryTimer = null;
+let aboutRuntimeCountdownTimer = null;
 let lastDashboardRuntimeRetryAt = 0;
 let lastAboutRuntimeRetryAt = 0;
 const DASHBOARD_ANNOUNCEMENT_DISMISS_PREFIX = 'dashboard_announcement_dismissed_';
@@ -200,6 +201,10 @@ function showSection(sectionName) {
     if (sectionName !== 'accounts' && aboutRuntimeRetryTimer) {
         clearTimeout(aboutRuntimeRetryTimer);
         aboutRuntimeRetryTimer = null;
+    }
+
+    if (sectionName !== 'accounts') {
+        stopAboutRuntimeCountdown();
     }
 }
 
@@ -3329,44 +3334,45 @@ async function handleApiError(err) {
 async function fetchJSON(url, opts = {}) {
     toggleLoading(true);
     try {
-    // 添加认证头
-    const token = getAuthToken();
-    if (token) {
-        opts.headers = opts.headers || {};
-        opts.headers['Authorization'] = `Bearer ${token}`;
-    }
+        // 添加认证头
+        const token = getAuthToken();
+        if (token) {
+            opts.headers = opts.headers || {};
+            opts.headers['Authorization'] = `Bearer ${token}`;
+        }
 
-    const res = await fetch(url, opts);
-    if (res.status === 401) {
-        // 未授权，跳转到登录页面
-        localStorage.removeItem('auth_token');
-        window.location.href = '/';
-        return;
-    }
-    if (!res.ok) {
-        let errorMessage = `HTTP ${res.status}`;
-        try {
-        const errorText = await res.text();
-        if (errorText) {
-            // 尝试解析JSON错误信息
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+            // 未授权，跳转到登录页面
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return null;
+        }
+        if (!res.ok) {
+            let errorMessage = `HTTP ${res.status}`;
             try {
-            const errorJson = JSON.parse(errorText);
-            errorMessage = errorJson.detail || errorJson.message || errorText;
+                const errorText = await res.text();
+                if (errorText) {
+                    // 尝试解析JSON错误信息
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        errorMessage = errorJson.detail || errorJson.message || errorText;
+                    } catch {
+                        errorMessage = errorText;
+                    }
+                }
             } catch {
-            errorMessage = errorText;
+                errorMessage = `HTTP ${res.status} ${res.statusText}`;
             }
+            throw new Error(errorMessage);
         }
-        } catch {
-        errorMessage = `HTTP ${res.status} ${res.statusText}`;
-        }
-        throw new Error(errorMessage);
-    }
-    const data = await res.json();
-    toggleLoading(false);
-    return data;
+        return await res.json();
     } catch (err) {
-    handleApiError(err);
-    throw err;
+        console.error(err);
+        showToast(err.message || '操作失败', 'danger');
+        throw err;
+    } finally {
+        toggleLoading(false);
     }
 }
 
@@ -3504,7 +3510,7 @@ function buildAboutMetaCard({ label, value, supporting = '' }) {
     `;
 }
 
-function buildAboutRuntimeStatusItem({ label, value, note = '', tone = '', richValue = false, accent = '', icon = '' }) {
+function buildAboutRuntimeStatusItem({ label, value, note = '', tone = '', richValue = false, richNote = false, accent = '', icon = '' }) {
     return `
         <div class="account-diagnostics-status-item ${tone ? `is-${tone}` : ''} ${accent ? `is-${accent}` : ''}">
             <div class="account-diagnostics-status-item-head">
@@ -3514,9 +3520,94 @@ function buildAboutRuntimeStatusItem({ label, value, note = '', tone = '', richV
                 <div class="account-diagnostics-status-item-label">${escapeHtml(label)}</div>
             </div>
             <div class="account-diagnostics-status-item-value">${richValue ? value : escapeHtml(value)}</div>
-            ${note ? `<div class="account-diagnostics-status-item-note">${escapeHtml(note)}</div>` : ''}
+            ${note ? `<div class="account-diagnostics-status-item-note">${richNote ? note : escapeHtml(note)}</div>` : ''}
         </div>
     `;
+}
+
+function formatAboutDuration(seconds) {
+    const totalSeconds = Math.max(0, Math.floor(Number(seconds) || 0));
+    const minutes = Math.floor(totalSeconds / 60);
+    const remainingSeconds = totalSeconds % 60;
+    if (minutes <= 0) {
+        return `${remainingSeconds}秒`;
+    }
+    return `${minutes}分${remainingSeconds}秒`;
+}
+
+function buildAboutTokenRefreshNote(runtimeStatus, tokenRefreshDisplay) {
+    const noteParts = [`最近刷新：${escapeHtml(tokenRefreshDisplay)}`];
+    const errorMessage = String(runtimeStatus?.token_refresh_error_message || '').trim();
+
+    if (
+        runtimeStatus?.token_refresh_status === 'qr_login_grace_wait'
+        && Number(runtimeStatus?.qr_login_grace_until || 0) > 0
+    ) {
+        const initialRemaining = Number(runtimeStatus?.qr_login_grace_remaining_seconds || 0);
+        const serverTime = Number(runtimeStatus?.runtime_server_time || 0);
+        const elapsedSinceFetch = serverTime > 0
+            ? Math.max(0, Math.floor((Date.now() / 1000) - serverTime))
+            : 0;
+        const displayRemaining = Math.max(0, initialRemaining - elapsedSinceFetch);
+        noteParts.push(
+            `扫码登录稳定期中，剩余<span class="js-about-qr-grace-countdown" data-remaining="${displayRemaining}" data-until="${Number(runtimeStatus.qr_login_grace_until)}">${formatAboutDuration(displayRemaining)}</span>`
+        );
+    } else if (errorMessage) {
+        noteParts.push(escapeHtml(errorMessage));
+    }
+
+    return noteParts.join(' · ');
+}
+
+function stopAboutRuntimeCountdown() {
+    if (aboutRuntimeCountdownTimer) {
+        clearInterval(aboutRuntimeCountdownTimer);
+        aboutRuntimeCountdownTimer = null;
+    }
+}
+
+function updateAboutRuntimeCountdowns() {
+    if (!document.getElementById('accounts-section')?.classList.contains('active')) {
+        stopAboutRuntimeCountdown();
+        return;
+    }
+
+    const nodes = document.querySelectorAll('.js-about-qr-grace-countdown');
+    if (!nodes.length) {
+        stopAboutRuntimeCountdown();
+        return;
+    }
+
+    let hasActiveCountdown = false;
+    nodes.forEach(node => {
+        const until = Number(node.dataset.until || 0);
+        const remaining = until > 0
+            ? Math.max(0, Math.ceil(until - (Date.now() / 1000)))
+            : Math.max(0, Number(node.dataset.remaining || 0) - 1);
+
+        node.dataset.remaining = String(remaining);
+        node.textContent = formatAboutDuration(remaining);
+        if (remaining > 0) {
+            hasActiveCountdown = true;
+        }
+    });
+
+    if (!hasActiveCountdown) {
+        stopAboutRuntimeCountdown();
+        const accountId = getAboutSelectedAccountId();
+        if (accountId && document.getElementById('accounts-section')?.classList.contains('active')) {
+            loadAboutRuntimeStatus(accountId);
+        }
+    }
+}
+
+function startAboutRuntimeCountdownIfNeeded() {
+    stopAboutRuntimeCountdown();
+    if (!document.querySelector('.js-about-qr-grace-countdown')) {
+        return;
+    }
+
+    aboutRuntimeCountdownTimer = setInterval(updateAboutRuntimeCountdowns, 1000);
 }
 
 function buildAboutRuntimeMetaItem(label, value) {
@@ -3675,6 +3766,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
     if (!statusContainer) return;
 
     if (!runtimeStatus) {
+        stopAboutRuntimeCountdown();
         renderAboutRuntimePlaceholder('暂无运行态', '当前账号还没有可用的运行态信息。');
         return;
     }
@@ -3721,10 +3813,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
         : readinessSignalItems.some(item => item.ready)
             ? 'warning'
             : 'danger';
-    const tokenRefreshNote = [
-        `最近刷新：${tokenRefreshDisplay}`,
-        runtimeStatus.token_refresh_error_message,
-    ].filter(Boolean).join(' · ');
+    const tokenRefreshNote = buildAboutTokenRefreshNote(runtimeStatus, tokenRefreshDisplay);
 
     statusContainer.innerHTML = `
         <div class="account-diagnostics-status-shell">
@@ -3761,6 +3850,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
                             note: tokenRefreshNote,
                             tone: tokenTone,
                             richValue: true,
+                            richNote: true,
                             accent: 'token',
                             icon: 'key',
                         })}
@@ -3792,6 +3882,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
             </div>
         </div>
     `;
+    startAboutRuntimeCountdownIfNeeded();
 }
 
 function getAboutHistoryMessageText(message) {

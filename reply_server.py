@@ -3183,9 +3183,11 @@ def _is_runtime_timestamp_recent(value: Any, window_seconds: Any) -> bool:
 
 def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     cleaned_cid = str(cookie_id or '').strip()
+    status_built_at = time.time()
     runtime_status = {
         'instance_exists': False,
         'running': False,
+        'runtime_server_time': int(status_built_at),
         'connection_state': 'not_running',
         'ws_ready': False,
         'session_ready': False,
@@ -3199,6 +3201,9 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'token_last_refreshed_at_display': None,
         'token_age_seconds': None,
         'token_cached': False,
+        'qr_login_grace_until': None,
+        'qr_login_grace_until_display': None,
+        'qr_login_grace_remaining_seconds': 0,
         'session_keepalive_status': None,
         'session_keepalive_display_status': None,
         'session_keepalive_display_note': None,
@@ -3292,11 +3297,30 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     stream_watchdog_grace_period = max(30, int(getattr(live_instance, 'stream_watchdog_grace_period', heartbeat_interval * 4) or heartbeat_interval * 4))
     message_stream_watchdog_timeout = max(60, int(getattr(live_instance, 'message_stream_watchdog_timeout', session_keepalive_interval * 3) or session_keepalive_interval * 3))
 
+    now = time.time()
+    qr_login_grace_until = None
+    qr_login_grace_remaining_seconds = 0
+    try:
+        account_info = db_manager.get_cookie_details(cleaned_cid) or {}
+        grace_until_value = int(account_info.get('qr_login_grace_until') or 0)
+        if grace_until_value > now:
+            qr_login_grace_until = grace_until_value
+            qr_login_grace_remaining_seconds = max(0, int(grace_until_value - now))
+    except Exception as e:
+        logger.debug(f"读取账号扫码保护期状态失败: {mask_sensitive_text(e)}")
+
+    token_refresh_error_message = getattr(live_instance, 'last_token_refresh_error_message', None)
+    if token_refresh_status == 'qr_login_grace_wait':
+        if qr_login_grace_remaining_seconds > 0:
+            token_refresh_error_message = f"扫码登录稳定期中，剩余{qr_login_grace_remaining_seconds}秒"
+        else:
+            token_refresh_status = 'started' if token_cached else None
+            token_refresh_error_message = None
+
     ws_ready_window = max(heartbeat_timeout * 2, heartbeat_interval * 3, 45)
     recent_connection_window = max(heartbeat_interval + 5, 20)
     session_ready_window = max(session_keepalive_interval + session_keepalive_retry_interval + 30, 180)
     token_ready_window = max(token_refresh_interval + token_retry_interval, 300)
-    now = time.time()
 
     recent_connection = _is_runtime_timestamp_recent(last_successful_connection_at, recent_connection_window)
     recent_heartbeat_ok = _is_runtime_timestamp_recent(heartbeat_response_at, ws_ready_window)
@@ -3441,6 +3465,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     runtime_status.update({
         'instance_exists': True,
         'running': True,
+        'runtime_server_time': int(now),
         'connection_state': connection_state_value,
         'ws_ready': ws_ready,
         'session_ready': session_ready,
@@ -3450,10 +3475,13 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'message_stream_note': message_stream_note,
         'token_cached': token_cached,
         'token_refresh_status': token_refresh_status,
-        'token_refresh_error_message': getattr(live_instance, 'last_token_refresh_error_message', None),
+        'token_refresh_error_message': token_refresh_error_message,
         'token_last_refreshed_at': token_refreshed_at,
         'token_last_refreshed_at_display': _format_runtime_timestamp(token_refreshed_at),
         'token_age_seconds': _get_runtime_age_seconds(token_refreshed_at),
+        'qr_login_grace_until': qr_login_grace_until,
+        'qr_login_grace_until_display': _format_runtime_timestamp(qr_login_grace_until),
+        'qr_login_grace_remaining_seconds': qr_login_grace_remaining_seconds,
         'session_keepalive_status': session_keepalive_status,
         'session_keepalive_display_status': session_display_status,
         'session_keepalive_display_note': session_display_note,
