@@ -12253,7 +12253,10 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                             f"手动发货 order_id={order_id} batch={group_index}/{total_send_groups}"
                             if is_batched_text_group else
                             f"手动发货 order_id={order_id} unit={first_unit_index}"
-                        )
+                        ),
+                        item_id=item_id,
+                        order_id=order_id,
+                        reply_source='手动发货',
                     )
                 else:
                     await xianyu_instance.send_delivery_steps_once(buyer_id, item_id, send_group.get('delivery_steps') or [])

@@ -2708,6 +2708,8 @@ class XianyuLive:
         self.last_heartbeat_response = 0
         self.last_sent_heartbeat_mid = None
         self.pending_heartbeat_mids = deque(maxlen=32)
+        self.pending_send_ack_waiters = {}
+        self.send_ack_timeout_seconds = 5
         self.heartbeat_task = None
         self.ws = None
         self.last_non_heartbeat_message_time = 0
@@ -5521,7 +5523,10 @@ class XianyuLive:
                             user_id,
                             delivery_steps,
                             user_url=user_url,
-                            log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 自动发货'
+                            log_prefix=f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 自动发货',
+                            item_id=item_id,
+                            order_id=order_id,
+                            reply_source='自动发货',
                         )
 
                         if not self._mark_data_reservation_sent_if_needed(delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta):
@@ -6170,7 +6175,10 @@ class XianyuLive:
                                 send_user_id,
                                 send_group.get('delivery_steps') or [],
                                 user_url=user_url,
-                                log_prefix=group_log_prefix
+                                log_prefix=group_log_prefix,
+                                item_id=item_id,
+                                order_id=order_id,
+                                reply_source='自动发货',
                             )
                         except Exception as e:
                             group_error = self._safe_str(e)
@@ -12344,8 +12352,402 @@ class XianyuLive:
         flush_current_batch()
         return groups
 
+    def _normalize_ws_chat_id(self, chat_id: Any) -> str:
+        text = str(chat_id or '').strip()
+        if text.endswith('@goofish'):
+            text = text.split('@', 1)[0]
+        return text
+
+    def _is_send_ack_success(self, ack: Any) -> bool:
+        if not isinstance(ack, dict):
+            return False
+        code = ack.get('code')
+        if code not in (200, '200'):
+            return False
+        ret_values = ack.get('ret')
+        if ret_values is None and isinstance(ack.get('body'), dict):
+            ret_values = ack.get('body', {}).get('ret')
+        if ret_values:
+            ret_text = ' '.join(str(item) for item in (ret_values if isinstance(ret_values, list) else [ret_values]))
+            if any(flag in ret_text.upper() for flag in ('FAIL', 'ERROR', 'DENY', 'ILLEGAL')):
+                return False
+        body_text = self._safe_str(ack.get('body', ''))
+        body_text_upper = body_text.upper()
+        if (
+            any(flag in body_text_upper for flag in ('FAIL::', 'ERROR::', 'DENY', 'ILLEGAL'))
+            or any(flag in body_text for flag in ('失败', '风控', '拒绝', '禁止'))
+        ):
+            return False
+        return True
+
+    def _summarize_send_ack(self, ack: Any) -> str:
+        if not isinstance(ack, dict):
+            return self._safe_str(ack)[:300]
+        summary = {
+            'code': ack.get('code'),
+            'ret': ack.get('ret'),
+            'body_keys': list(ack.get('body', {}).keys()) if isinstance(ack.get('body'), dict) else None,
+        }
+        body = ack.get('body')
+        if isinstance(body, dict):
+            for key in ('error', 'errorCode', 'msg', 'message', 'ret'):
+                if key in body:
+                    summary[key] = body.get(key)
+        return self._safe_str(summary)[:500]
+
+    async def _wait_for_send_ack(self, mid: str, timeout: float = None, future: asyncio.Future = None) -> Dict[str, Any]:
+        timeout = timeout or self.send_ack_timeout_seconds
+        if future is None:
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self.pending_send_ack_waiters[mid] = future
+        try:
+            ack = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"等待IM发送确认超时(mid={mid}, timeout={timeout}s)") from exc
+        finally:
+            if self.pending_send_ack_waiters.get(mid) is future:
+                self.pending_send_ack_waiters.pop(mid, None)
+
+        if not self._is_send_ack_success(ack):
+            raise RuntimeError(f"IM发送被平台拒绝或返回异常(mid={mid}, ack={self._summarize_send_ack(ack)})")
+        return ack
+
+    async def _receive_send_ack_direct(self, ws, mid: str, timeout: float = None) -> Dict[str, Any]:
+        """临时 WebSocket 连接没有主循环读包时，直接读取发送确认。"""
+        timeout = timeout or self.send_ack_timeout_seconds
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"等待IM发送确认超时(mid={mid}, timeout={timeout}s)")
+            raw_message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            try:
+                message_data = json.loads(raw_message)
+            except Exception:
+                continue
+            recv_mid = str((message_data.get('headers') or {}).get('mid') or '')
+            if recv_mid != mid:
+                continue
+            if not self._is_send_ack_success(message_data):
+                raise RuntimeError(f"IM发送被平台拒绝或返回异常(mid={mid}, ack={self._summarize_send_ack(message_data)})")
+            return message_data
+
+    def _consume_pending_send_ack(self, message_data: dict) -> bool:
+        try:
+            if not isinstance(message_data, dict):
+                return False
+            headers = message_data.get('headers') or {}
+            mid = str(headers.get('mid') or '')
+            if not mid:
+                return False
+            future = self.pending_send_ack_waiters.get(mid)
+            if not future:
+                return False
+            if not future.done():
+                future.set_result(message_data)
+            return True
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】处理IM发送确认回包失败: {self._safe_str(exc)}")
+            return False
+
+    def _record_outgoing_chat_message(self, chat_id: str, user_id: str, content: str, *,
+                                      content_type: int = 1, image_url: str = None, item_id: str = None,
+                                      reply_source: str = '自动发货', send_meta: Dict[str, Any] = None,
+                                      order_id: str = None, step_index: int = None, total_steps: int = None):
+        try:
+            from db_manager import db_manager as _db
+            from chat_event_hub import publish_chat_message
+
+            normalized_chat_id = self._normalize_ws_chat_id(chat_id)
+            extra_payload = {
+                'source': 'delivery_send',
+                'order_id': order_id,
+                'buyer_id': str(user_id or ''),
+                'step_index': step_index,
+                'total_steps': total_steps,
+                'send_mid': (send_meta or {}).get('mid'),
+                'send_uuid': (send_meta or {}).get('uuid'),
+                'ack_code': ((send_meta or {}).get('ack') or {}).get('code') if isinstance((send_meta or {}).get('ack'), dict) else None,
+                'ack_summary': self._summarize_send_ack((send_meta or {}).get('ack')) if (send_meta or {}).get('ack') else None,
+            }
+            extra_json = json.dumps({k: v for k, v in extra_payload.items() if v is not None}, ensure_ascii=False)
+            msg_id = _db.save_chat_message(
+                cookie_id=self.cookie_id,
+                chat_id=normalized_chat_id,
+                sender_id=self.myid,
+                sender_name=self.cookie_id,
+                content=content or ('[图片]' if content_type == 2 else ''),
+                content_type=content_type,
+                image_url=image_url,
+                item_id=item_id,
+                direction=1,
+                reply_source=reply_source,
+                media_url=image_url if content_type == 2 else None,
+                link_url=None,
+                extra_json=extra_json,
+            )
+            if msg_id:
+                publish_chat_message(self.cookie_id, {
+                    'msg_id': msg_id,
+                    'chat_id': normalized_chat_id,
+                    'sender_id': self.myid,
+                    'sender_name': self.cookie_id,
+                    'content': content or ('[图片]' if content_type == 2 else ''),
+                    'content_type': content_type,
+                    'image_url': image_url,
+                    'item_id': item_id,
+                    'direction': 1,
+                    'reply_source': reply_source,
+                    'media_url': image_url if content_type == 2 else None,
+                    'link_url': None,
+                    'extra_json': extra_json,
+                })
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】保存/推送自动发货发出消息失败: {self._safe_str(exc)}")
+
+    def _build_delivery_send_extra_json(self, user_id: str, send_meta: Dict[str, Any] = None,
+                                        order_id: str = None, step_index: int = None,
+                                        total_steps: int = None) -> str:
+        extra_payload = {
+            'source': 'delivery_send',
+            'order_id': order_id,
+            'buyer_id': str(user_id or ''),
+            'step_index': step_index,
+            'total_steps': total_steps,
+            'send_mid': (send_meta or {}).get('mid'),
+            'send_uuid': (send_meta or {}).get('uuid'),
+            'ack_code': ((send_meta or {}).get('ack') or {}).get('code') if isinstance((send_meta or {}).get('ack'), dict) else None,
+            'ack_summary': self._summarize_send_ack((send_meta or {}).get('ack')) if (send_meta or {}).get('ack') else None,
+        }
+        return json.dumps({k: v for k, v in extra_payload.items() if v is not None}, ensure_ascii=False)
+
+    def _get_outgoing_message_checkpoint(self, chat_id: str) -> int:
+        try:
+            normalized_chat_id = self._normalize_ws_chat_id(chat_id)
+            with db_manager.lock:
+                cursor = db_manager.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM chat_messages
+                    WHERE cookie_id = ? AND chat_id = ? AND sender_id = ? AND direction = 1
+                    ''',
+                    (self.cookie_id, normalized_chat_id, str(self.myid)),
+                )
+                row = cursor.fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】获取发出消息检查点失败: {self._safe_str(exc)}")
+            return 0
+
+    def _outgoing_chat_row_matches_delivery_step(self, row: Dict[str, Any], expected_content: str,
+                                                 content_type: int = 1, image_url: str = None) -> bool:
+        if not row:
+            return False
+        row_content_type = int(row.get('content_type') or 1)
+        if content_type == 2:
+            if row_content_type != 2:
+                return False
+            if image_url and row.get('image_url') == image_url:
+                return True
+            return not image_url and row.get('content') == '[图片]'
+
+        if row_content_type != 1:
+            return False
+        expected_text = self._normalize_delivery_compare_text(expected_content)
+        actual_text = self._normalize_delivery_compare_text(row.get('content'))
+        if not expected_text or not actual_text:
+            return False
+        if actual_text == expected_text:
+            return True
+        return len(expected_text) >= 24 and (expected_text in actual_text or actual_text in expected_text)
+
+    def _find_outgoing_delivery_chat_row(self, chat_id: str, expected_content: str, *,
+                                         content_type: int = 1, image_url: str = None,
+                                         after_id: int = 0) -> Optional[Dict[str, Any]]:
+        try:
+            normalized_chat_id = self._normalize_ws_chat_id(chat_id)
+            with db_manager.lock:
+                cursor = db_manager.conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT id, content, content_type, image_url, item_id, reply_source, created_at, extra_json
+                    FROM chat_messages
+                    WHERE cookie_id = ? AND chat_id = ? AND sender_id = ? AND direction = 1 AND id > ?
+                    ORDER BY id DESC
+                    LIMIT 30
+                    ''',
+                    (self.cookie_id, normalized_chat_id, str(self.myid), int(after_id or 0)),
+                )
+                rows = [
+                    {
+                        'id': row[0],
+                        'content': row[1],
+                        'content_type': row[2],
+                        'image_url': row[3],
+                        'item_id': row[4],
+                        'reply_source': row[5],
+                        'created_at': row[6],
+                        'extra_json': row[7],
+                    }
+                    for row in cursor.fetchall()
+                ]
+            for row in rows:
+                if self._outgoing_chat_row_matches_delivery_step(
+                    row,
+                    expected_content,
+                    content_type=content_type,
+                    image_url=image_url,
+                ):
+                    return row
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】查找官方同步发出消息失败: {self._safe_str(exc)}")
+        return None
+
+    def _annotate_outgoing_delivery_chat_message(self, msg_id: int, *, reply_source: str,
+                                                 item_id: str = None, extra_json: str = None) -> None:
+        if not msg_id:
+            return
+        try:
+            with db_manager.lock:
+                cursor = db_manager.conn.cursor()
+                cursor.execute(
+                    '''
+                    UPDATE chat_messages
+                    SET reply_source = ?,
+                        item_id = CASE WHEN item_id IS NULL OR item_id = '' THEN ? ELSE item_id END,
+                        extra_json = ?
+                    WHERE id = ? AND cookie_id = ?
+                    ''',
+                    (reply_source, item_id, extra_json, int(msg_id), self.cookie_id),
+                )
+                db_manager.conn.commit()
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】标记自动发货发出消息失败: {self._safe_str(exc)}")
+
+    async def _wait_for_outgoing_delivery_sync(self, chat_id: str, expected_content: str, *,
+                                               content_type: int = 1, image_url: str = None,
+                                               after_id: int = 0, timeout: float = 15,
+                                               order_id: str = None, step_index: int = None) -> Dict[str, Any]:
+        deadline = time.time() + max(1, timeout)
+        while time.time() < deadline:
+            row = self._find_outgoing_delivery_chat_row(
+                chat_id,
+                expected_content,
+                content_type=content_type,
+                image_url=image_url,
+                after_id=after_id,
+            )
+            if row:
+                logger.info(
+                    f"【{self.cookie_id}】自动发货消息已收到闲鱼官方同步: "
+                    f"chat_id={self._normalize_ws_chat_id(chat_id)}, order_id={order_id}, "
+                    f"step={step_index}, msg_db_id={row.get('id')}"
+                )
+                return row
+            await asyncio.sleep(0.5)
+
+        raise TimeoutError(
+            f"IM发送确认后未收到闲鱼官方发出消息同步"
+            f"(chat_id={self._normalize_ws_chat_id(chat_id)}, order_id={order_id}, step={step_index})"
+        )
+
+    def _normalize_delivery_compare_text(self, value: Any) -> str:
+        return str(value or '').replace('\r\n', '\n').replace('\r', '\n').strip()
+
+    def _extract_history_text_content(self, history_item: Dict[str, Any]) -> str:
+        message = (history_item or {}).get('message')
+        if not isinstance(message, dict):
+            return self._normalize_delivery_compare_text(message)
+        text_obj = message.get('text')
+        if isinstance(text_obj, dict):
+            return self._normalize_delivery_compare_text(text_obj.get('text'))
+        for key in ('content', 'text', 'raw'):
+            value = message.get(key)
+            if isinstance(value, str) and value:
+                return self._normalize_delivery_compare_text(value)
+        return ''
+
+    def _extract_history_image_urls(self, history_item: Dict[str, Any]) -> list:
+        message = (history_item or {}).get('message')
+        if not isinstance(message, dict):
+            return []
+        pics = message.get('image', {}).get('pics', []) if isinstance(message.get('image'), dict) else []
+        urls = []
+        for pic in pics or []:
+            if isinstance(pic, dict) and pic.get('url'):
+                urls.append(str(pic.get('url')))
+        return urls
+
+    def _history_item_is_outgoing(self, history_item: Dict[str, Any]) -> bool:
+        extension = (history_item or {}).get('message_extension') or {}
+        sender_id = str(extension.get('senderUserId') or extension.get('senderId') or (history_item or {}).get('send_user_id') or '')
+        if not sender_id:
+            return True
+        return sender_id == str(self.myid)
+
+    def _history_contains_delivery_step(self, history_messages: list, expected_content: str,
+                                        content_type: int = 1, image_url: str = None) -> bool:
+        expected_text = self._normalize_delivery_compare_text(expected_content)
+        for history_item in history_messages or []:
+            if not self._history_item_is_outgoing(history_item):
+                continue
+            if content_type == 2:
+                urls = self._extract_history_image_urls(history_item)
+                if image_url and any(image_url == url for url in urls):
+                    return True
+                continue
+
+            actual_text = self._extract_history_text_content(history_item)
+            if not actual_text or not expected_text:
+                continue
+            if actual_text == expected_text:
+                return True
+            if len(expected_text) >= 24 and (expected_text in actual_text or actual_text in expected_text):
+                return True
+        return False
+
+    async def _verify_delivery_step_visible_in_history(self, chat_id: str, expected_content: str, *,
+                                                       content_type: int = 1, image_url: str = None,
+                                                       order_id: str = None, step_index: int = None):
+        normalized_chat_id = self._normalize_ws_chat_id(chat_id)
+        for attempt in range(1, 5):
+            try:
+                history_messages = await self.fetch_conversation_history_with_fallback(
+                    normalized_chat_id,
+                    page_size=20,
+                    isolated_timeout=8,
+                )
+                if self._history_contains_delivery_step(
+                    history_messages,
+                    expected_content,
+                    content_type=content_type,
+                    image_url=image_url,
+                ):
+                    logger.info(
+                        f"【{self.cookie_id}】自动发货消息已在闲鱼会话历史中回读确认: "
+                        f"chat_id={normalized_chat_id}, order_id={order_id}, step={step_index}"
+                    )
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    f"【{self.cookie_id}】回读闲鱼会话历史确认自动发货消息失败: "
+                    f"chat_id={normalized_chat_id}, order_id={order_id}, step={step_index}, "
+                    f"attempt={attempt}/4, error={self._safe_str(exc)}"
+                )
+
+            if attempt < 4:
+                await asyncio.sleep(1.2 * attempt)
+
+        raise RuntimeError(
+            f"IM发送确认后未能在闲鱼会话历史中回读到自动发货消息"
+            f"(chat_id={normalized_chat_id}, order_id={order_id}, step={step_index})"
+        )
+
     async def _send_delivery_steps(self, websocket, chat_id: str, user_id: str, delivery_steps, user_url: str = None,
-                                   log_prefix: str = "自动发货", card_id: int = None):
+                                   log_prefix: str = "自动发货", card_id: int = None, item_id: str = None,
+                                   order_id: str = None, reply_source: str = '自动发货'):
         """按顺序发送发货步骤，支持文本与图片混排。"""
         steps = delivery_steps or []
         if not steps:
@@ -12357,6 +12759,8 @@ class XianyuLive:
         for index, step in enumerate(steps, start=1):
             step_type = step.get('type')
             step_content = step.get('content') or ''
+            use_main_ws_sync = websocket is getattr(self, 'ws', None)
+            sync_after_id = self._get_outgoing_message_checkpoint(chat_id) if use_main_ws_sync else 0
 
             if step_type == 'image':
                 image_data = step_content.replace("__IMAGE_SEND__", "", 1)
@@ -12370,14 +12774,84 @@ class XianyuLive:
                         logger.error(f"无效的卡券ID: {card_id_str}")
                         image_card_id = card_id
 
-                await self.send_image_msg(websocket, chat_id, user_id, image_url, card_id=image_card_id)
+                send_meta = await self.send_image_msg(websocket, chat_id, user_id, image_url, card_id=image_card_id)
+                actual_image_url = (send_meta or {}).get('image_url') or image_url
+                if use_main_ws_sync:
+                    synced_row = await self._wait_for_outgoing_delivery_sync(
+                        chat_id,
+                        '[图片]',
+                        content_type=2,
+                        image_url=actual_image_url,
+                        after_id=sync_after_id,
+                        order_id=order_id,
+                        step_index=index,
+                    )
+                    self._annotate_outgoing_delivery_chat_message(
+                        synced_row.get('id'),
+                        reply_source=reply_source,
+                        item_id=item_id,
+                        extra_json=self._build_delivery_send_extra_json(user_id, send_meta, order_id, index, total_steps),
+                    )
+                else:
+                    await self._verify_delivery_step_visible_in_history(
+                        chat_id,
+                        '[图片]',
+                        content_type=2,
+                        image_url=actual_image_url,
+                        order_id=order_id,
+                        step_index=index,
+                    )
+                    self._record_outgoing_chat_message(
+                        chat_id, user_id, '[图片]',
+                        content_type=2,
+                        image_url=actual_image_url,
+                        item_id=item_id,
+                        reply_source=reply_source,
+                        send_meta=send_meta,
+                        order_id=order_id,
+                        step_index=index,
+                        total_steps=total_steps,
+                    )
                 logger.info(
-                    f"【{log_prefix}】步骤 {index}/{total_steps} 已向 {user_url} 发送图片: {image_url}"
+                    f"【{log_prefix}】步骤 {index}/{total_steps} IM图片发送已被平台确认并完成会话回读: {user_url}"
                 )
             else:
-                await self.send_msg(websocket, chat_id, user_id, step_content)
+                send_meta = await self.send_msg(websocket, chat_id, user_id, step_content)
+                if use_main_ws_sync:
+                    synced_row = await self._wait_for_outgoing_delivery_sync(
+                        chat_id,
+                        step_content,
+                        content_type=1,
+                        after_id=sync_after_id,
+                        order_id=order_id,
+                        step_index=index,
+                    )
+                    self._annotate_outgoing_delivery_chat_message(
+                        synced_row.get('id'),
+                        reply_source=reply_source,
+                        item_id=item_id,
+                        extra_json=self._build_delivery_send_extra_json(user_id, send_meta, order_id, index, total_steps),
+                    )
+                else:
+                    await self._verify_delivery_step_visible_in_history(
+                        chat_id,
+                        step_content,
+                        content_type=1,
+                        order_id=order_id,
+                        step_index=index,
+                    )
+                    self._record_outgoing_chat_message(
+                        chat_id, user_id, step_content,
+                        content_type=1,
+                        item_id=item_id,
+                        reply_source=reply_source,
+                        send_meta=send_meta,
+                        order_id=order_id,
+                        step_index=index,
+                        total_steps=total_steps,
+                    )
                 logger.info(
-                    f"【{log_prefix}】步骤 {index}/{total_steps} 已向 {user_url} 发送文本内容"
+                    f"【{log_prefix}】步骤 {index}/{total_steps} IM文本发送已被平台确认并完成会话回读: {user_url}"
                 )
 
             if total_steps > 1 and index < total_steps:
@@ -13021,6 +13495,13 @@ class XianyuLive:
         await ws.send(json.dumps(msg))
 
     async def send_msg(self, ws, cid, toid, text):
+        send_mid = generate_mid()
+        send_uuid = generate_uuid()
+        use_main_ws_ack = ws is getattr(self, 'ws', None)
+        ack_future = None
+        if use_main_ws_ack:
+            ack_future = asyncio.get_running_loop().create_future()
+            self.pending_send_ack_waiters[send_mid] = ack_future
         text = {
             "contentType": 1,
             "text": {
@@ -13031,11 +13512,11 @@ class XianyuLive:
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
-                "mid": generate_mid()
+                "mid": send_mid
             },
             "body": [
                 {
-                    "uuid": generate_uuid(),
+                    "uuid": send_uuid,
                     "cid": f"{cid}@goofish",
                     "conversationType": 1,
                     "content": {
@@ -13064,7 +13545,25 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
+        try:
+            await ws.send(json.dumps(msg))
+            if use_main_ws_ack:
+                ack = await self._wait_for_send_ack(send_mid, future=ack_future)
+            else:
+                ack = await self._receive_send_ack_direct(ws, send_mid)
+            return {
+                'mid': send_mid,
+                'uuid': send_uuid,
+                'cid': self._normalize_ws_chat_id(cid),
+                'receiver_id': str(toid),
+                'content_type': 1,
+                'ack': ack,
+            }
+        except Exception:
+            if ack_future is not None and not ack_future.done():
+                ack_future.cancel()
+            self.pending_send_ack_waiters.pop(send_mid, None)
+            raise
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -13268,7 +13767,8 @@ class XianyuLive:
         logger.info(f"【{self.cookie_id}】已创建独立历史拉取实例: chat_id={cid}, page_size={page_size}")
         return await isolated_live.list_all_conversations(cid, page_size=page_size)
 
-    async def fetch_conversation_history_with_fallback(self, cid: str, page_size: int = 20, isolated_timeout: int = 12):
+    async def fetch_conversation_history_with_fallback(self, cid: str, page_size: int = 20,
+                                                       isolated_timeout: int = 12, fallback_timeout: int = 10):
         """优先使用独立临时实例拉取历史，超时后回退到主实例方式。"""
         try:
             return await asyncio.wait_for(
@@ -13286,7 +13786,22 @@ class XianyuLive:
                 f"error={self._safe_str(isolated_exc)}"
             )
 
-        return await self.list_all_conversations(cid, page_size=page_size)
+        try:
+            return await asyncio.wait_for(
+                self.list_all_conversations(cid, page_size=page_size),
+                timeout=max(3, fallback_timeout),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"【{self.cookie_id}】主实例历史拉取兜底仍超时: chat_id={cid}, "
+                f"page_size={page_size}, timeout={fallback_timeout}s"
+            )
+        except Exception as fallback_exc:
+            logger.warning(
+                f"【{self.cookie_id}】主实例历史拉取兜底失败: chat_id={cid}, "
+                f"error={self._safe_str(fallback_exc)}"
+            )
+        return []
 
     def _extract_image_url_from_message(self, message: dict) -> Optional[str]:
         """从消息结构中提取图片URL"""
@@ -14860,7 +15375,10 @@ class XianyuLive:
                 extra_headers=headers,
                 close_timeout=5  # 添加关闭超时
             ) as websocket:
-                result = await self._handle_websocket_connection(websocket, toid, item_id, text)
+                result = await asyncio.wait_for(
+                    self._handle_websocket_connection(websocket, toid, item_id, text),
+                    timeout=45,
+                )
                 if result:
                     logger.info(f"【{self.cookie_id}】单次发送消息成功")
                 else:
@@ -14877,7 +15395,10 @@ class XianyuLive:
                     additional_headers=headers,
                     close_timeout=5
                 ) as websocket:
-                    result = await self._handle_websocket_connection(websocket, toid, item_id, text)
+                    result = await asyncio.wait_for(
+                        self._handle_websocket_connection(websocket, toid, item_id, text),
+                        timeout=45,
+                    )
                     if result:
                         logger.info(f"【{self.cookie_id}】单次发送消息成功(兼容模式)")
                     else:
@@ -14903,7 +15424,10 @@ class XianyuLive:
                 extra_headers=headers,
                 close_timeout=5
             ) as websocket:
-                result = await self._handle_websocket_connection_steps(websocket, toid, item_id, delivery_steps)
+                result = await asyncio.wait_for(
+                    self._handle_websocket_connection_steps(websocket, toid, item_id, delivery_steps),
+                    timeout=90,
+                )
                 if result:
                     logger.info(f"【{self.cookie_id}】单次发送发货步骤成功")
                 else:
@@ -14918,7 +15442,10 @@ class XianyuLive:
                     additional_headers=headers,
                     close_timeout=5
                 ) as websocket:
-                    result = await self._handle_websocket_connection_steps(websocket, toid, item_id, delivery_steps)
+                    result = await asyncio.wait_for(
+                        self._handle_websocket_connection_steps(websocket, toid, item_id, delivery_steps),
+                        timeout=90,
+                    )
                     if result:
                         logger.info(f"【{self.cookie_id}】单次发送发货步骤成功(兼容模式)")
                     else:
@@ -14955,7 +15482,9 @@ class XianyuLive:
                         cid,
                         toid,
                         delivery_steps,
-                        log_prefix="单次手动发货"
+                        log_prefix="单次手动发货",
+                        item_id=item_id,
+                        reply_source='手动发货',
                     )
                     logger.info(f'【{self.cookie_id}】send delivery steps success')
                     return True
@@ -16474,7 +17003,10 @@ class XianyuLive:
                                                 chat_id,
                                                 send_user_id,
                                                 delivery_steps,
-                                                log_prefix=f"亦凡账号确认发货 order_id={order_id_saved or 'unknown'}"
+                                                log_prefix=f"亦凡账号确认发货 order_id={order_id_saved or 'unknown'}",
+                                                item_id=item_id_saved,
+                                                order_id=order_id_saved,
+                                                reply_source='自动发货',
                                             )
 
                                             finalize_result = await self._finalize_delivery_after_send(
@@ -17040,6 +17572,12 @@ class XianyuLive:
 
                                     # 处理心跳响应（高优先级，直接处理）
                                     if await self.handle_heartbeat_response(message_data):
+                                        continue
+
+                                    # 处理主动发送消息的服务端确认回包。这里必须在消息队列前消费，
+                                    # 否则自动发货会把 WebSocket 写入误判成真正发送成功。
+                                    if self._consume_pending_send_ack(message_data):
+                                        logger.info(f"【{self.cookie_id}】IM发送确认回包已匹配 [ID:{msg_id}]")
                                         continue
 
                                     is_sync_package = self.is_sync_package(message_data)
@@ -17621,6 +18159,14 @@ class XianyuLive:
     async def send_image_msg(self, ws, cid, toid, image_url, width=800, height=600, card_id=None):
         """发送图片消息"""
         try:
+            send_mid = generate_mid()
+            send_uuid = generate_uuid()
+            use_main_ws_ack = ws is getattr(self, 'ws', None)
+            ack_future = None
+            if use_main_ws_ack:
+                ack_future = asyncio.get_running_loop().create_future()
+                self.pending_send_ack_waiters[send_mid] = ack_future
+
             # 检查图片URL是否需要上传到CDN
             original_url = image_url
 
@@ -17700,11 +18246,11 @@ class XianyuLive:
             msg = {
                 "lwp": "/r/MessageSend/sendByReceiverScope",
                 "headers": {
-                    "mid": generate_mid()
+                    "mid": send_mid
                 },
                 "body": [
                     {
-                        "uuid": generate_uuid(),
+                        "uuid": send_uuid,
                         "cid": f"{cid}@goofish",
                         "conversationType": 1,
                         "content": {
@@ -17734,8 +18280,28 @@ class XianyuLive:
                 ]
             }
 
-            await ws.send(json.dumps(msg))
-            logger.info(f"【{self.cookie_id}】图片消息发送成功: {image_url}")
+            try:
+                await ws.send(json.dumps(msg))
+                if use_main_ws_ack:
+                    ack = await self._wait_for_send_ack(send_mid, future=ack_future)
+                else:
+                    ack = await self._receive_send_ack_direct(ws, send_mid)
+            except Exception:
+                if ack_future is not None and not ack_future.done():
+                    ack_future.cancel()
+                self.pending_send_ack_waiters.pop(send_mid, None)
+                raise
+
+            logger.info(f"【{self.cookie_id}】图片消息发送已被平台确认: {image_url}")
+            return {
+                'mid': send_mid,
+                'uuid': send_uuid,
+                'cid': self._normalize_ws_chat_id(cid),
+                'receiver_id': str(toid),
+                'content_type': 2,
+                'image_url': image_url,
+                'ack': ack,
+            }
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】发送图片消息失败: {self._safe_str(e)}")
