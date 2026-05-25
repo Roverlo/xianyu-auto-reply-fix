@@ -5162,6 +5162,42 @@ Cookie数量: {cookie_count}
                 logger.error(f"获取发货 finalize 状态失败: {e}")
                 return None
 
+    def has_delivery_send_uncertain_log(self, order_id: str, cookie_id: str = None) -> bool:
+        """Return True if prior logs indicate IM send may have reached the buyer."""
+        if not order_id:
+            return False
+
+        uncertain_markers = (
+            'IM发送确认后未收到闲鱼官方发出消息同步',
+            'IM发送确认后未能在闲鱼会话历史中回读到自动发货消息',
+            '等待IM发送确认超时',
+            'sent 1000 (OK); then received 1000 (OK)',
+            'received 1000 (OK)',
+        )
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                params = [order_id]
+                cookie_filter = ''
+                if cookie_id:
+                    cookie_filter = ' AND cookie_id = ?'
+                    params.append(cookie_id)
+
+                marker_sql = ' OR '.join(['reason LIKE ?' for _ in uncertain_markers])
+                params.extend([f'%{marker}%' for marker in uncertain_markers])
+                self._execute_sql(cursor, f'''
+                    SELECT 1
+                    FROM delivery_logs
+                    WHERE order_id = ?{cookie_filter}
+                      AND status = 'failed'
+                      AND ({marker_sql})
+                    LIMIT 1
+                ''', params)
+                return cursor.fetchone() is not None
+            except Exception as e:
+                logger.error(f"检查发货不确定日志失败: {e}")
+                return False
+
     def get_delivery_finalization_states(self, order_id: str):
         """获取订单全部发货单元的 finalize 状态。"""
         with self.lock:
@@ -5215,6 +5251,7 @@ Cookie数量: {cookie_count}
 
         finalized_unit_indexes = []
         pending_finalize_unit_indexes = []
+        uncertain_unit_indexes = []
         remaining_unit_indexes = []
 
         for unit_index in range(1, expected + 1):
@@ -5223,10 +5260,12 @@ Cookie数量: {cookie_count}
                 finalized_unit_indexes.append(unit_index)
             elif status == 'sent':
                 pending_finalize_unit_indexes.append(unit_index)
+            elif status == 'send_uncertain':
+                uncertain_unit_indexes.append(unit_index)
             else:
                 remaining_unit_indexes.append(unit_index)
 
-        if pending_finalize_unit_indexes:
+        if pending_finalize_unit_indexes or uncertain_unit_indexes:
             aggregate_status = 'partial_pending_finalize'
         elif len(finalized_unit_indexes) >= expected:
             aggregate_status = 'shipped'
@@ -5241,9 +5280,11 @@ Cookie数量: {cookie_count}
             'state_count': len(states),
             'finalized_count': len(finalized_unit_indexes),
             'pending_finalize_count': len(pending_finalize_unit_indexes),
+            'uncertain_count': len(uncertain_unit_indexes),
             'remaining_count': len(remaining_unit_indexes),
             'finalized_unit_indexes': finalized_unit_indexes,
             'pending_finalize_unit_indexes': pending_finalize_unit_indexes,
+            'uncertain_unit_indexes': uncertain_unit_indexes,
             'remaining_unit_indexes': remaining_unit_indexes,
             'aggregate_status': aggregate_status,
             'states': states,

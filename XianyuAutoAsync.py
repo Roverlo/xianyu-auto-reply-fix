@@ -4143,6 +4143,10 @@ class XianyuLive:
             # 如果没有订单ID，则不进行冷却检查，允许发货
             return True
 
+        if self._has_delivery_send_uncertain_state(order_id):
+            logger.warning(f"【{self.cookie_id}】订单 {order_id} 存在已发送/待确认记录，跳过再次发送")
+            return False
+
         current_time = time.time()
         last_delivery = self.last_delivery_time.get(order_id, 0)
 
@@ -4392,6 +4396,73 @@ class XianyuLive:
             last_error=last_error,
         )
 
+    def _has_delivery_send_uncertain_state(self, order_id: str, delivery_unit_index: int = 1) -> bool:
+        """True means the IM may already be sent, so another send would risk spamming the buyer."""
+        if not order_id:
+            return False
+
+        try:
+            from db_manager import db_manager
+            state = db_manager.get_delivery_finalization_state(order_id, delivery_unit_index)
+            status = state.get('status') if state else None
+            if status == 'send_uncertain':
+                return True
+            if status == 'finalized':
+                current_order = db_manager.get_order_by_id(order_id)
+                try:
+                    expected_quantity = max(1, int((current_order or {}).get('quantity') or 1))
+                except (TypeError, ValueError):
+                    expected_quantity = 1
+                progress = db_manager.get_delivery_progress_summary(order_id, expected_quantity=expected_quantity)
+                if progress.get('aggregate_status') == 'shipped':
+                    return True
+
+            if db_manager.has_delivery_send_uncertain_log(order_id, self.cookie_id):
+                return True
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】检查发货不确定状态失败: {self._safe_str(exc)}")
+        return False
+
+    def _is_delivery_send_uncertain_error(self, error: Exception) -> bool:
+        """Detect errors raised after an IM send may already have reached the platform."""
+        error_text = self._safe_str(error)
+        uncertain_markers = (
+            'IM发送确认后未收到闲鱼官方发出消息同步',
+            'IM发送确认后未能在闲鱼会话历史中回读到自动发货消息',
+            '等待IM发送确认超时',
+            'sent 1000 (OK); then received 1000 (OK)',
+            'received 1000 (OK)',
+        )
+        return any(marker in error_text for marker in uncertain_markers)
+
+    def _persist_delivery_send_uncertain_state(self, order_id: str, item_id: str, buyer_id: str,
+                                               delivery_meta: dict = None, channel: str = 'auto',
+                                               last_error: str = None) -> bool:
+        if not order_id:
+            return False
+
+        meta = dict(delivery_meta or {})
+        meta.setdefault('success', True)
+        meta['send_uncertain'] = True
+        meta['requires_manual_review'] = True
+        meta['last_send_error'] = last_error
+        reservation_marked = self._mark_data_reservation_sent_if_needed(meta)
+        meta['data_reservation_marked_sent'] = reservation_marked
+        if not reservation_marked:
+            logger.warning(
+                f"【{self.cookie_id}】发货状态不确定，且卡密预占标记已发送失败: "
+                f"order_id={order_id}, reservation_id={meta.get('data_reservation_id')}"
+            )
+        return self._persist_delivery_finalization_state(
+            order_id=order_id,
+            item_id=item_id,
+            buyer_id=buyer_id,
+            delivery_meta=meta,
+            channel=channel,
+            status='send_uncertain',
+            last_error=last_error or 'IM发送确认后未完成可靠同步，已禁止自动重发'
+        )
+
     def _summarize_delivery_progress(self, order_id: str, expected_quantity: int = 1):
         if not order_id:
             return {
@@ -4400,9 +4471,11 @@ class XianyuLive:
                 'aggregate_status': 'pending_ship',
                 'finalized_count': 0,
                 'pending_finalize_count': 0,
+                'uncertain_count': 0,
                 'remaining_count': max(1, int(expected_quantity or 1)),
                 'finalized_unit_indexes': [],
                 'pending_finalize_unit_indexes': [],
+                'uncertain_unit_indexes': [],
                 'remaining_unit_indexes': list(range(1, max(1, int(expected_quantity or 1)) + 1)),
                 'states': [],
             }
@@ -5606,6 +5679,41 @@ class XianyuLive:
                             rule_meta=delivery_rule_meta
                         )
                     except Exception as send_e:
+                        if self._is_delivery_send_uncertain_error(send_e):
+                            uncertain_reason = (
+                                f'自动发货消息发送状态不确定，已禁止自动重发，请人工核对闲鱼聊天记录: '
+                                f'{self._safe_str(send_e)}'
+                            )
+                            uncertain_meta = delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta
+                            self._persist_delivery_send_uncertain_state(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                delivery_meta=uncertain_meta,
+                                channel='auto',
+                                last_error=uncertain_reason
+                            )
+                            self._activate_delivery_lock(lock_key, delay_minutes=24 * 60)
+                            self._record_delivery_log(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                status='failed',
+                                reason=uncertain_reason,
+                                channel='auto',
+                                rule_meta=delivery_rule_meta
+                            )
+                            await self.send_delivery_failure_notification(
+                                send_user_name="买家",
+                                send_user_id=user_id,
+                                item_id=item_id,
+                                error_message=uncertain_reason,
+                                chat_id=chat_id,
+                                order_id=order_id
+                            )
+                            logger.error(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] {uncertain_reason}')
+                            return
+
                         self._record_delivery_log(
                             order_id=order_id,
                             item_id=item_id,
@@ -5649,16 +5757,38 @@ class XianyuLive:
                     )
 
         except Exception as e:
-            self._release_data_reservation_if_needed(
-                delivery_result if 'delivery_result' in locals() and isinstance(delivery_result, dict) else delivery_rule_meta if 'delivery_rule_meta' in locals() else None,
-                error=f'自动发货发送失败: {self._safe_str(e)}'
+            failure_meta = (
+                delivery_result if 'delivery_result' in locals() and isinstance(delivery_result, dict)
+                else delivery_rule_meta if 'delivery_rule_meta' in locals()
+                else None
             )
+            uncertain_error = self._is_delivery_send_uncertain_error(e)
+            if uncertain_error:
+                failure_reason = (
+                    f'简化消息自动发货发送状态不确定，已禁止自动重发，请人工核对闲鱼聊天记录: '
+                    f'{self._safe_str(e)}'
+                )
+                self._persist_delivery_send_uncertain_state(
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=user_id,
+                    delivery_meta=failure_meta,
+                    channel='auto',
+                    last_error=failure_reason
+                )
+                self._activate_delivery_lock(order_id, delay_minutes=24 * 60)
+            else:
+                failure_reason = f'简化消息自动发货异常: {self._safe_str(e)}'
+                self._release_data_reservation_if_needed(
+                    failure_meta,
+                    error=f'自动发货发送失败: {self._safe_str(e)}'
+                )
             self._record_delivery_log(
                 order_id=order_id,
                 item_id=item_id,
                 buyer_id=user_id,
                 status='failed',
-                reason=f'简化消息自动发货异常: {self._safe_str(e)}',
+                reason=failure_reason,
                 channel='auto'
             )
             logger.error(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 简化消息自动发货异常: {self._safe_str(e)}')
@@ -6182,14 +6312,29 @@ class XianyuLive:
                             )
                         except Exception as e:
                             group_error = self._safe_str(e)
+                            group_send_uncertain = self._is_delivery_send_uncertain_error(e)
                             for prepared_unit in group_units:
                                 unit_rule_meta = prepared_unit.get('rule_meta') or {}
                                 unit_index = prepared_unit.get('unit_index') or 1
-                                self._release_data_reservation_if_needed(
-                                    unit_rule_meta,
-                                    error=f'发送失败(unit={unit_index}): {group_error}'
-                                )
-                                last_delivery_error = f"发送第 {unit_index}/{quantity_to_send} 个卡券失败: {group_error}"
+                                if group_send_uncertain:
+                                    last_delivery_error = (
+                                        f"发送第 {unit_index}/{quantity_to_send} 个卡券状态不确定，"
+                                        f"已禁止自动重发，请人工核对闲鱼聊天记录: {group_error}"
+                                    )
+                                    self._persist_delivery_send_uncertain_state(
+                                        order_id=order_id,
+                                        item_id=item_id,
+                                        buyer_id=send_user_id,
+                                        delivery_meta=unit_rule_meta,
+                                        channel='auto',
+                                        last_error=last_delivery_error
+                                    )
+                                else:
+                                    self._release_data_reservation_if_needed(
+                                        unit_rule_meta,
+                                        error=f'发送失败(unit={unit_index}): {group_error}'
+                                    )
+                                    last_delivery_error = f"发送第 {unit_index}/{quantity_to_send} 个卡券失败: {group_error}"
                                 self._record_delivery_log(
                                     order_id=order_id,
                                     item_id=item_id,
@@ -6201,6 +6346,8 @@ class XianyuLive:
                                     rule_meta=unit_rule_meta
                                 )
                                 logger.error(last_delivery_error)
+                            if group_send_uncertain:
+                                self._activate_delivery_lock(lock_key, delay_minutes=24 * 60)
                             continue
 
                         for prepared_unit in group_units:
@@ -12829,21 +12976,39 @@ class XianyuLive:
                 send_meta = await self.send_image_msg(websocket, chat_id, user_id, image_url, card_id=image_card_id)
                 actual_image_url = (send_meta or {}).get('image_url') or image_url
                 if use_main_ws_sync:
-                    synced_row = await self._wait_for_outgoing_delivery_sync(
-                        chat_id,
-                        '[图片]',
-                        content_type=2,
-                        image_url=actual_image_url,
-                        after_id=sync_after_id,
-                        order_id=order_id,
-                        step_index=index,
-                    )
-                    self._annotate_outgoing_delivery_chat_message(
-                        synced_row.get('id'),
-                        reply_source=reply_source,
-                        item_id=item_id,
-                        extra_json=self._build_delivery_send_extra_json(user_id, send_meta, order_id, index, total_steps),
-                    )
+                    try:
+                        synced_row = await self._wait_for_outgoing_delivery_sync(
+                            chat_id,
+                            '[图片]',
+                            content_type=2,
+                            image_url=actual_image_url,
+                            after_id=sync_after_id,
+                            order_id=order_id,
+                            step_index=index,
+                        )
+                        self._annotate_outgoing_delivery_chat_message(
+                            synced_row.get('id'),
+                            reply_source=reply_source,
+                            item_id=item_id,
+                            extra_json=self._build_delivery_send_extra_json(user_id, send_meta, order_id, index, total_steps),
+                        )
+                    except TimeoutError as sync_error:
+                        logger.warning(
+                            f"【{self.cookie_id}】IM图片发送已收到发送确认，但未等到官方同步；"
+                            f"按已发出处理并禁止自动重发: chat_id={self._normalize_ws_chat_id(chat_id)}, "
+                            f"order_id={order_id}, step={index}, error={self._safe_str(sync_error)}"
+                        )
+                        self._record_outgoing_chat_message(
+                            chat_id, user_id, '[图片]',
+                            content_type=2,
+                            image_url=actual_image_url,
+                            item_id=item_id,
+                            reply_source=reply_source,
+                            send_meta=send_meta,
+                            order_id=order_id,
+                            step_index=index,
+                            total_steps=total_steps,
+                        )
                 else:
                     await self._verify_delivery_step_visible_in_history(
                         chat_id,
@@ -12870,20 +13035,37 @@ class XianyuLive:
             else:
                 send_meta = await self.send_msg(websocket, chat_id, user_id, step_content)
                 if use_main_ws_sync:
-                    synced_row = await self._wait_for_outgoing_delivery_sync(
-                        chat_id,
-                        step_content,
-                        content_type=1,
-                        after_id=sync_after_id,
-                        order_id=order_id,
-                        step_index=index,
-                    )
-                    self._annotate_outgoing_delivery_chat_message(
-                        synced_row.get('id'),
-                        reply_source=reply_source,
-                        item_id=item_id,
-                        extra_json=self._build_delivery_send_extra_json(user_id, send_meta, order_id, index, total_steps),
-                    )
+                    try:
+                        synced_row = await self._wait_for_outgoing_delivery_sync(
+                            chat_id,
+                            step_content,
+                            content_type=1,
+                            after_id=sync_after_id,
+                            order_id=order_id,
+                            step_index=index,
+                        )
+                        self._annotate_outgoing_delivery_chat_message(
+                            synced_row.get('id'),
+                            reply_source=reply_source,
+                            item_id=item_id,
+                            extra_json=self._build_delivery_send_extra_json(user_id, send_meta, order_id, index, total_steps),
+                        )
+                    except TimeoutError as sync_error:
+                        logger.warning(
+                            f"【{self.cookie_id}】IM文本发送已收到发送确认，但未等到官方同步；"
+                            f"按已发出处理并禁止自动重发: chat_id={self._normalize_ws_chat_id(chat_id)}, "
+                            f"order_id={order_id}, step={index}, error={self._safe_str(sync_error)}"
+                        )
+                        self._record_outgoing_chat_message(
+                            chat_id, user_id, step_content,
+                            content_type=1,
+                            item_id=item_id,
+                            reply_source=reply_source,
+                            send_meta=send_meta,
+                            order_id=order_id,
+                            step_index=index,
+                            total_steps=total_steps,
+                        )
                 else:
                     await self._verify_delivery_step_visible_in_history(
                         chat_id,
