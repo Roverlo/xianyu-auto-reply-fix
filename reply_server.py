@@ -1095,6 +1095,12 @@ async def start_scheduled_task_checker():
     """应用启动时开启定时任务检查协程"""
     asyncio.create_task(scheduled_task_checker())
     logger.info("定时任务调度器已启动")
+    try:
+        from auto_rate_task import auto_rate_task_loop
+        asyncio.create_task(auto_rate_task_loop())
+        logger.info("自动补评价任务已启动")
+    except Exception as exc:
+        logger.error(f"自动补评价任务启动失败: {exc}")
 
 
 # 添加请求日志中间件
@@ -7387,6 +7393,11 @@ class AutoCommentUpdate(BaseModel):
     auto_comment: bool
 
 
+class AutoCommentOrderRequest(BaseModel):
+    cookie_id: Optional[str] = None
+    comment: Optional[str] = None
+
+
 class CommentTemplateCreate(BaseModel):
     name: str
     content: str
@@ -11549,6 +11560,117 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
     except Exception as e:
         log_with_user('error', f"查询用户订单失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
+
+
+@app.get('/api/auto-comment/logs')
+def get_auto_comment_logs(
+    cookie_id: str = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """查询自动评价执行日志。"""
+    try:
+        if cookie_id:
+            cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        logs = db_manager.get_scheduled_rate_logs(
+            user_id=current_user['user_id'],
+            cookie_id=cookie_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {"success": True, "data": logs}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"查询自动评价日志失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"查询自动评价日志失败: {str(e)}")
+
+
+@app.post('/api/orders/{order_id}/comment')
+async def comment_order_once(
+    order_id: str,
+    request: AutoCommentOrderRequest = AutoCommentOrderRequest(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动对指定订单执行一次买家好评。"""
+    try:
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail='订单不存在')
+
+        cookie_id = str(request.cookie_id or order.get('cookie_id') or '').strip()
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        if order.get('cookie_id') and order.get('cookie_id') != cookie_id:
+            raise HTTPException(status_code=403, detail='订单不属于该账号')
+
+        from auto_rate_task import rate_order_once
+
+        result = await rate_order_once(
+            cookie_id=cookie_id,
+            order_id=order_id,
+            comment=request.comment,
+            batch_id=f"manual_{uuid.uuid4()}",
+            source='manual',
+        )
+        log_with_user('info', f"手动评价订单: order_id={order_id}, cookie_id={cookie_id}, result={result}", current_user)
+        return {"success": bool(result.get('success')), "data": result, "message": result.get('message')}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"手动评价订单失败: order_id={order_id}, error={str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"手动评价订单失败: {str(e)}")
+
+
+@app.post('/api/auto-comment/run-once')
+async def run_auto_comment_once(
+    request: AutoCommentOrderRequest = AutoCommentOrderRequest(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动触发一轮当前用户范围内的自动补评价。"""
+    try:
+        from auto_rate_task import rate_order_once
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        target_cookie_ids = [request.cookie_id] if request.cookie_id else list(user_cookies.keys())
+        batch_id = f"manual_batch_{uuid.uuid4()}"
+        results = []
+        stats = {"batch_id": batch_id, "accounts": 0, "orders": 0, "success": 0, "failed": 0, "skipped": 0}
+
+        for raw_cookie_id in target_cookie_ids:
+            cookie_id = _ensure_cookie_access(raw_cookie_id, current_user)
+            if not db_manager.get_auto_comment(cookie_id):
+                continue
+            stats['accounts'] += 1
+            template = db_manager.get_active_comment_template(cookie_id)
+            if not template or not str(template.get('content') or '').strip():
+                stats['skipped'] += 1
+                continue
+            orders = db_manager.get_pending_auto_comment_orders(cookie_id, limit=5, days=10, cooldown_minutes=0)
+            for order in orders:
+                stats['orders'] += 1
+                result = await rate_order_once(
+                    cookie_id=cookie_id,
+                    order_id=order.get('order_id'),
+                    comment=request.comment or str(template.get('content') or '').strip(),
+                    batch_id=batch_id,
+                    source='manual_batch',
+                )
+                results.append(result)
+                if result.get('success'):
+                    stats['success'] += 1
+                elif result.get('status') in {'skipped', 'missing_template', 'already_rated'}:
+                    stats['skipped'] += 1
+                else:
+                    stats['failed'] += 1
+                await asyncio.sleep(1)
+
+        return {"success": True, "data": {"stats": stats, "results": results}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"手动触发自动补评价失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"手动触发自动补评价失败: {str(e)}")
 
 
 @app.get('/api/orders/stream')
