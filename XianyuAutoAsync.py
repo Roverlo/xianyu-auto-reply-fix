@@ -2480,6 +2480,31 @@ class XianyuLive:
             self.pending_order_reconcile_task = None
             logger.info(f"【{self.cookie_id}】后台任务引用已全部重置")
 
+    def _is_transient_network_error(self, error_type: str = "", error_msg: str = "") -> bool:
+        """Return True for local/network failures that should not trigger login recovery."""
+        text = f"{error_type or ''} {error_msg or ''}".lower()
+        network_keywords = (
+            "gaierror",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "getaddrinfo failed",
+            "nodename nor servname",
+            "err_name_not_resolved",
+            "dns",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "network is unreachable",
+            "no route to host",
+            "host is unreachable",
+            "cannot connect",
+            "clientconnectorerror",
+            "server disconnected",
+            "timed out",
+            "timeout",
+        )
+        return any(keyword in text for keyword in network_keywords)
+
     def _calculate_retry_delay(self, error_msg: str) -> int:
         """根据错误类型和失败次数计算重试延迟"""
         current_time = time.time()
@@ -2503,9 +2528,9 @@ class XianyuLive:
         if "no close frame received or sent" in error_msg:
             return min(3 * self.connection_failures, 15)
         
-        # 网络连接问题 - 长延迟
-        elif "Connection refused" in error_msg or "timeout" in error_msg.lower():
-            return min(10 * self.connection_failures, 60)
+        # 网络连接问题 - 长延迟，但保持较快探测以便网络恢复后自动拉起
+        elif self._is_transient_network_error(error_msg=error_msg):
+            return min(max(15 * max(1, self.connection_failures), 15), 120)
         
         # 其他未知错误 - 中等延迟
         else:
@@ -17878,6 +17903,7 @@ class XianyuLive:
                     error_msg = self._safe_str(e)
                     import traceback
                     error_type = type(e).__name__
+                    is_transient_network_error = self._is_transient_network_error(error_type, error_msg)
                     
                     # 检查是否是 ConnectionClosedError（正常的连接关闭）
                     is_connection_closed = (
@@ -17924,6 +17950,19 @@ class XianyuLive:
 
                     # 检查是否超过最大失败次数
                     if self.connection_failures >= self.max_connection_failures:
+                        if is_transient_network_error:
+                            retry_delay = max(self._calculate_retry_delay(error_msg), 120)
+                            self._set_connection_state(
+                                ConnectionState.RECONNECTING,
+                                f"连续网络异常{self.connection_failures}次，保持主循环等待网络恢复"
+                            )
+                            logger.warning(
+                                f"【{self.cookie_id}】连续{self.connection_failures}次连接失败更像本机/网络/DNS异常，"
+                                f"跳过密码登录和实例重启，{retry_delay}秒后继续重连"
+                            )
+                            await self._interruptible_sleep(retry_delay)
+                            continue
+
                         self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
                         logger.warning(f"【{self.cookie_id}】连续失败{self.max_connection_failures}次，尝试通过密码登录刷新Cookie...")
                         
