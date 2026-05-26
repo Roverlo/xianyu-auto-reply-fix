@@ -1756,6 +1756,13 @@ class XianyuLive:
                     if business_idle < self.message_stream_watchdog_timeout:
                         continue
 
+                    if not self.last_sync_package_time and not self.last_user_chat_time:
+                        logger.info(
+                            f"【{self.cookie_id}】业务流长时间只有心跳，但当前连接从未收到同步包/买家消息，"
+                            f"按低活跃时段继续观察: connected_for={connected_for:.0f}s, business_idle={business_idle:.0f}s"
+                        )
+                        continue
+
                     if (
                         self.last_stream_watchdog_reconnect_time
                         and now - self.last_stream_watchdog_reconnect_time < self.message_stream_watchdog_timeout / 2
@@ -2761,9 +2768,21 @@ class XianyuLive:
         self.last_init_failure_type = None
         self.init_auth_failures = 0
         self.stream_watchdog_task = None
-        self.stream_watchdog_check_interval = max(self.heartbeat_interval, 15)
-        self.stream_watchdog_grace_period = max(self.heartbeat_interval * 4, 120)
-        self.message_stream_watchdog_timeout = max(self.session_keepalive_interval * 3, 1800)
+        self.stream_watchdog_check_interval = max(
+            int(RISK_CONTROL.get('message_stream_watchdog_check_interval_seconds', self.heartbeat_interval) or self.heartbeat_interval),
+            self.heartbeat_interval,
+            15,
+        )
+        self.stream_watchdog_grace_period = max(
+            int(RISK_CONTROL.get('message_stream_watchdog_grace_seconds', 600) or 600),
+            self.heartbeat_interval * 4,
+            120,
+        )
+        self.message_stream_watchdog_timeout = max(
+            int(RISK_CONTROL.get('message_stream_watchdog_timeout_seconds', 7200) or 7200),
+            self.session_keepalive_interval * 6,
+            3600,
+        )
         self.stream_watchdog_trigger_times = deque(maxlen=8)
         self.message_stream_notification_window = max(self.message_stream_watchdog_timeout * 2, 3600)
         self.message_stream_notification_cooldown = max(self.message_stream_watchdog_timeout, 1800)

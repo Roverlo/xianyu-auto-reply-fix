@@ -3403,6 +3403,7 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     stream_stale_now = bool(
         ws_ready
         and recent_heartbeat_ok
+        and (last_sync_package_at is not None or last_user_chat_at is not None)
         and connected_for_seconds is not None
         and connected_for_seconds >= stream_watchdog_grace_period
         and business_idle_seconds is not None
