@@ -4277,6 +4277,9 @@ async function loadCookies() {
                 <button class="btn btn-sm btn-outline-warning account-action-btn" onclick="configAIReply('${cookie.id}')" title="配置AI回复" data-action="ai-reply" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
                     <i class="bi bi-robot"></i><span class="action-text">AI</span>
                 </button>
+                <button class="btn btn-sm btn-outline-danger account-action-btn" onclick="runHistoricalAutoCommentForAccount('${cookie.id}')" title="历史订单补评价" data-action="history-rate" data-requires-enabled="true" ${!isEnabled ? 'disabled' : ''}>
+                    <i class="bi bi-star-fill"></i><span class="action-text">补评</span>
+                </button>
             </div>
             <div class="account-action-group account-action-group-item" aria-label="商品操作">
                 <span class="account-action-group-label">商品</span>
@@ -5014,6 +5017,72 @@ function updateAutoCommentRowStatus(accountId, enabled) {
         const label = toggle.closest('.status-toggle');
         label.title = enabled ? '点击关闭自动好评' : '点击开启自动好评';
     }
+}
+
+async function runHistoricalAutoComment(accountIds, options = {}) {
+    const normalizedIds = Array.from(new Set((accountIds || []).map(id => String(id || '').trim()).filter(Boolean)));
+    if (normalizedIds.length === 0) {
+        showToast('当前没有可补评的账号', 'warning');
+        return;
+    }
+
+    const confirmText = options.confirmText || `确定要为 ${normalizedIds.length} 个账号执行历史订单补评价吗？\n\n将从闲鱼待评价列表拉取订单，并按账号激活的好评模板逐单评价。`;
+    if (!options.skipConfirm && !confirm(confirmText)) return;
+
+    toggleLoading(true);
+    showToast('正在执行历史订单补评价，请稍候...', 'info');
+    try {
+        const response = await fetch(`${apiBase}/api/auto-comment/batch-rate`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ cookie_ids: normalizedIds, page_size: 100 })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.success === false) {
+            showToast(data.detail || data.message || '历史补评价失败', 'danger');
+            return;
+        }
+
+        const stats = data.data || {};
+        const failedDetails = (stats.details || []).filter(item => !item.success || (item.failed_count || 0) > 0);
+        const summary = `历史补评完成：评价 ${stats.total_rated || 0} 笔，失败 ${stats.total_failed || 0} 笔，待评 ${stats.total_pending || 0} 笔`;
+        if (failedDetails.length > 0) {
+            const failedText = failedDetails.slice(0, 3).map(item => `${item.account_id}：${item.message}`).join('；');
+            showToast(`${summary}。${failedText}`, 'warning');
+        } else {
+            showToast(data.message || summary, 'success');
+        }
+        await loadCookies();
+    } catch (error) {
+        console.error('历史补评价失败:', error);
+        showToast(`历史补评价请求异常: ${error.message}`, 'danger');
+    } finally {
+        toggleLoading(false);
+    }
+}
+
+// 批量执行当前账号列表的历史订单补评价
+async function runHistoricalAutoCommentForAllAccounts() {
+    const accountIds = Array.from(document.querySelectorAll('#cookieTable tbody .cookie-id strong'))
+        .map(el => (el.textContent || '').trim())
+        .filter(Boolean);
+    await runHistoricalAutoComment(accountIds, {
+        confirmText: `确定要为当前列表中的 ${accountIds.length} 个账号执行历史订单补评价吗？\n\n将从闲鱼待评价列表拉取订单，并按账号激活的好评模板逐单评价。`
+    });
+}
+
+// 执行单个账号的历史订单补评价
+async function runHistoricalAutoCommentForAccount(accountId) {
+    if (!accountId) {
+        showToast('缺少账号ID', 'warning');
+        return;
+    }
+    await runHistoricalAutoComment([accountId], {
+        confirmText: `确定要为账号「${accountId}」执行历史订单补评价吗？`
+    });
 }
 
 // 切换自动求小红花状态
