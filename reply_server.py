@@ -3279,6 +3279,15 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     heartbeat_response_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_heartbeat_response', 0))
     heartbeat_sent_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_heartbeat_time', 0))
     token_refreshed_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_token_refresh_time', 0))
+    persisted_token_info = None
+    if token_cached:
+        try:
+            persisted_token_info = XianyuLive.load_persisted_access_token(cleaned_cid)
+        except Exception as e:
+            logger.debug(f"读取本地Token缓存时间失败: {cleaned_cid} - {mask_sensitive_text(e)}")
+    persisted_token_at = _normalize_runtime_timestamp((persisted_token_info or {}).get('timestamp'))
+    if persisted_token_at is not None and (token_refreshed_at is None or persisted_token_at > token_refreshed_at):
+        token_refreshed_at = persisted_token_at
     session_keepalive_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_session_keepalive_time', 0))
     last_non_heartbeat_message_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_non_heartbeat_message_time', 0))
     last_sync_package_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_sync_package_time', 0))

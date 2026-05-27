@@ -391,7 +391,13 @@ class XianyuLive:
         }
 
     @classmethod
-    def save_persisted_access_token(cls, cookie_id: str, token: str, source: str = 'token_refresh') -> bool:
+    def save_persisted_access_token(
+        cls,
+        cookie_id: str,
+        token: str,
+        source: str = 'token_refresh',
+        cached_at: Optional[float] = None,
+    ) -> bool:
         """加密保存最近一次成功的 accessToken，供同机重启短期复用。"""
         cleaned_cookie_id = str(cookie_id or '').strip()
         cleaned_token = str(token or '').strip()
@@ -400,7 +406,7 @@ class XianyuLive:
 
         payload = {
             'token': cleaned_token,
-            'cached_at': time.time(),
+            'cached_at': float(cached_at or time.time()),
             'source': source,
         }
         encrypted_payload = db_manager._encrypt_secret(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
@@ -17753,7 +17759,16 @@ class XianyuLive:
                             await self.init(websocket)
                             logger.info(f"【{self.cookie_id}】WebSocket初始化完成！")
                             if self.current_token:
-                                self.save_persisted_access_token(self.cookie_id, self.current_token, source='websocket_init_success')
+                                token_validated_at = time.time()
+                                self.last_token_refresh_time = token_validated_at
+                                self.last_token_refresh_status = "success"
+                                self.last_token_refresh_error_message = None
+                                self.save_persisted_access_token(
+                                    self.cookie_id,
+                                    self.current_token,
+                                    source='websocket_init_success',
+                                    cached_at=token_validated_at,
+                                )
 
                             # 初始化完成后才设置为已连接状态
                             self._set_connection_state(ConnectionState.CONNECTED, "初始化完成，连接就绪")
