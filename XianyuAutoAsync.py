@@ -16512,10 +16512,7 @@ class XianyuLive:
         }
 
     def _get_item_polish_module(self):
-        if os.getenv('ITEM_POLISH_IMPL', '').strip().lower() == 'plain':
-            from item_polish_module import ItemPolishModule
-        else:
-            from secure_item_polish_ultra import ItemPolishModule
+        from item_polish_module import ItemPolishModule
 
         return ItemPolishModule(self)
 
