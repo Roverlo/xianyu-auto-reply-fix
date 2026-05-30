@@ -1211,7 +1211,7 @@ async function loadOrderDashboardMetrics() {
             const normalizedStatus = normalizeOrderStatus(order?.order_status);
             const parsedAmount = parseOrderAmount(order);
 
-            if (isSalesEligibleOrder(normalizedStatus) && parsedAmount !== null) {
+            if (isOwnedAccountItemOrder(order) && isSalesEligibleOrder(normalizedStatus) && parsedAmount !== null) {
                 totalSalesAmount += parsedAmount;
             }
 
@@ -1797,6 +1797,10 @@ function isCompletedOrder(normalizedStatus) {
 function isSalesEligibleOrder(normalizedStatus) {
     const salesEligibleStatuses = ['pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed'];
     return salesEligibleStatuses.includes(normalizedStatus);
+}
+
+function isOwnedAccountItemOrder(order) {
+    return order?.is_owned_item !== false;
 }
 
 function isCompletionEligibleOrder(normalizedStatus) {

@@ -140,6 +140,7 @@ SALES_ELIGIBLE_ORDER_STATUSES = {
 }
 
 ORDER_SALES_TIME_SQL = "COALESCE(NULLIF(platform_paid_at, ''), NULLIF(platform_created_at, ''), created_at)"
+ORDER_SALES_TIME_ORDERS_ALIAS_SQL = "COALESCE(NULLIF(o.platform_paid_at, ''), NULLIF(o.platform_created_at, ''), o.created_at)"
 
 ORDER_HISTORY_SYNC_JOB_RETENTION_SECONDS = 3600
 order_history_sync_jobs: Dict[str, Dict[str, Any]] = {}
@@ -1660,8 +1661,10 @@ async def get_sales_data(
         # 构建查询
         placeholders = ','.join(['?'] * len(cookie_ids))
         query = (
-            f"SELECT amount, {ORDER_SALES_TIME_SQL} AS effective_sales_at, order_status "
-            f"FROM orders WHERE cookie_id IN ({placeholders})"
+            f"SELECT o.amount, {ORDER_SALES_TIME_ORDERS_ALIAS_SQL} AS effective_sales_at, o.order_status "
+            f"FROM orders o "
+            f"JOIN item_info i ON i.cookie_id = o.cookie_id AND i.item_id = o.item_id "
+            f"WHERE o.cookie_id IN ({placeholders})"
         )
         params = list(cookie_ids)
         
@@ -1669,13 +1672,13 @@ async def get_sales_data(
             utc_start = local_date_to_utc_start(start_date)
             if not utc_start:
                 raise HTTPException(status_code=400, detail='开始日期格式错误，应为 YYYY-MM-DD')
-            query += f" AND {ORDER_SALES_TIME_SQL} >= ?"
+            query += f" AND {ORDER_SALES_TIME_ORDERS_ALIAS_SQL} >= ?"
             params.append(utc_start)
         if end_date:
             utc_end_exclusive = local_date_to_utc_end_exclusive(end_date)
             if not utc_end_exclusive:
                 raise HTTPException(status_code=400, detail='结束日期格式错误，应为 YYYY-MM-DD')
-            query += f" AND {ORDER_SALES_TIME_SQL} < ?"
+            query += f" AND {ORDER_SALES_TIME_ORDERS_ALIAS_SQL} < ?"
             params.append(utc_end_exclusive)
         
         # 执行查询
@@ -1797,8 +1800,10 @@ async def get_sales_summary(
         placeholders = ','.join(['?'] * len(cookie_ids))
         month_start_utc = local_date_to_utc_start(month_start_str)
         query = (
-            f"SELECT amount, {ORDER_SALES_TIME_SQL} AS effective_sales_at, order_status "
-            f"FROM orders WHERE {ORDER_SALES_TIME_SQL} >= ? AND cookie_id IN ({placeholders})"
+            f"SELECT o.amount, {ORDER_SALES_TIME_ORDERS_ALIAS_SQL} AS effective_sales_at, o.order_status "
+            f"FROM orders o "
+            f"JOIN item_info i ON i.cookie_id = o.cookie_id AND i.item_id = o.item_id "
+            f"WHERE {ORDER_SALES_TIME_ORDERS_ALIAS_SQL} >= ? AND o.cookie_id IN ({placeholders})"
         )
         all_orders = db_manager.execute_query(query, [month_start_utc] + cookie_ids)
 
@@ -11716,9 +11721,15 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
         all_orders = []
         for cookie_id in user_cookies.keys():
             orders = db_manager.get_orders_by_cookie(cookie_id, limit=1000)  # 增加限制数量
+            owned_item_rows = db_manager.execute_query(
+                "SELECT item_id FROM item_info WHERE cookie_id = ?",
+                (cookie_id,)
+            )
+            owned_item_ids = {str(row[0]) for row in owned_item_rows if row and row[0] is not None}
             # 为每个订单添加cookie_id信息
             for order in orders:
                 order['cookie_id'] = cookie_id
+                order['is_owned_item'] = str(order.get('item_id') or '') in owned_item_ids
                 all_orders.append(order)
 
         # 历史订单补录后优先按平台下单时间展示，回退到本地入库时间
