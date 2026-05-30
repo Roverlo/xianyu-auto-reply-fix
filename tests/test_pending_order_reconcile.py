@@ -2,6 +2,7 @@ import asyncio
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 class _Logger:
@@ -121,6 +122,11 @@ class _FakeDbManager:
         return None
 
 
+class _CookieManager:
+    def get_cookie_status(self, _cookie_id):
+        return True
+
+
 class PendingOrderReconcileTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.original_db_manager = xianyu_module.db_manager
@@ -133,7 +139,7 @@ class PendingOrderReconcileTest(unittest.IsolatedAsyncioTestCase):
         self.live.connection_state = ConnectionState.CONNECTED
         self.live.pending_order_reconcile_enabled = True
         self.live.pending_order_reconcile_lock = asyncio.Lock()
-        self.live.pending_order_reconcile_max_order_age_minutes = 10080
+        self.live.pending_order_reconcile_max_order_age_minutes = 43200
         self.live.pending_order_reconcile_notice_cooldown = 300
         self.live.pending_order_reconcile_notice_times = {}
         self.live.pending_order_reconcile_session_expired_backoff = 1800
@@ -264,6 +270,78 @@ class PendingOrderReconcileTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(stats, {"scanned": 0, "pending": 0, "delivered": 0, "skipped": 0})
         self.assertEqual(fetch_count, 1)
+
+
+class MessageStreamWatchdogTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.live = object.__new__(XianyuLive)
+        self.live.cookie_id = "cookie-1"
+        self.live.ws = _FakeWebSocket()
+        self.live.heartbeat_timeout = 10
+        self.live.heartbeat_interval = 30
+        self.live.stream_watchdog_check_interval = 1
+        self.live.stream_watchdog_grace_period = 1
+        self.live.message_stream_watchdog_timeout = 100
+        self.live.last_non_heartbeat_message_time = 0
+        self.live.last_sync_package_time = 0
+        self.live.last_user_chat_time = 0
+        self.live.last_stream_watchdog_reconnect_time = 0
+        self.live.last_heartbeat_response = 1000
+        self.live._safe_str = str
+
+    async def _run_one_watchdog_pass(self):
+        cookie_manager = types.ModuleType("cookie_manager")
+        cookie_manager.manager = _CookieManager()
+        sleep_calls = 0
+
+        async def interruptible_sleep(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError()
+
+        self.live._interruptible_sleep = interruptible_sleep
+        async def notify_stale(*_args, **_kwargs):
+            return None
+
+        self.live._maybe_notify_message_stream_stale = notify_stale
+
+        with mock.patch.dict(sys.modules, {"cookie_manager": cookie_manager}), \
+                mock.patch.object(xianyu_module.time, "time", return_value=1000):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.live.message_stream_watchdog_loop()
+
+    async def test_initial_silence_under_threshold_keeps_observing(self):
+        reconnect_reasons = []
+
+        async def force_reconnect(reason):
+            reconnect_reasons.append(reason)
+            return True
+
+        self.live.last_successful_connection = 850
+        self.live.message_stream_initial_silence_reconnect_timeout = 200
+        self.live._force_websocket_reconnect = force_reconnect
+
+        await self._run_one_watchdog_pass()
+
+        self.assertEqual(reconnect_reasons, [])
+        self.assertEqual(self.live.last_stream_watchdog_reconnect_time, 0)
+
+    async def test_initial_silence_over_threshold_reconnects(self):
+        reconnect_reasons = []
+
+        async def force_reconnect(reason):
+            reconnect_reasons.append(reason)
+            return True
+
+        self.live.last_successful_connection = 700
+        self.live.message_stream_initial_silence_reconnect_timeout = 200
+        self.live._force_websocket_reconnect = force_reconnect
+
+        await self._run_one_watchdog_pass()
+
+        self.assertEqual(reconnect_reasons, ["业务消息流长时间只有心跳，疑似假在线"])
+        self.assertEqual(self.live.last_stream_watchdog_reconnect_time, 1000)
 
 
 if __name__ == "__main__":

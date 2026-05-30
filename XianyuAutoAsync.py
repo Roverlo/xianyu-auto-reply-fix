@@ -1762,7 +1762,11 @@ class XianyuLive:
                     if business_idle < self.message_stream_watchdog_timeout:
                         continue
 
-                    if not self.last_sync_package_time and not self.last_user_chat_time:
+                    initial_silence = not self.last_sync_package_time and not self.last_user_chat_time
+                    if (
+                        initial_silence
+                        and connected_for < self.message_stream_initial_silence_reconnect_timeout
+                    ):
                         logger.info(
                             f"【{self.cookie_id}】业务流长时间只有心跳，但当前连接从未收到同步包/买家消息，"
                             f"按低活跃时段继续观察: connected_for={connected_for:.0f}s, business_idle={business_idle:.0f}s"
@@ -1785,10 +1789,17 @@ class XianyuLive:
                     else:
                         user_chat_status = "，当前连接尚未收到真实买家消息"
 
-                    logger.warning(
-                        f"【{self.cookie_id}】检测到业务流疑似假在线: "
-                        f"已连接{connected_for:.0f}秒，最近非心跳业务包距今{business_idle:.0f}秒，{sync_status}{user_chat_status}"
-                    )
+                    if initial_silence:
+                        logger.warning(
+                            f"【{self.cookie_id}】检测到业务流疑似假在线: 当前连接从未收到同步包/买家消息，"
+                            f"已连接{connected_for:.0f}秒，超过初始静默重连阈值"
+                            f"{self.message_stream_initial_silence_reconnect_timeout:.0f}秒"
+                        )
+                    else:
+                        logger.warning(
+                            f"【{self.cookie_id}】检测到业务流疑似假在线: "
+                            f"已连接{connected_for:.0f}秒，最近非心跳业务包距今{business_idle:.0f}秒，{sync_status}{user_chat_status}"
+                        )
                     await self._force_websocket_reconnect("业务消息流长时间只有心跳，疑似假在线")
                     await self._maybe_notify_message_stream_stale(now, connected_for, business_idle)
                 except asyncio.CancelledError:
@@ -2788,6 +2799,15 @@ class XianyuLive:
             int(RISK_CONTROL.get('message_stream_watchdog_timeout_seconds', 7200) or 7200),
             self.session_keepalive_interval * 6,
             3600,
+        )
+        self.message_stream_initial_silence_reconnect_timeout = max(
+            int(
+                RISK_CONTROL.get(
+                    'message_stream_initial_silence_reconnect_seconds',
+                    self.message_stream_watchdog_timeout * 2,
+                ) or self.message_stream_watchdog_timeout * 2
+            ),
+            self.message_stream_watchdog_timeout,
         )
         self.stream_watchdog_trigger_times = deque(maxlen=8)
         self.message_stream_notification_window = max(self.message_stream_watchdog_timeout * 2, 3600)

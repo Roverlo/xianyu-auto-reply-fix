@@ -143,6 +143,7 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'token_refresh_dedup_window_seconds': 60,
     'token_retry_min_wait_seconds': 180,
     'max_post_slider_session_retries': 1,
+    'message_stream_initial_silence_reconnect_seconds': 14400,
     'pending_order_reconcile_enabled': True,
     'pending_order_reconcile_interval_seconds': 120,
     'pending_order_reconcile_boot_delay_seconds': 30,
