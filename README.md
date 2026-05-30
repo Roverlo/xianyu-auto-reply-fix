@@ -4,13 +4,14 @@
 [![GitHub](https://img.shields.io/badge/GitHub-GuDong2003%2Fxianyu--auto--reply--fix-blue?logo=github)](https://github.com/GuDong2003/xianyu-auto-reply-fix)
 [![Docker Compose](https://img.shields.io/badge/Docker%20Compose-源码构建-blue?logo=docker)](#-快速开始)
 [![Python](https://img.shields.io/badge/Python-3.11+-green?logo=python)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Usage](https://img.shields.io/badge/Usage-仅供学习-red.svg)](#️-版权声明与使用条款)
 
 ## 📋 项目概述
 
 一个功能完整的闲鱼管理系统，采用现代化的技术架构，支持多用户、多账号管理，具备智能回复、自动发货、自动确认发货、商品管理等企业级功能。系统基于Python异步编程，使用FastAPI提供RESTful API，SQLite数据库存储，支持Docker一键部署。
 
-> **⚠️ 重要提示：本项目仅供学习研究使用，严禁商业用途！使用前请仔细阅读[版权声明](#️-版权声明与使用条款)。**
+> **⚠️ 重要提示：本项目采用 AGPL-3.0 开源协议，仅供学习研究使用，请勿用于违法违规场景。使用前请仔细阅读[版权声明](#️-版权声明与使用条款)。**
 
 ## 🏗️ 技术架构
 
@@ -474,18 +475,19 @@ docker-deploy.bat
 
 ### 📋 重要声明
 
-本项目基于原项目整理和修复，仅供学习与研究使用，请勿用于商业用途或任何违法违规场景。
+本项目基于原项目整理和修复，采用 **GNU Affero General Public License v3.0（AGPL-3.0）** 开源协议。项目定位为学习与研究使用，请勿用于任何违法违规场景。
 
 ### 🚫 使用限制
 
-- **禁止商业使用** - 不得将本项目或其衍生内容用于商业用途
+- **遵守开源协议** - 使用、修改、分发或通过网络提供服务时，应遵守 AGPL-3.0 的源码提供、版权声明保留等要求
 - **禁止违法使用** - 不得将本项目用于任何违法违规活动
 - **禁止滥用服务** - 不得利用本项目进行骚扰、欺诈或其他不当行为
 
 ### ✅ 使用说明
 
-- **保留来源信息** - 使用、修改或分发时请保留原项目来源说明
+- **保留来源信息** - 使用、修改或分发时请保留原项目来源说明和版权声明
 - **标注修改内容** - 如基于本项目进行了修改，建议明确标注修改部分
+- **提供对应源码** - 如分发修改版本或通过网络向用户提供服务，应按 AGPL-3.0 要求向用户提供对应源码
 - **自行承担风险** - 使用者需自行承担部署、配置和运行风险
 - **遵守当地法规** - 使用者应确保实际用途符合当地法律法规和平台规则
 

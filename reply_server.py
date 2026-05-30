@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -1097,6 +1097,18 @@ async def start_scheduled_task_checker():
     """应用启动时开启定时任务检查协程"""
     asyncio.create_task(scheduled_task_checker())
     logger.info("定时任务调度器已启动")
+    try:
+        from auto_rate_task import auto_rate_task_loop
+        asyncio.create_task(auto_rate_task_loop())
+        logger.info("自动补评价任务已启动")
+    except Exception as exc:
+        logger.error(f"自动补评价任务启动失败: {exc}")
+    try:
+        from auto_red_flower_task import auto_red_flower_task_loop
+        asyncio.create_task(auto_red_flower_task_loop())
+        logger.info("自动求小红花任务已启动")
+    except Exception as exc:
+        logger.error(f"自动求小红花任务启动失败: {exc}")
 
 
 # 添加请求日志中间件
@@ -3603,6 +3615,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
         auto_comment = db_manager.get_auto_comment(cookie_id)
+        auto_red_flower = db_manager.get_auto_red_flower(cookie_id)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
@@ -3617,6 +3630,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
             'auto_comment': auto_comment,
+            'auto_red_flower': auto_red_flower,
             'remark': remark,
             'status_note': status_note,
             'username': username,
@@ -3897,6 +3911,7 @@ async def trigger_session_keepalive(cid: str, current_user: Dict[str, Any] = Dep
                 live_instance = None
 
         log_with_user('info', f"手动触发账号 {cid} 的轻量会话保活", current_user)
+        batch_id = f"manual_keepalive_{uuid.uuid4()}"
         used_temporary_instance = False
 
         if live_instance:
@@ -3930,10 +3945,23 @@ async def trigger_session_keepalive(cid: str, current_user: Dict[str, Any] = Dep
             used_temporary_instance = True
 
         runtime_status = _build_live_runtime_status(cid)
+        message = '轻量会话保活成功' if keepalive_ok else '轻量会话保活失败'
+        db_manager.add_scheduled_task_log(
+            batch_id=batch_id,
+            task_type='login_renew',
+            cookie_id=cid,
+            object_id='session_keepalive',
+            status='success' if keepalive_ok else 'failed',
+            message=message,
+            raw_response={
+                'runtime_status': runtime_status,
+                'temporary_instance': used_temporary_instance,
+            },
+        )
         return {
             'success': keepalive_ok,
             'cookie_id': cid,
-            'message': '轻量会话保活成功' if keepalive_ok else '轻量会话保活失败',
+            'message': message,
             'runtime_status': runtime_status,
             'temporary_instance': used_temporary_instance,
         }
@@ -3941,6 +3969,17 @@ async def trigger_session_keepalive(cid: str, current_user: Dict[str, Any] = Dep
         raise
     except Exception as e:
         logger.error(f"手动轻量保活失败: {cid} - {mask_sensitive_text(e)}")
+        try:
+            db_manager.add_scheduled_task_log(
+                batch_id=f"manual_keepalive_{uuid.uuid4()}",
+                task_type='login_renew',
+                cookie_id=cid,
+                object_id='session_keepalive',
+                status='failed',
+                message=f"手动轻量保活失败: {str(e)}",
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=safe_client_error("手动轻量保活失败，请稍后重试"))
 
 
@@ -4691,6 +4730,44 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                         },
                     )
                     return
+
+                if not is_refresh_mode:
+                    try:
+                        soft_preflight_timeout = max(
+                            8.0,
+                            min(float(RISK_CONTROL.get('soft_auth_token_preflight_timeout_seconds', 5.0) or 5.0) + 3.0, 18.0)
+                        )
+                        log_with_user('info', f"密码登录成功后开始轻量Token软预检（失败不阻断原流程）: {account_id}", current_user)
+                        temp_preflight_xianyu = XianyuLive(
+                            cookies_str=cookies_str,
+                            cookie_id=account_id,
+                            user_id=user_id,
+                            register_instance=False,
+                        )
+                        soft_preflight_future = asyncio.run_coroutine_threadsafe(
+                            temp_preflight_xianyu.soft_preflight_token_after_auth(
+                                cookies_str,
+                                source='password_login',
+                                proxy=proxy_config,
+                            ),
+                            request_loop,
+                        )
+                        try:
+                            soft_preflight_result = soft_preflight_future.result(timeout=soft_preflight_timeout)
+                            log_with_user(
+                                'info',
+                                f"密码登录轻量Token软预检完成: {account_id}, status={soft_preflight_result.get('status')}, token_cached={soft_preflight_result.get('token_cached')}",
+                                current_user,
+                            )
+                        except concurrent.futures.TimeoutError:
+                            soft_preflight_future.cancel()
+                            log_with_user('warning', f"密码登录轻量Token软预检超时，不阻断保存与启动任务: {account_id}", current_user)
+                    except Exception as soft_preflight_err:
+                        log_with_user(
+                            'warning',
+                            f"密码登录轻量Token软预检失败，不阻断保存与启动任务: {account_id}, 错误: {str(soft_preflight_err)}",
+                            current_user,
+                        )
 
                 if is_refresh_mode:
                     try:
@@ -7576,6 +7653,25 @@ class AutoCommentUpdate(BaseModel):
     auto_comment: bool
 
 
+class AutoRedFlowerUpdate(BaseModel):
+    auto_red_flower: bool
+
+
+class AutoCommentOrderRequest(BaseModel):
+    cookie_id: Optional[str] = None
+    comment: Optional[str] = None
+
+
+class AutoCommentBatchRateRequest(BaseModel):
+    cookie_ids: Optional[List[str]] = None
+    account_ids: Optional[List[str]] = None
+    page_size: Optional[int] = 100
+
+
+class RedFlowerOrderRequest(BaseModel):
+    cookie_id: Optional[str] = None
+
+
 class CommentTemplateCreate(BaseModel):
     name: str
     content: str
@@ -7649,6 +7745,56 @@ def get_auto_confirm(cid: str, current_user: Dict[str, Any] = Depends(get_curren
         return {
             "auto_confirm": auto_confirm,
             "message": f"自动确认发货当前{'开启' if auto_confirm else '关闭'}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 自动求小红花相关API ====================
+
+@app.put("/cookies/{cid}/auto-red-flower")
+def update_auto_red_flower(cid: str, update_data: AutoRedFlowerUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新账号的自动求小红花设置"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        user_id = current_user['user_id']
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        success = db_manager.update_auto_red_flower(cid, update_data.auto_red_flower)
+        if not success:
+            raise HTTPException(status_code=500, detail="更新自动求小红花设置失败")
+
+        return {
+            "msg": "success",
+            "auto_red_flower": update_data.auto_red_flower,
+            "message": f"自动求小红花已{'开启' if update_data.auto_red_flower else '关闭'}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cookies/{cid}/auto-red-flower")
+def get_auto_red_flower(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号的自动求小红花设置"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    try:
+        user_id = current_user['user_id']
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        auto_red_flower = db_manager.get_auto_red_flower(cid)
+        return {
+            "auto_red_flower": auto_red_flower,
+            "message": f"自动求小红花当前{'开启' if auto_red_flower else '关闭'}"
         }
     except HTTPException:
         raise
@@ -9204,8 +9350,61 @@ class ItemSearchMultipleRequest(BaseModel):
     total_pages: int = 1
 
 
+class ProductMaterialRequest(BaseModel):
+    title: str
+    description: str
+    price: Optional[float] = None
+    original_price: Optional[float] = None
+    category: Optional[str] = None
+    images: List[Any] = []
+    delivery_method: str = "包邮"
+    postage: Optional[float] = 0
+    can_self_pickup: bool = False
+    brand: Optional[str] = None
+    condition: Optional[str] = "全新"
+    remark: Optional[str] = None
+
+
+class ProductMaterialUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    original_price: Optional[float] = None
+    category: Optional[str] = None
+    images: Optional[List[Any]] = None
+    delivery_method: Optional[str] = None
+    postage: Optional[float] = None
+    can_self_pickup: Optional[bool] = None
+    brand: Optional[str] = None
+    condition: Optional[str] = None
+    remark: Optional[str] = None
+
+
+class ProductBatchPublishRequest(BaseModel):
+    account_ids: List[str]
+    material_ids: List[int]
+
+
+class ProductSinglePublishRequest(BaseModel):
+    account_id: str
+    title: str
+    description: str
+    price: Optional[float] = None
+    original_price: Optional[float] = None
+    images: List[Any]
+    delivery_method: str = "包邮"
+    postage: Optional[float] = 0
+    can_self_pickup: bool = False
+    category: Optional[str] = None
+    brand: Optional[str] = None
+    condition: Optional[str] = "全新"
+
+
 def _parse_optional_non_negative_float(value: Any, field_label: str) -> Optional[float]:
-    raw_value = str(value or "").strip()
+    if value is None:
+        return None
+
+    raw_value = str(value).strip()
     if not raw_value:
         return None
 
@@ -9310,6 +9509,555 @@ async def _sync_items_after_publish(
         }
     finally:
         await xianyu_instance.close_session()
+
+
+PRODUCT_PUBLISH_DELIVERY_CHOICES = {"包邮", "按距离计费", "一口价", "无需邮寄"}
+
+
+def _model_to_dict(model: BaseModel, *, exclude_unset: bool = False) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_unset=exclude_unset)
+    return model.dict(exclude_unset=exclude_unset)
+
+
+def _dedupe_str_list(values: List[Any], field_label: str) -> List[str]:
+    result: List[str] = []
+    for value in values or []:
+        text = str(value or '').strip()
+        if not text:
+            continue
+        if text not in result:
+            result.append(text)
+    if not result:
+        raise HTTPException(status_code=400, detail=f"{field_label}不能为空")
+    return result
+
+
+def _dedupe_int_list(values: List[Any], field_label: str) -> List[int]:
+    result: List[int] = []
+    for value in values or []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and number not in result:
+            result.append(number)
+    if not result:
+        raise HTTPException(status_code=400, detail=f"{field_label}不能为空")
+    return result
+
+
+def _normalize_product_publish_data(data: Dict[str, Any], *, partial: bool = False) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+
+    for field in ('title', 'description', 'category', 'brand', 'condition', 'remark'):
+        if field in data or not partial:
+            value = data.get(field)
+            if value is None:
+                normalized[field] = None
+            else:
+                normalized[field] = str(value).strip()
+
+    if not partial:
+        if not normalized.get('title'):
+            raise HTTPException(status_code=400, detail="商品标题不能为空")
+        if not normalized.get('description'):
+            raise HTTPException(status_code=400, detail="商品描述不能为空")
+    else:
+        if 'title' in normalized and not normalized.get('title'):
+            raise HTTPException(status_code=400, detail="商品标题不能为空")
+        if 'description' in normalized and not normalized.get('description'):
+            raise HTTPException(status_code=400, detail="商品描述不能为空")
+
+    if 'price' in data or not partial:
+        normalized['price'] = _parse_optional_non_negative_float(data.get('price'), "现价")
+    if 'original_price' in data or not partial:
+        normalized['original_price'] = _parse_optional_non_negative_float(data.get('original_price'), "原价")
+    if 'postage' in data or not partial:
+        normalized['postage'] = _parse_optional_non_negative_float(data.get('postage'), "邮费")
+
+    current_price = normalized.get('price') if 'price' in normalized else data.get('price')
+    original_price = normalized.get('original_price') if 'original_price' in normalized else data.get('original_price')
+    if original_price is not None and current_price is None:
+        raise HTTPException(status_code=400, detail="填写原价时必须同时填写现价")
+
+    if 'delivery_method' in data or not partial:
+        delivery_method = str(data.get('delivery_method') or '包邮').strip() or '包邮'
+        if delivery_method not in PRODUCT_PUBLISH_DELIVERY_CHOICES:
+            raise HTTPException(status_code=400, detail="不支持的运费方式")
+        normalized['delivery_method'] = delivery_method
+        if delivery_method == '一口价' and normalized.get('postage') is None:
+            raise HTTPException(status_code=400, detail="运费方式为一口价时必须填写邮费")
+
+    if 'can_self_pickup' in data or not partial:
+        normalized['can_self_pickup'] = _parse_form_bool(data.get('can_self_pickup'))
+
+    if 'images' in data or not partial:
+        images = data.get('images') or []
+        if not isinstance(images, list):
+            raise HTTPException(status_code=400, detail="商品图片必须是数组")
+        normalized['images'] = images
+
+    return normalized
+
+
+def _validate_publish_images(images: List[Any]) -> List[Dict[str, Any]]:
+    if not images:
+        raise HTTPException(status_code=400, detail="请至少提供 1 张商品图片")
+    if len(images) > 9:
+        raise HTTPException(status_code=400, detail="单次最多支持 9 张商品图片")
+
+    normalized_images = []
+    for index, image in enumerate(images, start=1):
+        if not isinstance(image, dict):
+            raise HTTPException(status_code=400, detail=f"第 {index} 张图片格式无效")
+        if not any(image.get(key) for key in ('url', 'image_url', 'src', 'content', 'data', 'base64')):
+            raise HTTPException(status_code=400, detail=f"第 {index} 张图片缺少 URL 或 Base64 内容")
+        normalized_images.append(image)
+    return normalized_images
+
+
+def _build_published_item_url(item_id: Optional[str]) -> Optional[str]:
+    clean_item_id = str(item_id or '').strip()
+    if not clean_item_id:
+        return None
+    return f"https://www.goofish.com/item?id={clean_item_id}"
+
+
+def _summarize_publish_sync(sync_result: Dict[str, Any]) -> Tuple[str, str, int, int]:
+    sync_success = bool(sync_result.get('success'))
+    sync_status = 'success' if sync_success else 'failed'
+    sync_message = sync_result.get('message') or ('同步成功' if sync_success else '同步失败')
+
+    page_sync = sync_result.get('page_sync') or {}
+    full_sync = sync_result.get('full_sync') or {}
+    sync_total_count = int(page_sync.get('current_count') or 0)
+    sync_saved_count = int(page_sync.get('saved_count') or 0)
+    if full_sync.get('used'):
+        sync_total_count += int(full_sync.get('total_count') or 0)
+        sync_saved_count += int(full_sync.get('total_saved') or 0)
+
+    return sync_status, sync_message, sync_total_count, sync_saved_count
+
+
+async def _publish_product_to_account(
+    *,
+    current_user: Dict[str, Any],
+    account_id: str,
+    title: str,
+    description: str,
+    images: List[Dict[str, Any]],
+    current_price: Optional[float],
+    original_price: Optional[float],
+    delivery_choice: str,
+    post_price: Optional[float],
+    can_self_pickup: bool,
+    material_id: Optional[int] = None,
+    batch_id: Optional[str] = None,
+    log_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    from utils.item_publisher import ItemPublisher
+
+    user_prefix = get_user_log_prefix(current_user)
+    cleaned_account_id = _ensure_cookie_access(account_id, current_user)
+    cookies_map = _get_user_cookies_map(current_user)
+    cookies_str = str(cookies_map.get(cleaned_account_id) or '').strip()
+    if not cookies_str:
+        raise HTTPException(status_code=400, detail="账号 Cookie 为空，无法发布商品")
+
+    cleaned_title = str(title or '').strip()
+    cleaned_description = str(description or '').strip()
+    if not cleaned_title:
+        raise HTTPException(status_code=400, detail="商品标题不能为空")
+    if not cleaned_description:
+        raise HTTPException(status_code=400, detail="商品描述不能为空")
+
+    image_payloads = _validate_publish_images(images)
+    current_price_value = _parse_optional_non_negative_float(current_price, "现价")
+    original_price_value = _parse_optional_non_negative_float(original_price, "原价")
+    post_price_value = _parse_optional_non_negative_float(post_price, "邮费")
+
+    if original_price_value is not None and current_price_value is None:
+        raise HTTPException(status_code=400, detail="填写原价时必须同时填写现价")
+    if delivery_choice not in PRODUCT_PUBLISH_DELIVERY_CHOICES:
+        raise HTTPException(status_code=400, detail="不支持的运费方式")
+    if delivery_choice == "一口价" and post_price_value is None:
+        raise HTTPException(status_code=400, detail="运费方式为一口价时必须填写邮费")
+
+    created_log_id = log_id
+    if not created_log_id:
+        created_log_id = db_manager.add_publish_log(
+            current_user['user_id'],
+            cleaned_account_id,
+            cleaned_title,
+            description=cleaned_description,
+            price=str(current_price_value) if current_price_value is not None else None,
+            material_id=material_id,
+            batch_id=batch_id,
+            status='publishing',
+        )
+    else:
+        db_manager.update_publish_log(created_log_id, status='publishing')
+
+    try:
+        logger.info(
+            f"{user_prefix} 开始发布商品: cookie_id={cleaned_account_id}, "
+            f"title={cleaned_title}, images={len(image_payloads)}, delivery_choice={delivery_choice}"
+        )
+
+        async with ItemPublisher(cookies_str, cleaned_account_id) as publisher:
+            publish_result = await publisher.publish_item(
+                title=cleaned_title,
+                description=cleaned_description,
+                images=image_payloads,
+                current_price=current_price_value,
+                original_price=original_price_value,
+                delivery_choice=delivery_choice,
+                post_price=post_price_value,
+                can_self_pickup=bool(can_self_pickup),
+            )
+            latest_cookies_str = publisher.cookies_str
+            published_item_id = publisher.extract_published_item_id(publish_result)
+
+            if not publisher.is_success_response(publish_result):
+                error_message = publisher.extract_error_message(publish_result)
+                if created_log_id:
+                    db_manager.update_publish_log(
+                        created_log_id,
+                        status='failed',
+                        error_message=error_message,
+                        raw_response=publish_result,
+                    )
+                raise HTTPException(status_code=400, detail=f"商品发布失败: {error_message}")
+
+        _persist_cookie_value_for_account(
+            cleaned_account_id,
+            current_user,
+            cookies_str,
+            latest_cookies_str,
+        )
+
+        try:
+            sync_result = await _sync_items_after_publish(
+                cleaned_account_id,
+                latest_cookies_str or cookies_str,
+                published_item_id=published_item_id,
+            )
+        except Exception as sync_exc:
+            logger.warning(
+                f"{user_prefix} 商品发布成功但同步商品列表失败: "
+                f"cookie_id={cleaned_account_id}, error={mask_sensitive_text(sync_exc)}"
+            )
+            sync_result = {
+                "success": False,
+                "message": f"发布成功，但同步最新商品列表失败: {str(sync_exc)}",
+                "published_item_id": published_item_id,
+                "item_synced": False,
+                "page_sync": {"success": False, "current_count": 0, "saved_count": 0, "error": str(sync_exc)},
+                "full_sync": {"used": False, "success": False, "total_count": 0, "total_saved": 0, "error": None},
+            }
+
+        sync_status, sync_message, sync_total_count, sync_saved_count = _summarize_publish_sync(sync_result)
+        item_url = _build_published_item_url(published_item_id)
+
+        if created_log_id:
+            db_manager.update_publish_log(
+                created_log_id,
+                status='success',
+                item_url=item_url,
+                item_id=published_item_id,
+                sync_status=sync_status,
+                sync_message=sync_message,
+                sync_total_count=sync_total_count,
+                sync_saved_count=sync_saved_count,
+                raw_response=publish_result,
+            )
+
+        sync_success = bool(sync_result.get('success'))
+        success_message = "商品发布成功"
+        if sync_success:
+            success_message = "商品发布成功，已同步到商品管理"
+        elif sync_result.get('message'):
+            success_message = f"商品发布成功，{sync_result['message']}"
+
+        logger.info(
+            f"{user_prefix} 商品发布完成: cookie_id={cleaned_account_id}, "
+            f"published_item_id={published_item_id or 'unknown'}, sync_success={sync_success}"
+        )
+
+        return {
+            "success": True,
+            "message": success_message,
+            "published_item_id": published_item_id,
+            "item_url": item_url,
+            "log_id": created_log_id,
+            "batch_id": batch_id,
+            "publish_result": publish_result,
+            "sync_result": sync_result,
+        }
+
+    except HTTPException as exc:
+        if created_log_id and exc.status_code >= 400:
+            db_manager.update_publish_log(created_log_id, status='failed', error_message=str(exc.detail))
+        raise
+    except ValueError as exc:
+        if created_log_id:
+            db_manager.update_publish_log(created_log_id, status='failed', error_message=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        if created_log_id:
+            db_manager.update_publish_log(created_log_id, status='failed', error_message=str(exc))
+        logger.error(f"{user_prefix} 商品发布运行失败: {mask_sensitive_text(exc)}")
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        if created_log_id:
+            db_manager.update_publish_log(created_log_id, status='failed', error_message=str(exc))
+        logger.error(f"{user_prefix} 商品发布异常: {mask_sensitive_text(exc)}")
+        raise HTTPException(status_code=500, detail=f"商品发布异常: {str(exc)}")
+
+
+async def _run_product_batch_publish(batch_id: str, jobs: List[Dict[str, Any]], current_user: Dict[str, Any]):
+    logger.info(f"{get_user_log_prefix(current_user)} 商品批量发布任务开始: batch_id={batch_id}, total={len(jobs)}")
+    for job in jobs:
+        material = job.get('material') or {}
+        log_id = job.get('log_id')
+        account_id = job.get('account_id')
+        try:
+            await _publish_product_to_account(
+                current_user=current_user,
+                account_id=account_id,
+                title=material.get('title'),
+                description=material.get('description'),
+                images=material.get('images') or [],
+                current_price=material.get('price'),
+                original_price=material.get('original_price'),
+                delivery_choice=material.get('delivery_method') or '包邮',
+                post_price=material.get('postage'),
+                can_self_pickup=bool(material.get('can_self_pickup')),
+                material_id=material.get('id'),
+                batch_id=batch_id,
+                log_id=log_id,
+            )
+        except HTTPException as exc:
+            logger.warning(
+                f"{get_user_log_prefix(current_user)} 商品批量发布失败: batch_id={batch_id}, "
+                f"account_id={account_id}, material_id={material.get('id')}, error={exc.detail}"
+            )
+        except Exception as exc:
+            if log_id:
+                db_manager.update_publish_log(log_id, status='failed', error_message=str(exc))
+            logger.error(
+                f"{get_user_log_prefix(current_user)} 商品批量发布异常: batch_id={batch_id}, "
+                f"account_id={account_id}, material_id={material.get('id')}, error={mask_sensitive_text(exc)}"
+            )
+    logger.info(f"{get_user_log_prefix(current_user)} 商品批量发布任务结束: batch_id={batch_id}")
+
+
+@app.get("/product-materials")
+def list_product_materials(
+    page: int = 1,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """分页获取当前用户的商品发布素材。"""
+    return {
+        "success": True,
+        **db_manager.list_product_materials(current_user['user_id'], page=page, page_size=page_size),
+    }
+
+
+@app.post("/product-materials")
+def create_product_material(
+    request: ProductMaterialRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """保存商品发布素材。"""
+    data = _normalize_product_publish_data(_model_to_dict(request), partial=False)
+    material_id = db_manager.add_product_material(current_user['user_id'], data)
+    if not material_id:
+        raise HTTPException(status_code=500, detail="保存商品素材失败")
+    return {
+        "success": True,
+        "message": "商品素材保存成功",
+        "material": db_manager.get_product_material(material_id, current_user['user_id']),
+    }
+
+
+@app.get("/product-materials/{material_id}")
+def get_product_material(
+    material_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    material = db_manager.get_product_material(material_id, current_user['user_id'])
+    if not material:
+        raise HTTPException(status_code=404, detail="商品素材不存在")
+    return {"success": True, "material": material}
+
+
+@app.put("/product-materials/{material_id}")
+def update_product_material(
+    material_id: int,
+    request: ProductMaterialUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    existing = db_manager.get_product_material(material_id, current_user['user_id'])
+    if not existing:
+        raise HTTPException(status_code=404, detail="商品素材不存在")
+
+    update_payload = _model_to_dict(request, exclude_unset=True)
+    if not update_payload:
+        raise HTTPException(status_code=400, detail="没有可更新的字段")
+
+    merged_payload = dict(existing)
+    merged_payload.update(update_payload)
+    normalized_full = _normalize_product_publish_data(merged_payload, partial=False)
+    data = {key: normalized_full.get(key) for key in update_payload.keys() if key in normalized_full}
+    if not data:
+        raise HTTPException(status_code=400, detail="没有可更新的字段")
+
+    if not db_manager.update_product_material(material_id, current_user['user_id'], data):
+        raise HTTPException(status_code=500, detail="更新商品素材失败")
+    return {
+        "success": True,
+        "message": "商品素材更新成功",
+        "material": db_manager.get_product_material(material_id, current_user['user_id']),
+    }
+
+
+@app.delete("/product-materials/{material_id}")
+def delete_product_material(
+    material_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    if not db_manager.delete_product_material(material_id, current_user['user_id']):
+        raise HTTPException(status_code=404, detail="商品素材不存在")
+    return {"success": True, "message": "商品素材删除成功"}
+
+
+@app.get("/publish-logs")
+def list_publish_logs(
+    account_id: Optional[str] = None,
+    status: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    if account_id:
+        _ensure_cookie_access(account_id, current_user)
+    return {
+        "success": True,
+        **db_manager.list_publish_logs(
+            user_id=current_user['user_id'],
+            account_id=account_id,
+            status=status,
+            batch_id=batch_id,
+            page=page,
+            page_size=page_size,
+        ),
+    }
+
+
+@app.delete("/publish-logs/old")
+def clear_old_publish_logs(
+    days: int = 30,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    deleted = db_manager.clear_old_publish_logs(current_user['user_id'], days=days)
+    return {"success": True, "message": f"已清理 {deleted} 条发布日志", "deleted": deleted}
+
+
+@app.post("/product-publish")
+async def publish_product_json(
+    request: ProductSinglePublishRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """通过 JSON 素材发布单个商品，图片支持已上传 URL 或 Base64。"""
+    data = _normalize_product_publish_data({
+        "title": request.title,
+        "description": request.description,
+        "price": request.price,
+        "original_price": request.original_price,
+        "images": request.images,
+        "delivery_method": request.delivery_method,
+        "postage": request.postage,
+        "can_self_pickup": request.can_self_pickup,
+        "category": request.category,
+        "brand": request.brand,
+        "condition": request.condition,
+    }, partial=False)
+    return await _publish_product_to_account(
+        current_user=current_user,
+        account_id=request.account_id,
+        title=data['title'],
+        description=data['description'],
+        images=data.get('images') or [],
+        current_price=data.get('price'),
+        original_price=data.get('original_price'),
+        delivery_choice=data.get('delivery_method') or '包邮',
+        post_price=data.get('postage'),
+        can_self_pickup=bool(data.get('can_self_pickup')),
+    )
+
+
+@app.post("/product-publish/batch")
+async def batch_publish_products(
+    request: ProductBatchPublishRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """按账号和素材组合启动后台批量发布。"""
+    account_ids = _dedupe_str_list(request.account_ids, "发布账号")
+    material_ids = _dedupe_int_list(request.material_ids, "商品素材")
+    for account_id in account_ids:
+        _ensure_cookie_access(account_id, current_user)
+
+    materials = db_manager.list_product_materials_by_ids(material_ids, current_user['user_id'])
+    found_ids = {int(material.get('id')) for material in materials}
+    missing_ids = [mid for mid in material_ids if mid not in found_ids]
+    if missing_ids:
+        raise HTTPException(status_code=404, detail=f"商品素材不存在: {missing_ids}")
+
+    total_jobs = len(account_ids) * len(materials)
+    if total_jobs > 100:
+        raise HTTPException(status_code=400, detail="单次批量发布最多支持 100 个任务")
+
+    batch_id = f"product_publish_{uuid.uuid4()}"
+    jobs: List[Dict[str, Any]] = []
+    for material in materials:
+        _validate_publish_images(material.get('images') or [])
+        for account_id in account_ids:
+            log_id = db_manager.add_publish_log(
+                current_user['user_id'],
+                account_id,
+                material.get('title') or '',
+                description=material.get('description'),
+                price=str(material.get('price')) if material.get('price') is not None else None,
+                material_id=material.get('id'),
+                batch_id=batch_id,
+                status='pending',
+            )
+            jobs.append({"log_id": log_id, "account_id": account_id, "material": material})
+
+    background_tasks.add_task(_run_product_batch_publish, batch_id, jobs, dict(current_user))
+    return {
+        "success": True,
+        "message": "批量发布任务已启动",
+        "batch_id": batch_id,
+        "total": len(jobs),
+        "logs": [job.get('log_id') for job in jobs],
+    }
+
+
+@app.get("/product-publish/batch/{batch_id}")
+def get_product_publish_batch_status(
+    batch_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    return {
+        "success": True,
+        **db_manager.get_publish_batch_status(batch_id, current_user['user_id']),
+    }
 
 
 @app.post("/items/search")
@@ -9474,38 +10222,8 @@ async def publish_item(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """发布单个商品，并在成功后同步到本地商品列表。"""
-    user_prefix = get_user_log_prefix(current_user)
-
-    cleaned_cookie_id = _ensure_cookie_access(cookie_id, current_user)
-    cookies_map = _get_user_cookies_map(current_user)
-    cookies_str = str(cookies_map.get(cleaned_cookie_id) or "").strip()
-    if not cookies_str:
-        raise HTTPException(status_code=400, detail="账号 Cookie 为空，无法发布商品")
-
-    cleaned_title = str(title or "").strip()
-    cleaned_description = str(description or "").strip()
-    if not cleaned_title:
-        raise HTTPException(status_code=400, detail="商品标题不能为空")
-    if not cleaned_description:
-        raise HTTPException(status_code=400, detail="商品描述不能为空")
-
-    if not images:
-        raise HTTPException(status_code=400, detail="请至少上传 1 张商品图片")
-    if len(images) > 9:
-        raise HTTPException(status_code=400, detail="单次最多上传 9 张商品图片")
-
-    current_price_value = _parse_optional_non_negative_float(current_price, "现价")
-    original_price_value = _parse_optional_non_negative_float(original_price, "原价")
-    post_price_value = _parse_optional_non_negative_float(post_price, "邮费")
-    can_self_pickup_value = _parse_form_bool(can_self_pickup)
-
-    if original_price_value is not None and current_price_value is None:
-        raise HTTPException(status_code=400, detail="填写原价时必须同时填写现价")
-    if delivery_choice == "一口价" and post_price_value is None:
-        raise HTTPException(status_code=400, detail="运费方式为一口价时必须填写邮费")
-
     image_payloads = []
-    for index, image in enumerate(images, start=1):
+    for index, image in enumerate(images or [], start=1):
         if image.content_type and not image.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail=f"第 {index} 张文件不是图片")
 
@@ -9513,85 +10231,23 @@ async def publish_item(
         if not image_content:
             raise HTTPException(status_code=400, detail=f"第 {index} 张图片为空")
 
-        image_payloads.append(
-            {
-                "filename": image.filename or f"publish-image-{index}.jpg",
-                "content": image_content,
-            }
-        )
+        image_payloads.append({
+            "filename": image.filename or f"publish-image-{index}.jpg",
+            "content": image_content,
+        })
 
-    try:
-        from utils.item_publisher import ItemPublisher
-
-        logger.info(
-            f"{user_prefix} 开始发布商品: cookie_id={cleaned_cookie_id}, "
-            f"title={cleaned_title}, images={len(image_payloads)}, delivery_choice={delivery_choice}"
-        )
-
-        async with ItemPublisher(cookies_str, cleaned_cookie_id) as publisher:
-            publish_result = await publisher.publish_item(
-                title=cleaned_title,
-                description=cleaned_description,
-                images=image_payloads,
-                current_price=current_price_value,
-                original_price=original_price_value,
-                delivery_choice=delivery_choice,
-                post_price=post_price_value,
-                can_self_pickup=can_self_pickup_value,
-            )
-            latest_cookies_str = publisher.cookies_str
-            published_item_id = publisher.extract_published_item_id(publish_result)
-
-            if not publisher.is_success_response(publish_result):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"商品发布失败: {publisher.extract_error_message(publish_result)}",
-                )
-
-        _persist_cookie_value_for_account(
-            cleaned_cookie_id,
-            current_user,
-            cookies_str,
-            latest_cookies_str,
-        )
-
-        sync_result = await _sync_items_after_publish(
-            cleaned_cookie_id,
-            latest_cookies_str or cookies_str,
-            published_item_id=published_item_id,
-        )
-
-        sync_success = bool(sync_result.get("success"))
-        success_message = "商品发布成功"
-        if sync_success:
-            success_message = "商品发布成功，已同步到商品管理"
-        elif sync_result.get("message"):
-            success_message = f"商品发布成功，{sync_result['message']}"
-
-        logger.info(
-            f"{user_prefix} 商品发布完成: cookie_id={cleaned_cookie_id}, "
-            f"published_item_id={published_item_id or 'unknown'}, sync_success={sync_success}"
-        )
-
-        return {
-            "success": True,
-            "message": success_message,
-            "published_item_id": published_item_id,
-            "publish_result": publish_result,
-            "sync_result": sync_result,
-        }
-
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
-        logger.error(f"{user_prefix} 商品发布运行失败: {mask_sensitive_text(exc)}")
-        raise HTTPException(status_code=500, detail=str(exc))
-    except Exception as exc:
-        logger.error(f"{user_prefix} 商品发布异常: {mask_sensitive_text(exc)}")
-        raise HTTPException(status_code=500, detail=f"商品发布异常: {str(exc)}")
-
+    return await _publish_product_to_account(
+        current_user=current_user,
+        account_id=cookie_id,
+        title=title,
+        description=description,
+        images=image_payloads,
+        current_price=current_price,
+        original_price=original_price,
+        delivery_choice=delivery_choice,
+        post_price=post_price,
+        can_self_pickup=_parse_form_bool(can_self_pickup),
+    )
 
 
 @app.get("/items/cookie/{cookie_id}")
@@ -11746,6 +12402,685 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
 
 
+TASK_LOG_TYPE_LABELS = {
+    'auto_comment': '自动评价',
+    'auto_red_flower': '求小红花',
+    'item_polish': '商品擦亮',
+    'login_renew': '登录续期',
+    'cookie_refresh': 'Cookie刷新',
+    'other_task': '其他任务',
+}
+
+
+def _normalize_task_log_limit(limit: int) -> int:
+    try:
+        return max(1, min(int(limit or 100), 500))
+    except Exception:
+        return 100
+
+
+def _normalize_task_log_offset(offset: int) -> int:
+    try:
+        return max(0, int(offset or 0))
+    except Exception:
+        return 0
+
+
+def _get_task_log_cookie_scope(current_user: Dict[str, Any], cookie_id: str = None) -> List[str]:
+    if cookie_id:
+        return [_ensure_cookie_access(cookie_id, current_user)]
+    return list(_get_user_cookies_map(current_user).keys())
+
+
+def _task_log_created_at_sort_value(log: Dict[str, Any]) -> float:
+    value = log.get('created_at') or log.get('updated_at') or ''
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        text = str(value or '').strip()
+        if not text:
+            return 0.0
+        normalized = text.replace('T', ' ')[:19]
+        return datetime.strptime(normalized, '%Y-%m-%d %H:%M:%S').timestamp()
+    except Exception:
+        return 0.0
+
+
+def _normalize_task_log_row(log: Dict[str, Any], task_type: str, task_label: str = None) -> Dict[str, Any]:
+    normalized = dict(log or {})
+    normalized['task_type'] = task_type
+    normalized['task_label'] = task_label or TASK_LOG_TYPE_LABELS.get(task_type, task_type)
+    normalized.setdefault('object_id', normalized.get('order_id') or normalized.get('item_id') or normalized.get('session_id') or '')
+    normalized.setdefault('status', 'failed')
+    normalized.setdefault('message', '')
+    normalized.setdefault('created_at', normalized.get('updated_at') or '')
+    return normalized
+
+
+def _map_risk_log_to_task_type(log: Dict[str, Any]) -> str:
+    event_type = str(log.get('event_type') or '').strip().lower()
+    trigger_scene = str(log.get('trigger_scene') or '').strip().lower()
+    result_code = str(log.get('result_code') or '').strip().lower()
+    text = ' '.join(str(log.get(key) or '') for key in (
+        'event_description', 'event_description_display', 'processing_result',
+        'processing_result_display', 'error_message', 'error_message_display'
+    )).lower()
+
+    if (
+        event_type in {'cookie_refresh', 'token_expired'}
+        or trigger_scene in {'auto_cookie_refresh', 'manual_cookie_refresh', 'manual_password_refresh', 'manual_qr_refresh', 'qr_login', 'token_refresh'}
+        or 'cookie_refresh' in result_code
+        or 'token_refresh' in result_code
+        or 'cookie刷新' in text
+        or 'token刷新' in text
+    ):
+        return 'cookie_refresh'
+
+    if (
+        trigger_scene in {'password_login', 'login_renew', 'session_keepalive'}
+        or event_type in {'password_login', 'password_error', 'face_verify', 'sms_verify', 'qr_verify'}
+        or 'password_login' in result_code
+        or '登录' in text
+        or '保活' in text
+    ):
+        return 'login_renew'
+
+    return 'other_task'
+
+
+def _normalize_risk_task_status(log: Dict[str, Any]) -> str:
+    status = str(log.get('processing_status') or '').strip().lower()
+    result_code = str(log.get('result_code') or '').strip().lower()
+    combined = ' '.join(str(log.get(key) or '') for key in (
+        'processing_result', 'processing_result_display', 'error_message', 'error_message_display'
+    )).lower()
+
+    if status == 'success' or 'success' in result_code or '成功' in combined:
+        return 'success'
+    if status == 'processing':
+        return 'processing'
+    if 'expired' in result_code or '过期' in combined or 'session_expired' in combined:
+        return 'cookie_expired'
+    if status == 'failed' or 'failed' in result_code or '失败' in combined or '异常' in combined:
+        return 'failed'
+    return status or 'failed'
+
+
+def _risk_log_to_task_log(log: Dict[str, Any]) -> Dict[str, Any]:
+    task_type = _map_risk_log_to_task_type(log)
+    message_parts = [
+        log.get('event_description_display') or log.get('event_description'),
+        log.get('processing_result_display') or log.get('processing_result'),
+        log.get('error_message_display') or log.get('error_message'),
+    ]
+    message = ' / '.join(str(part).strip() for part in message_parts if str(part or '').strip())
+    return _normalize_task_log_row({
+        'id': f"risk-{log.get('id')}",
+        'batch_id': log.get('session_id') or log.get('result_code') or f"risk_{log.get('id')}",
+        'cookie_id': log.get('cookie_id'),
+        'object_id': log.get('session_id') or log.get('result_code') or log.get('event_type'),
+        'status': _normalize_risk_task_status(log),
+        'message': message or '-',
+        'raw_response': log,
+        'created_at': log.get('updated_at') or log.get('created_at'),
+    }, task_type)
+
+
+def _load_risk_task_logs(current_user: Dict[str, Any], task_type: str = 'all', cookie_id: str = None,
+                         limit: int = 100) -> List[Dict[str, Any]]:
+    cookie_ids = _get_task_log_cookie_scope(current_user, cookie_id)
+    logs: List[Dict[str, Any]] = []
+    for scoped_cookie_id in cookie_ids:
+        risk_logs = db_manager.get_risk_control_logs(
+            cookie_id=scoped_cookie_id,
+            limit=max(20, min(limit, 500)),
+            offset=0,
+        )
+        for risk_log in risk_logs:
+            task_log = _risk_log_to_task_log(risk_log)
+            if task_type == 'all' or task_log.get('task_type') == task_type:
+                logs.append(task_log)
+    return logs
+
+
+@app.get('/api/task-logs')
+def get_task_logs(
+    task_type: str = 'all',
+    cookie_id: str = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """查询系统日志页的统一任务日志。"""
+    try:
+        safe_limit = _normalize_task_log_limit(limit)
+        safe_offset = _normalize_task_log_offset(offset)
+        requested_type = str(task_type or 'all').strip() or 'all'
+        if requested_type not in {'all', *TASK_LOG_TYPE_LABELS.keys()}:
+            requested_type = 'all'
+
+        scoped_cookie_id = None
+        if cookie_id:
+            scoped_cookie_id = _ensure_cookie_access(cookie_id, current_user)
+
+        logs: List[Dict[str, Any]] = []
+
+        if requested_type in {'all', 'auto_comment'}:
+            logs.extend(
+                _normalize_task_log_row(log, 'auto_comment')
+                for log in db_manager.get_scheduled_rate_logs(
+                    user_id=current_user['user_id'],
+                    cookie_id=scoped_cookie_id,
+                    limit=safe_limit,
+                    offset=0,
+                )
+            )
+
+        if requested_type in {'all', 'auto_red_flower'}:
+            logs.extend(
+                _normalize_task_log_row(log, 'auto_red_flower')
+                for log in db_manager.get_scheduled_red_flower_logs(
+                    user_id=current_user['user_id'],
+                    cookie_id=scoped_cookie_id,
+                    limit=safe_limit,
+                    offset=0,
+                )
+            )
+
+        generic_types = {'item_polish', 'login_renew', 'cookie_refresh', 'other_task'}
+        if requested_type == 'all':
+            generic_task_type = None
+        elif requested_type in generic_types:
+            generic_task_type = requested_type
+        else:
+            generic_task_type = '__skip__'
+
+        if generic_task_type != '__skip__':
+            generic_logs = db_manager.get_scheduled_task_logs(
+                user_id=current_user['user_id'],
+                cookie_id=scoped_cookie_id,
+                task_type=generic_task_type,
+                limit=safe_limit,
+                offset=0,
+            )
+            logs.extend(_normalize_task_log_row(log, log.get('task_type') or 'other_task') for log in generic_logs)
+
+        if requested_type in {'all', 'login_renew', 'cookie_refresh', 'other_task'}:
+            logs.extend(_load_risk_task_logs(current_user, requested_type, scoped_cookie_id, safe_limit))
+
+        logs.sort(key=_task_log_created_at_sort_value, reverse=True)
+        page = logs[safe_offset:safe_offset + safe_limit]
+        return {"success": True, "data": page, "total": len(logs)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"查询统一任务日志失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"查询统一任务日志失败: {str(e)}")
+
+
+@app.get('/api/auto-comment/logs')
+def get_auto_comment_logs(
+    cookie_id: str = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """查询自动评价执行日志。"""
+    try:
+        if cookie_id:
+            cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        logs = db_manager.get_scheduled_rate_logs(
+            user_id=current_user['user_id'],
+            cookie_id=cookie_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {"success": True, "data": logs}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"查询自动评价日志失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"查询自动评价日志失败: {str(e)}")
+
+
+def _find_first_nested_value(payload: Any, keys: List[str]) -> Any:
+    """从闲鱼待评价列表项中尽量提取字段。"""
+    if isinstance(payload, dict):
+        for key in keys:
+            if key in payload and payload[key] not in (None, ''):
+                return payload[key]
+        for value in payload.values():
+            found = _find_first_nested_value(value, keys)
+            if found not in (None, ''):
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_first_nested_value(value, keys)
+            if found not in (None, ''):
+                return found
+    return None
+
+
+def _extract_merchant_rate_order_id(item: Dict[str, Any]) -> str:
+    return str(_find_first_nested_value(item, [
+        'orderId', 'tradeId', 'bizOrderId', 'biz_order_id', 'order_id', 'trade_id'
+    ]) or '').strip()
+
+
+def _extract_merchant_rate_item_meta(item: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        'item_id': str(_find_first_nested_value(item, ['itemId', 'item_id', 'auctionId', 'auction_id']) or '').strip(),
+        'buyer_id': str(_find_first_nested_value(item, ['buyerId', 'buyer_id', 'buyerUserId', 'userId']) or '').strip(),
+        'buyer_nick': str(_find_first_nested_value(item, ['buyerNick', 'buyer_nick', 'buyerName', 'nick', 'userNick']) or '').strip(),
+    }
+
+
+@app.post('/api/auto-comment/batch-rate')
+async def batch_rate_historical_orders(
+    request: AutoCommentBatchRateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """从闲鱼待评价列表拉取历史订单并批量补评价。"""
+    try:
+        from utils.rate_service import RateService, fetch_merchant_rate_list
+
+        raw_ids = request.cookie_ids if request.cookie_ids is not None else request.account_ids
+        account_ids = list(dict.fromkeys(
+            str(account_id or '').strip()
+            for account_id in (raw_ids or [])
+            if str(account_id or '').strip()
+        ))
+        if not account_ids:
+            raise HTTPException(status_code=400, detail='请选择账号')
+
+        page_size = max(1, min(int(request.page_size or 100), 100))
+        batch_id = f"manual_history_rate_{uuid.uuid4()}"
+        details = []
+        stats = {
+            'batch_id': batch_id,
+            'total_accounts': len(account_ids),
+            'success_accounts': 0,
+            'total_pending': 0,
+            'total_rated': 0,
+            'total_failed': 0,
+            'total_skipped': 0,
+        }
+
+        for raw_cookie_id in account_ids:
+            account_result = {
+                'account_id': raw_cookie_id,
+                'success': False,
+                'rated_count': 0,
+                'failed_count': 0,
+                'skipped_count': 0,
+                'total_pending': 0,
+                'message': '',
+            }
+            try:
+                cookie_id = _ensure_cookie_access(raw_cookie_id, current_user)
+                account_result['account_id'] = cookie_id
+
+                if not db_manager.get_auto_comment(cookie_id):
+                    account_result['message'] = '未开启自动好评'
+                    account_result['skipped_count'] += 1
+                    stats['total_skipped'] += 1
+                    db_manager.add_scheduled_rate_log(
+                        batch_id, cookie_id, status='skipped', message='历史补评价跳过：未开启自动好评'
+                    )
+                    details.append(account_result)
+                    continue
+
+                template = db_manager.get_active_comment_template(cookie_id)
+                feedback = str((template or {}).get('content') or '').strip()
+                if not feedback:
+                    account_result['message'] = '未设置激活的好评模板'
+                    account_result['skipped_count'] += 1
+                    stats['total_skipped'] += 1
+                    db_manager.add_scheduled_rate_log(
+                        batch_id, cookie_id, status='missing_template', message='历史补评价跳过：未设置激活的好评模板'
+                    )
+                    details.append(account_result)
+                    continue
+
+                cookie_string = db_manager.get_cookie(cookie_id)
+                if not cookie_string:
+                    account_result['message'] = '账号 Cookie 为空或不存在'
+                    account_result['failed_count'] += 1
+                    stats['total_failed'] += 1
+                    db_manager.add_scheduled_rate_log(
+                        batch_id, cookie_id, status='cookie_expired', message='历史补评价失败：账号 Cookie 为空或不存在'
+                    )
+                    details.append(account_result)
+                    continue
+
+                list_result = await fetch_merchant_rate_list(
+                    cookie_string=cookie_string,
+                    account_id=cookie_id,
+                    page=1,
+                    page_size=page_size,
+                    max_retries=3,
+                )
+                if not list_result.get('success'):
+                    status = 'cookie_expired' if list_result.get('session_expired') else 'failed'
+                    message = f"获取待评价列表失败: {list_result.get('message') or '未知错误'}"
+                    account_result['message'] = message
+                    account_result['failed_count'] += 1
+                    stats['total_failed'] += 1
+                    db_manager.add_scheduled_rate_log(
+                        batch_id=batch_id,
+                        cookie_id=cookie_id,
+                        status=status,
+                        message=message,
+                        raw_response=list_result.get('raw') or list_result,
+                    )
+                    details.append(account_result)
+                    continue
+
+                pending_items = list_result.get('items') or []
+                if not isinstance(pending_items, list):
+                    pending_items = []
+                account_result['total_pending'] = len(pending_items)
+                stats['total_pending'] += len(pending_items)
+
+                if not pending_items:
+                    account_result['success'] = True
+                    account_result['message'] = '没有待评价订单'
+                    stats['success_accounts'] += 1
+                    db_manager.add_scheduled_rate_log(
+                        batch_id, cookie_id, status='skipped', message='历史补评价：没有待评价订单'
+                    )
+                    details.append(account_result)
+                    continue
+
+                current_cookie = str(list_result.get('cookies_str') or cookie_string)
+                for item in pending_items:
+                    meta = _extract_merchant_rate_item_meta(item if isinstance(item, dict) else {})
+                    order_id = _extract_merchant_rate_order_id(item if isinstance(item, dict) else {})
+                    if not order_id:
+                        account_result['failed_count'] += 1
+                        stats['total_failed'] += 1
+                        db_manager.add_scheduled_rate_log(
+                            batch_id=batch_id,
+                            cookie_id=cookie_id,
+                            item_id=meta.get('item_id') or None,
+                            buyer_id=meta.get('buyer_id') or None,
+                            buyer_nick=meta.get('buyer_nick') or None,
+                            comment=feedback,
+                            status='failed',
+                            message='待评价列表项缺少订单号',
+                            raw_response=item,
+                        )
+                        continue
+
+                    rate_service = RateService(current_cookie, account_id=cookie_id)
+                    rate_result = await rate_service.rate_buyer(order_id, feedback=feedback)
+                    if rate_service.cookie_string and rate_service.cookie_string != current_cookie:
+                        current_cookie = rate_service.cookie_string
+
+                    status = 'already_rated' if rate_result.get('already_rated') else (
+                        'success' if rate_result.get('success') else ('cookie_expired' if rate_result.get('session_expired') else 'failed')
+                    )
+                    message = str(rate_result.get('message') or '')
+                    db_manager.add_scheduled_rate_log(
+                        batch_id=batch_id,
+                        cookie_id=cookie_id,
+                        order_id=order_id,
+                        item_id=meta.get('item_id') or None,
+                        buyer_id=meta.get('buyer_id') or None,
+                        buyer_nick=meta.get('buyer_nick') or None,
+                        comment=feedback,
+                        status=status,
+                        message=message,
+                        raw_response=rate_result.get('raw') or rate_result,
+                    )
+
+                    if rate_result.get('success'):
+                        account_result['rated_count'] += 1
+                        stats['total_rated'] += 1
+                        db_manager.mark_order_rated(order_id, True)
+                    else:
+                        account_result['failed_count'] += 1
+                        stats['total_failed'] += 1
+                        db_manager.mark_order_rated(order_id, False, message)
+
+                    await asyncio.sleep(1)
+
+                account_result['success'] = True
+                account_result['message'] = (
+                    f"评价完成: 成功 {account_result['rated_count']} 笔，"
+                    f"失败 {account_result['failed_count']} 笔"
+                )
+                stats['success_accounts'] += 1
+                details.append(account_result)
+            except HTTPException as exc:
+                account_result['message'] = str(exc.detail or '账号无权限或不存在')
+                account_result['failed_count'] += 1
+                stats['total_failed'] += 1
+                details.append(account_result)
+            except Exception as exc:
+                logger.error(f"[历史补评价] 账号 {raw_cookie_id} 处理异常: {exc}")
+                account_result['message'] = f"处理异常: {str(exc)}"
+                account_result['failed_count'] += 1
+                stats['total_failed'] += 1
+                try:
+                    db_manager.add_scheduled_rate_log(
+                        batch_id, raw_cookie_id, status='failed', message=account_result['message']
+                    )
+                except Exception:
+                    pass
+                details.append(account_result)
+
+        message = (
+            f"历史补评价完成: {stats['success_accounts']}/{stats['total_accounts']} 个账号处理成功，"
+            f"共评价 {stats['total_rated']} 笔，失败 {stats['total_failed']} 笔"
+        )
+        log_with_user('info', message, current_user)
+        return {
+            'success': True,
+            'message': message,
+            'data': {
+                **stats,
+                'details': details,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"历史补评价失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"历史补评价失败: {str(e)}")
+
+
+@app.post('/api/orders/{order_id}/comment')
+async def comment_order_once(
+    order_id: str,
+    request: AutoCommentOrderRequest = AutoCommentOrderRequest(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动对指定订单执行一次买家好评。"""
+    try:
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail='订单不存在')
+
+        cookie_id = str(request.cookie_id or order.get('cookie_id') or '').strip()
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        if order.get('cookie_id') and order.get('cookie_id') != cookie_id:
+            raise HTTPException(status_code=403, detail='订单不属于该账号')
+
+        from auto_rate_task import rate_order_once
+
+        result = await rate_order_once(
+            cookie_id=cookie_id,
+            order_id=order_id,
+            comment=request.comment,
+            batch_id=f"manual_{uuid.uuid4()}",
+            source='manual',
+        )
+        log_with_user('info', f"手动评价订单: order_id={order_id}, cookie_id={cookie_id}, result={result}", current_user)
+        return {"success": bool(result.get('success')), "data": result, "message": result.get('message')}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"手动评价订单失败: order_id={order_id}, error={str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"手动评价订单失败: {str(e)}")
+
+
+@app.post('/api/auto-comment/run-once')
+async def run_auto_comment_once(
+    request: AutoCommentOrderRequest = AutoCommentOrderRequest(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动触发一轮当前用户范围内的自动补评价。"""
+    try:
+        from auto_rate_task import rate_order_once
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        target_cookie_ids = [request.cookie_id] if request.cookie_id else list(user_cookies.keys())
+        batch_id = f"manual_batch_{uuid.uuid4()}"
+        results = []
+        stats = {"batch_id": batch_id, "accounts": 0, "orders": 0, "success": 0, "failed": 0, "skipped": 0}
+
+        for raw_cookie_id in target_cookie_ids:
+            cookie_id = _ensure_cookie_access(raw_cookie_id, current_user)
+            if not db_manager.get_auto_comment(cookie_id):
+                continue
+            stats['accounts'] += 1
+            template = db_manager.get_active_comment_template(cookie_id)
+            if not template or not str(template.get('content') or '').strip():
+                stats['skipped'] += 1
+                continue
+            orders = db_manager.get_pending_auto_comment_orders(cookie_id, limit=5, days=10, cooldown_minutes=0)
+            for order in orders:
+                stats['orders'] += 1
+                result = await rate_order_once(
+                    cookie_id=cookie_id,
+                    order_id=order.get('order_id'),
+                    comment=request.comment or str(template.get('content') or '').strip(),
+                    batch_id=batch_id,
+                    source='manual_batch',
+                )
+                results.append(result)
+                if result.get('success'):
+                    stats['success'] += 1
+                elif result.get('status') in {'skipped', 'missing_template', 'already_rated'}:
+                    stats['skipped'] += 1
+                else:
+                    stats['failed'] += 1
+                await asyncio.sleep(1)
+
+        return {"success": True, "data": {"stats": stats, "results": results}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"手动触发自动补评价失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"手动触发自动补评价失败: {str(e)}")
+
+
+@app.get('/api/auto-red-flower/logs')
+def get_auto_red_flower_logs(
+    cookie_id: str = None,
+    limit: int = 100,
+    offset: int = 0,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """查询求小红花执行日志。"""
+    try:
+        if cookie_id:
+            cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        logs = db_manager.get_scheduled_red_flower_logs(
+            user_id=current_user['user_id'],
+            cookie_id=cookie_id,
+            limit=limit,
+            offset=offset,
+        )
+        return {"success": True, "data": logs}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"查询求小红花日志失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"查询求小红花日志失败: {str(e)}")
+
+
+@app.post('/api/orders/{order_id}/red-flower')
+async def request_order_red_flower_once(
+    order_id: str,
+    request: RedFlowerOrderRequest = RedFlowerOrderRequest(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动对指定订单执行一次求小红花。"""
+    try:
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail='订单不存在')
+
+        cookie_id = str(request.cookie_id or order.get('cookie_id') or '').strip()
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        if order.get('cookie_id') and order.get('cookie_id') != cookie_id:
+            raise HTTPException(status_code=403, detail='订单不属于该账号')
+
+        from auto_red_flower_task import request_red_flower_once
+
+        result = await request_red_flower_once(
+            cookie_id=cookie_id,
+            order_id=order_id,
+            batch_id=f"manual_red_flower_{uuid.uuid4()}",
+            source='manual',
+        )
+        log_with_user('info', f"手动求小红花: order_id={order_id}, cookie_id={cookie_id}, result={result}", current_user)
+        return {"success": bool(result.get('success')), "data": result, "message": result.get('message')}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"手动求小红花失败: order_id={order_id}, error={str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"手动求小红花失败: {str(e)}")
+
+
+@app.post('/api/auto-red-flower/run-once')
+async def run_auto_red_flower_once(
+    request: RedFlowerOrderRequest = RedFlowerOrderRequest(),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """手动触发一轮当前用户范围内的自动求小红花。"""
+    try:
+        from auto_red_flower_task import request_red_flower_once
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        target_cookie_ids = [request.cookie_id] if request.cookie_id else list(user_cookies.keys())
+        batch_id = f"manual_red_flower_batch_{uuid.uuid4()}"
+        results = []
+        stats = {"batch_id": batch_id, "accounts": 0, "orders": 0, "success": 0, "failed": 0, "skipped": 0}
+
+        for raw_cookie_id in target_cookie_ids:
+            cookie_id = _ensure_cookie_access(raw_cookie_id, current_user)
+            if not db_manager.get_auto_red_flower(cookie_id):
+                continue
+            stats['accounts'] += 1
+            orders = db_manager.get_pending_red_flower_orders(cookie_id, limit=5, days=10, cooldown_minutes=0)
+            for order in orders:
+                stats['orders'] += 1
+                result = await request_red_flower_once(
+                    cookie_id=cookie_id,
+                    order_id=order.get('order_id'),
+                    batch_id=batch_id,
+                    source='manual_batch',
+                )
+                results.append(result)
+                if result.get('success'):
+                    stats['success'] += 1
+                elif result.get('status') in {'skipped', 'already_red_flower'}:
+                    stats['skipped'] += 1
+                else:
+                    stats['failed'] += 1
+                await asyncio.sleep(1)
+
+        return {"success": True, "data": {"stats": stats, "results": results}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"手动触发自动求小红花失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"手动触发自动求小红花失败: {str(e)}")
+
+
 @app.get('/api/orders/stream')
 def stream_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
     """订单实时事件流，仅在订单页激活时使用。"""
@@ -11853,6 +13188,40 @@ async def chat_send_message(
             ),
             timeout=15,
         )
+
+        # 闲鱼通过 sendByReceiverScope 发出的消息，WebSocket 不会以"自己发出"形式
+        # 稳定回推给同一连接，导致前端在线客服看不到自己刚发的消息。这里仿照
+        # XianyuAutoAsync.py 手动发出分支，主动落库 + publish 一次；并 mark
+        # 去重标记，避免闲鱼真的回推时再重复一条。
+        try:
+            from chat_event_hub import publish_chat_message, self_send_dedup
+            myid = getattr(live_instance, 'myid', None) or ''
+            sender_name = cookie_id
+            try:
+                detail = db_manager.get_cookie_details(cookie_id) or {}
+                sender_name = detail.get('remark') or detail.get('username') or cookie_id
+            except Exception:
+                pass
+
+            _msg_id_db = db_manager.save_chat_message(
+                cookie_id=cookie_id, chat_id=req.chat_id,
+                sender_id=str(myid), sender_name=str(sender_name),
+                content=req.message, content_type=1,
+                image_url=None, item_id=None,
+                direction=1, reply_source='手动',
+                media_url=None, link_url=None, extra_json=None,
+            )
+            publish_chat_message(cookie_id, {
+                'msg_id': _msg_id_db, 'chat_id': req.chat_id,
+                'sender_id': str(myid), 'sender_name': str(sender_name),
+                'content': req.message, 'content_type': 1,
+                'image_url': None,
+                'item_id': None, 'direction': 1, 'reply_source': '手动',
+                'media_url': None, 'link_url': None, 'extra_json': None,
+            })
+            self_send_dedup.mark(cookie_id, req.chat_id, str(myid), req.message)
+        except Exception as e:
+            logger.debug(f"客服 Web 发送后回显落库失败: {mask_sensitive_text(e)}")
 
         return {'success': True, 'message': '发送成功'}
     except HTTPException:
@@ -12999,26 +14368,68 @@ async def restart_application(current_user: Dict[str, Any] = Depends(get_current
 async def polish_account_items(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """擦亮指定账号的所有在售商品"""
     try:
+        cid = _ensure_cookie_access(cid, current_user)
         cookie_info = db_manager.get_cookie_by_id(cid)
+        batch_id = f"manual_polish_{uuid.uuid4()}"
         if not cookie_info:
+            db_manager.add_scheduled_task_log(
+                batch_id=batch_id,
+                task_type='item_polish',
+                cookie_id=cid,
+                status='failed',
+                message='未找到指定的账号信息',
+            )
             return {"success": False, "message": "未找到指定的账号信息"}
 
         cookies_str = cookie_info.get('cookies_str', '')
         if not cookies_str:
+            db_manager.add_scheduled_task_log(
+                batch_id=batch_id,
+                task_type='item_polish',
+                cookie_id=cid,
+                status='failed',
+                message='账号cookie信息为空',
+            )
             return {"success": False, "message": "账号cookie信息为空"}
 
         from XianyuAutoAsync import XianyuLive
         xianyu_instance = XianyuLive(cookies_str, cid, register_instance=False)
 
         logger.info(f"开始擦亮账号 {cid} 的所有商品")
-        result = await xianyu_instance.polish_all_items()
+        try:
+            result = await xianyu_instance.polish_all_items()
+        finally:
+            await xianyu_instance.close_session()
 
-        await xianyu_instance.close_session()
+        total = int(result.get('total') or 0) if isinstance(result, dict) else 0
+        polished = int(result.get('polished') or 0) if isinstance(result, dict) else 0
+        failed = int(result.get('failed') or 0) if isinstance(result, dict) else 0
+        status = 'success' if result.get('success') and failed == 0 else ('partial_success' if result.get('success') and polished > 0 else 'failed')
+        message = result.get('message') or f"擦亮完成：总计 {total}，成功 {polished}，失败 {failed}"
+        db_manager.add_scheduled_task_log(
+            batch_id=batch_id,
+            task_type='item_polish',
+            cookie_id=cid,
+            object_id='all_items',
+            status=status,
+            message=message,
+            raw_response=result,
+        )
 
         return result
 
     except Exception as e:
         logger.error(f"擦亮账号商品异常: {str(e)}")
+        try:
+            db_manager.add_scheduled_task_log(
+                batch_id=f"manual_polish_{uuid.uuid4()}",
+                task_type='item_polish',
+                cookie_id=cid,
+                status='failed',
+                message=f"擦亮异常: {str(e)}",
+            )
+        except Exception:
+            pass
         return {"success": False, "message": f"擦亮异常: {str(e)}"}
 
 
@@ -13276,6 +14687,23 @@ async def scheduled_task_checker():
                     )
 
                     db_manager.update_task_run_result(task_id, result, next_run_str)
+                    try:
+                        total = int(result.get('total') or 0) if isinstance(result, dict) else 0
+                        polished = int(result.get('polished') or 0) if isinstance(result, dict) else 0
+                        failed = int(result.get('failed') or 0) if isinstance(result, dict) else 0
+                        status = 'success' if result.get('success') and failed == 0 else ('partial_success' if result.get('success') and polished > 0 else 'failed')
+                        message = result.get('message') or f"定时任务执行完成：总计 {total}，成功 {polished}，失败 {failed}"
+                        db_manager.add_scheduled_task_log(
+                            batch_id=f"scheduled_task_{task_id}_{uuid.uuid4()}",
+                            task_type=task_type if task_type in TASK_LOG_TYPE_LABELS else 'other_task',
+                            cookie_id=account_id,
+                            object_id=f"scheduled_task:{task_id}",
+                            status=status,
+                            message=message,
+                            raw_response=result,
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"记录定时任务日志失败: task_id={task_id}, error={log_error}")
                     logger.info(f"定时任务 {task_id} 执行完毕，下次运行: {next_run_str}")
 
                 except Exception as e:

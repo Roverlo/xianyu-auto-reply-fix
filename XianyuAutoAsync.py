@@ -4126,12 +4126,33 @@ class XianyuLive:
             
             # 调用好评接口
             result = await self._call_comment_api(order_id, comment_content)
-            
+            result_message = result.get("message", "未知错误")
+            batch_id = f"realtime_{int(time.time() * 1000)}"
+
+            try:
+                order_info = db_manager.get_order_by_id(order_id) or {}
+                db_manager.add_scheduled_rate_log(
+                    batch_id=batch_id,
+                    cookie_id=self.cookie_id,
+                    order_id=order_id,
+                    item_id=order_info.get('item_id'),
+                    buyer_id=order_info.get('buyer_id'),
+                    buyer_nick=order_info.get('buyer_nick'),
+                    comment=comment_content,
+                    status='success' if result.get('success') else ('cookie_expired' if result.get('session_expired') else 'failed'),
+                    message=result_message,
+                    raw_response=result.get('raw') or result,
+                )
+            except Exception as log_e:
+                logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] 写入自动评价日志失败: {self._safe_str(log_e)}')
+
             if result.get('success'):
+                db_manager.mark_order_rated(order_id, True)
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ✅ 订单 {order_id} 自动好评成功')
                 return True
             else:
-                logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ❌ 订单 {order_id} 自动好评失败: {result.get("message", "未知错误")}')
+                db_manager.mark_order_rated(order_id, False, result_message)
+                logger.warning(f'[{msg_time}] 【{self.cookie_id}】[{msg_id}] ❌ 订单 {order_id} 自动好评失败: {result_message}')
                 return False
                 
         except Exception as e:
@@ -4151,61 +4172,27 @@ class XianyuLive:
             return None
 
     async def _call_comment_api(self, order_id: str, comment: str) -> dict:
-        """调用好评接口"""
-        import aiohttp
-        
+        """调用本地闲鱼评价接口。"""
         try:
-            # 好评接口地址：从系统设置读取；未配置则拒绝调用，避免向未知第三方泄露 Cookie
-            comment_api_url = (db_manager.get_system_setting('auto_comment_api_url') or '').strip()
-            if not comment_api_url:
-                logger.warning(f"【{self.cookie_id}】未配置 auto_comment_api_url，跳过自动好评接口调用")
-                return {
-                    "success": False,
-                    "message": "未配置自动好评 API 地址，请在系统设置中填写后再启用此功能"
-                }
+            from utils.rate_service import RateService
 
-            # 获取当前账号的cookie
-            cookie_str = self.cookies_str
-            
-            payload = {
-                "cookie_str": cookie_str,
-                "order_id": order_id,
-                "comment": comment
-            }
-            
-            headers = {
-                "accept": "application/json",
-                "Content-Type": "application/json"
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(comment_api_url, json=payload, headers=headers, timeout=30) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        return {
-                            "success": result.get("status") == "success",
-                            "message": result.get("message", "好评成功")
-                        }
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"【{self.cookie_id}】好评接口返回错误: status={response.status}, body={error_text}")
-                        return {
-                            "success": False,
-                            "message": f"接口返回错误: {response.status}"
-                        }
-                        
+            rate_service = RateService(self.cookies_str, account_id=self.cookie_id)
+            result = await rate_service.rate_buyer(order_id, comment)
+
+            # RateService 可能在令牌过期时合并 Set-Cookie 并保存到 DB；同步当前实例内存 Cookie。
+            refreshed_cookie = getattr(rate_service, 'cookie_string', None)
+            if refreshed_cookie and refreshed_cookie != self.cookies_str:
+                self.cookies_str = refreshed_cookie
+                self.cookies = trans_cookies(refreshed_cookie)
+                logger.info(f"【{self.cookie_id}】自动评价后已同步刷新 Cookie 到当前实例")
+
+            return result
         except asyncio.TimeoutError:
             logger.error(f"【{self.cookie_id}】好评接口请求超时")
-            return {
-                "success": False,
-                "message": "请求超时"
-            }
+            return {"success": False, "message": "请求超时"}
         except Exception as e:
             logger.error(f"【{self.cookie_id}】调用好评接口异常: {self._safe_str(e)}")
-            return {
-                "success": False,
-                "message": str(e)
-            }
+            return {"success": False, "message": str(e)}
 
     def can_auto_delivery(self, order_id: str) -> bool:
         """检查是否可以进行自动发货（防重复发货）- 基于订单ID"""
@@ -7153,6 +7140,133 @@ class XianyuLive:
             return 'slider_present'
         return status or source or 'unknown'
 
+    @staticmethod
+    def _coerce_config_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        text = str(value).strip().lower()
+        if text in {'1', 'true', 'yes', 'on'}:
+            return True
+        if text in {'0', 'false', 'no', 'off'}:
+            return False
+        return default
+
+    @classmethod
+    def _is_soft_auth_token_preflight_enabled(cls, source: str = '') -> bool:
+        enabled = cls._coerce_config_bool(
+            RISK_CONTROL.get('soft_auth_token_preflight_enabled', True),
+            True,
+        )
+        if not enabled:
+            return False
+
+        normalized_source = str(source or '').strip().lower()
+        if normalized_source.startswith('qr_login'):
+            # 扫码登录当前有稳定期保护，默认不主动请求 token；需要时可通过配置显式开启。
+            return cls._coerce_config_bool(
+                RISK_CONTROL.get('soft_auth_token_preflight_qr_enabled', False),
+                False,
+            )
+        return True
+
+    @staticmethod
+    def _get_soft_auth_token_preflight_timeout() -> float:
+        try:
+            timeout = float(RISK_CONTROL.get('soft_auth_token_preflight_timeout_seconds', 5.0) or 5.0)
+        except (TypeError, ValueError):
+            timeout = 5.0
+        return max(2.0, min(timeout, 15.0))
+
+    async def soft_preflight_token_after_auth(
+        self,
+        cookie_string: str = None,
+        source: str = 'auth_success',
+        proxy: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """认证成功后的轻量 token 软预检。
+
+        该方法只做观测与 token 预热：网络失败、超时、未知响应都不会阻断既有登录/刷新流程。
+        默认也不会在扫码登录稳定期内主动触发，避免破坏当前风控保护策略。
+        """
+        normalized_source = str(source or 'auth_success').strip() or 'auth_success'
+        if not self._is_soft_auth_token_preflight_enabled(normalized_source):
+            return {
+                'status': 'skipped',
+                'source': normalized_source,
+                'reason': 'disabled_by_config',
+                'token_cached': False,
+            }
+
+        target_cookie_string = str(cookie_string or self.cookies_str or '').strip()
+        if not target_cookie_string:
+            logger.warning(f"【{self.cookie_id}】{normalized_source} 软Token预检跳过：Cookie为空")
+            return {
+                'status': 'skipped',
+                'source': normalized_source,
+                'reason': 'empty_cookie',
+                'token_cached': False,
+            }
+
+        timeout = self._get_soft_auth_token_preflight_timeout()
+        try:
+            from utils.xianyu_slider_stealth import probe_cookie_verification_from_cookie
+
+            logger.info(
+                f"【{self.cookie_id}】开始{normalized_source}软Token预检，timeout={timeout:.1f}s（失败不阻断原流程）"
+            )
+            probe_result = await asyncio.to_thread(
+                probe_cookie_verification_from_cookie,
+                target_cookie_string,
+                proxy if proxy is not None else self.proxy_config,
+                timeout,
+            )
+        except Exception as preflight_err:
+            logger.warning(
+                f"【{self.cookie_id}】{normalized_source}软Token预检未完成，不阻断原流程: {self._safe_str(preflight_err)}"
+            )
+            return {
+                'status': 'inconclusive',
+                'source': normalized_source,
+                'reason': self._safe_str(preflight_err),
+                'token_cached': False,
+            }
+
+        status = str(probe_result.get('status') or 'unknown')
+        verification_url = str(probe_result.get('verification_url') or '').strip()
+        token_cached = False
+        if status == 'cookie_valid':
+            data_payload = (probe_result.get('payload') or {}).get('data') or {}
+            access_token = str(data_payload.get('accessToken') or '').strip()
+            if access_token:
+                self.cache_auth_prewarmed_token(
+                    self.cookie_id,
+                    access_token,
+                    source=f'soft_preflight:{normalized_source}',
+                )
+                token_cached = True
+            logger.info(
+                f"【{self.cookie_id}】{normalized_source}软Token预检通过"
+                f"{'，已缓存预热token' if token_cached else ''}"
+            )
+        elif status == 'verification_required':
+            logger.warning(
+                f"【{self.cookie_id}】{normalized_source}软Token预检返回验证要求，不阻断原流程: {verification_url or '无URL'}"
+            )
+        else:
+            logger.warning(
+                f"【{self.cookie_id}】{normalized_source}软Token预检结果未知(status={status})，不阻断原流程"
+            )
+
+        return {
+            'status': status,
+            'source': normalized_source,
+            'verification_url': verification_url,
+            'token_cached': token_cached,
+            'success_ret': bool(probe_result.get('success_ret')),
+            'has_token_payload': bool(probe_result.get('has_token_payload')),
+        }
     async def preflight_token_after_manual_refresh(self) -> str:
         """手动刷新成功后的 token 预检，确认新实例可直接完成初始化。
 
@@ -8431,6 +8545,12 @@ class XianyuLive:
                 self._set_runtime_cookie_state(
                     cookies_str=new_cookies_str,
                     cookies_dict=new_cookies_dict,
+                    source="password_login_refresh",
+                )
+
+                # 认证成功后的轻量 Token 软预检：只用于观测/预热，不阻断原有更新与重启流程
+                await self.soft_preflight_token_after_auth(
+                    new_cookies_str,
                     source="password_login_refresh",
                 )
 
@@ -17146,6 +17266,17 @@ class XianyuLive:
             if send_user_id == self.myid and not is_system_message:
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】[{msg_id}] 【手动发出】 商品({item_id}): {send_message}")
 
+                # Web /api/chat/send 已经做过落库+publish，如果命中去重标记
+                # 说明这是闲鱼对同一条消息的回推，直接跳过避免前端看到两条。
+                try:
+                    from chat_event_hub import self_send_dedup
+                    if self_send_dedup.consume(self.cookie_id, chat_id, str(self.myid), send_message):
+                        pause_manager.pause_chat(chat_id, self.cookie_id)
+                        logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 处理结束（Web 自发回推已去重）")
+                        return
+                except Exception as _e:
+                    logger.debug(f"自发消息去重检查失败: {self._safe_str(_e)}")
+
                 try:
                     from db_manager import db_manager as _db
                     from chat_event_hub import publish_chat_message
@@ -18464,10 +18595,7 @@ class XianyuLive:
         }
 
     def _get_item_polish_module(self):
-        if os.getenv('ITEM_POLISH_IMPL', '').strip().lower() == 'plain':
-            from item_polish_module import ItemPolishModule
-        else:
-            from secure_item_polish_ultra import ItemPolishModule
+        from item_polish_module import ItemPolishModule
 
         return ItemPolishModule(self)
 

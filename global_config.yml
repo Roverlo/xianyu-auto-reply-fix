@@ -67,6 +67,9 @@ RISK_CONTROL:
   backoff_max_cap_seconds: 3600
   consecutive_failure_protection_threshold: 5
   max_post_slider_session_retries: 1
+  soft_auth_token_preflight_enabled: true
+  soft_auth_token_preflight_timeout_seconds: 5.0
+  soft_auth_token_preflight_qr_enabled: false
   night_cookie_refresh_multiplier: 2
   night_end_hour: 6
   night_keepalive_multiplier: 3

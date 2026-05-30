@@ -71,6 +71,30 @@ input:checked + .status-slider:before {
   border: 1px solid #fecaca;
 }
 
+.account-status-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  min-width: 92px;
+}
+
+.account-status-main {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.account-status-cell .account-status-note-badge {
+  max-width: 100%;
+  justify-content: center;
+  text-align: center;
+}
+
 .account-status-note-badge {
   display: inline-flex;
   align-items: center;
@@ -89,6 +113,14 @@ input:checked + .status-slider:before {
   font-size: 0.8rem;
 }
 
+#cookieTable thead th {
+  white-space: nowrap;
+}
+
+#cookieTable thead th:nth-child(5) {
+  min-width: 4.5rem;
+}
+
 .account-row.disabled {
   opacity: 0.6;
   background-color: #f9fafb;
@@ -96,6 +128,107 @@ input:checked + .status-slider:before {
 
 .account-row.disabled .cookie-value {
   background-color: #f3f4f6;
+}
+
+.account-actions-cell {
+  min-width: 340px;
+}
+
+.account-actions-toolbar {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.35rem;
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.1rem 0;
+  scrollbar-width: thin;
+}
+
+.account-actions-toolbar::-webkit-scrollbar {
+  height: 4px;
+}
+
+.account-action-group {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.18rem;
+  padding: 0.18rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.65rem;
+  background: #f8fafc;
+}
+
+.account-action-group-label,
+.account-action-btn .action-text {
+  display: none;
+}
+
+.account-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  border-radius: 0.5rem !important;
+  margin-left: 0 !important;
+  padding: 0;
+  font-size: 0.78rem;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.account-action-btn .bi {
+  font-size: 0.95rem;
+}
+
+.account-action-group-danger {
+  margin-left: auto;
+}
+
+.account-action-delete {
+  min-width: 28px;
+}
+
+.account-action-group-basic {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.account-action-group-reply {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+}
+
+.account-action-group-item {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.account-action-group-flower {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+
+.account-action-group-danger {
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.account-actions-group {
+  display: flex !important;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.25rem;
+}
+
+.account-actions-group > .btn {
+  border-radius: 0.375rem !important;
+  margin-left: 0 !important;
 }
 
 /* 关键词管理界面的状态提示 */
@@ -1235,6 +1368,41 @@ input:checked + .status-slider:before {
   background: rgba(245, 158, 11, 0.16);
   color: #fcd34d;
   border-color: rgba(245, 158, 11, 0.32);
+}
+
+[data-theme="dark"] .account-action-group {
+  background: rgba(15, 23, 42, 0.72);
+  border-color: rgba(148, 163, 184, 0.22);
+}
+
+[data-theme="dark"] .account-action-group-label {
+  background: rgba(51, 65, 85, 0.9);
+  color: #cbd5e1;
+}
+
+[data-theme="dark"] .account-action-group-basic {
+  background: rgba(30, 41, 59, 0.55);
+  border-color: rgba(148, 163, 184, 0.22);
+}
+
+[data-theme="dark"] .account-action-group-reply {
+  background: rgba(6, 78, 59, 0.24);
+  border-color: rgba(16, 185, 129, 0.24);
+}
+
+[data-theme="dark"] .account-action-group-item {
+  background: rgba(30, 64, 175, 0.2);
+  border-color: rgba(59, 130, 246, 0.24);
+}
+
+[data-theme="dark"] .account-action-group-flower {
+  background: rgba(146, 64, 14, 0.2);
+  border-color: rgba(251, 146, 60, 0.24);
+}
+
+[data-theme="dark"] .account-action-group-danger {
+  background: rgba(127, 29, 29, 0.2);
+  border-color: rgba(248, 113, 113, 0.24);
 }
 
 /* 禁用账号提示 */

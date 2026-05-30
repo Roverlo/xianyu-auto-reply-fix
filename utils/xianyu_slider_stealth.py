@@ -142,6 +142,7 @@ def build_cookie_verification_sign(ts: str, token: str, data: str) -> str:
 def probe_cookie_verification_from_cookie(
     cookie_text: str,
     proxy: Optional[Dict[str, Any]] = None,
+    timeout: float = 30,
 ) -> Dict[str, Any]:
     import requests
 
@@ -215,7 +216,7 @@ def probe_cookie_verification_from_cookie(
         params=params,
         data={"data": data_val},
         proxies=proxies,
-        timeout=30,
+        timeout=timeout,
     )
     response.raise_for_status()
     payload = response.json()
@@ -5498,7 +5499,40 @@ class XianyuSliderStealth:
             target_page = self._select_monitor_page(context, page)
 
         self.last_browser_cookie_warmup_session_unready = False
-        cookies_dict = self._snapshot_context_cookies(context, page=target_page)
+
+        # 账密登录成功后，浏览器可能停留在 login.taobao.com / www.taobao.com，新的 _m_h5_tk
+        # 会落到 .taobao.com 域；后续 mtop.idlemessage.pc.login.token 接口被 h5api.m.goofish.com
+        # 网关 H5 token 校验时拿不到对应域的 token，直接回 FAIL_SYS_ILLEGAL_ACCESS::非法请求。
+        # 参考 1157ab3 在 _get_cookies_after_success 的做法，先回访 goofish 主域让 H5 token
+        # 重发到 .goofish.com，再做 cookie 快照，并显式让同名 Cookie 取 goofish 域版本。
+        if target_page:
+            try:
+                pre_snapshot_url = target_page.url or ''
+                pre_snapshot_host = (urlparse(pre_snapshot_url).hostname or '').lower()
+            except Exception:
+                pre_snapshot_host = ''
+            if 'goofish.com' not in pre_snapshot_host:
+                try:
+                    target_page.goto(
+                        'https://www.goofish.com/',
+                        wait_until='domcontentloaded',
+                        timeout=8000,
+                    )
+                    time.sleep(1.5)
+                    logger.info(
+                        f"【{self.pure_user_id}】{scene}前已回访 goofish 主域，"
+                        f"等待 .goofish.com 域重新颁发 _m_h5_tk"
+                    )
+                except Exception as goto_e:
+                    logger.warning(
+                        f"【{self.pure_user_id}】{scene}前回访 goofish 主域失败，仍按当前页 cookie 继续: {goto_e}"
+                    )
+
+        cookies_dict = self._snapshot_context_cookies(
+            context,
+            page=target_page,
+            preferred_domain_suffixes=('goofish.com',),
+        )
         if extra_cookie_updates:
             merged_from_network = dict(cookies_dict)
             merged_from_network.update(extra_cookie_updates)

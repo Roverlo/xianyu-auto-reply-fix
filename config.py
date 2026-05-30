@@ -152,6 +152,9 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'pending_order_reconcile_notice_cooldown_seconds': 1800,
     'pending_order_reconcile_session_expired_backoff_seconds': 1800,
     'pending_order_reconcile_error_backoff_seconds': 300,
+    'soft_auth_token_preflight_enabled': True,
+    'soft_auth_token_preflight_timeout_seconds': 5.0,
+    'soft_auth_token_preflight_qr_enabled': False,
 })
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):

@@ -103,6 +103,10 @@ data/
 backups/
 logs/
 realtime.log
+product_kits/
+quick_sell_kits/
+ready_to_sell/
+tools/
 
 # 上传文件
 static/uploads/*
@@ -162,6 +166,7 @@ cache/
 .playwright/
 playwright-report/
 test-results/
+browser_data/
 
 # 示例和演示文件
 example_*.py
