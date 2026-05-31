@@ -1757,20 +1757,15 @@ class XianyuLive:
                     if heartbeat_age > heartbeat_stale_timeout:
                         continue
 
+                    initial_silence = not self.last_sync_package_time and not self.last_user_chat_time
                     last_business_at = self.last_non_heartbeat_message_time or self.last_successful_connection
                     business_idle = now - last_business_at
-                    if business_idle < self.message_stream_watchdog_timeout:
-                        continue
-
-                    initial_silence = not self.last_sync_package_time and not self.last_user_chat_time
-                    if (
-                        initial_silence
-                        and connected_for < self.message_stream_initial_silence_reconnect_timeout
-                    ):
-                        logger.info(
-                            f"【{self.cookie_id}】业务流长时间只有心跳，但当前连接从未收到同步包/买家消息，"
-                            f"按低活跃时段继续观察: connected_for={connected_for:.0f}s, business_idle={business_idle:.0f}s"
-                        )
+                    idle_threshold = (
+                        self.message_stream_initial_silence_reconnect_timeout
+                        if initial_silence
+                        else self.message_stream_watchdog_timeout
+                    )
+                    if business_idle < idle_threshold:
                         continue
 
                     if (
@@ -1950,6 +1945,83 @@ class XianyuLive:
                 return chat_id
 
         return self._lookup_recent_chat_id_for_history_order(order)
+
+    def _extract_chat_id_from_create_chat_response(self, message_data: Any) -> Optional[str]:
+        """Extract a goofish conversation id from a create-chat response."""
+        try:
+            body = message_data.get('body') if isinstance(message_data, dict) else None
+            if isinstance(body, dict):
+                for key in ('singleChatConversation', 'conversation'):
+                    conversation = body.get(key)
+                    if isinstance(conversation, dict):
+                        chat_id = self._normalize_history_chat_id(conversation.get('cid'))
+                        if chat_id:
+                            return chat_id
+
+                chat_id = self._normalize_history_chat_id(body.get('cid'))
+                if chat_id:
+                    return chat_id
+
+            return self._extract_chat_id_from_history_payload(message_data)
+        except Exception:
+            return None
+
+    async def _create_chat_for_history_order(self, buyer_id: str, item_id: str,
+                                             timeout: float = 20.0) -> Optional[str]:
+        """Create/open a buyer conversation on an isolated WebSocket and return its cid."""
+        buyer_id = self._normalize_buyer_id_value(buyer_id)
+        item_id = str(item_id or '').strip()
+        if not item_id or not self._is_trustworthy_buyer_id(buyer_id):
+            return None
+
+        logger.warning(
+            f"【{self.cookie_id}】待发货补偿缺少会话ID，尝试通过买家ID+商品ID创建/打开会话: "
+            f"buyer_id={buyer_id}, item_id={item_id}"
+        )
+
+        headers = self._build_websocket_headers()
+        try:
+            async with await self._create_websocket_connection(headers) as websocket:
+                await self.init(websocket)
+                create_mid = await self.create_chat(websocket, buyer_id, item_id)
+
+                deadline = time.time() + max(3.0, float(timeout or 0))
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    raw_message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                    try:
+                        message_data = json.loads(raw_message)
+                    except Exception:
+                        continue
+                    response_mid = str((message_data.get('headers') or {}).get('mid') or '')
+                    if response_mid != str(create_mid):
+                        continue
+                    chat_id = self._extract_chat_id_from_create_chat_response(message_data)
+                    if chat_id:
+                        logger.warning(
+                            f"【{self.cookie_id}】待发货补偿已通过创建/打开会话解析到chat_id: "
+                            f"buyer_id={buyer_id}, item_id={item_id}, chat_id={chat_id}"
+                        )
+                        return chat_id
+        except Exception as exc:
+            logger.warning(
+                f"【{self.cookie_id}】待发货补偿创建/打开会话解析chat_id失败: "
+                f"buyer_id={buyer_id}, item_id={item_id}, error={self._safe_str(exc)}"
+            )
+
+        return None
+
+    async def _resolve_history_order_chat_id_for_delivery(self, order: Dict[str, Any],
+                                                          detail: Dict[str, Any] = None) -> Optional[str]:
+        chat_id = self._resolve_history_order_chat_id(order, detail)
+        if chat_id:
+            return chat_id
+
+        buyer_id = self._normalize_buyer_id_value(order.get('buyer_id'))
+        item_id = str(order.get('item_id') or '').strip()
+        return await self._create_chat_for_history_order(buyer_id, item_id)
 
     def _persist_history_order_candidate(self, order: Dict[str, Any], detail: Dict[str, Any] = None,
                                          chat_id: str = None) -> bool:
@@ -2183,7 +2255,7 @@ class XianyuLive:
                     )
 
                 latest_status = str((detail or {}).get('order_status') or order.get('order_status') or '').strip()
-                chat_id = self._resolve_history_order_chat_id(order, detail)
+                chat_id = await self._resolve_history_order_chat_id_for_delivery(order, detail)
                 self._persist_history_order_candidate(order, detail=detail, chat_id=chat_id)
 
                 if latest_status != 'pending_ship':
@@ -2796,18 +2868,18 @@ class XianyuLive:
             120,
         )
         self.message_stream_watchdog_timeout = max(
-            int(RISK_CONTROL.get('message_stream_watchdog_timeout_seconds', 7200) or 7200),
-            self.session_keepalive_interval * 6,
-            3600,
+            int(RISK_CONTROL.get('message_stream_watchdog_timeout_seconds', 1800) or 1800),
+            self.session_keepalive_interval * 2,
+            900,
         )
         self.message_stream_initial_silence_reconnect_timeout = max(
             int(
                 RISK_CONTROL.get(
                     'message_stream_initial_silence_reconnect_seconds',
-                    self.message_stream_watchdog_timeout * 2,
-                ) or self.message_stream_watchdog_timeout * 2
+                    900,
+                ) or 900
             ),
-            self.message_stream_watchdog_timeout,
+            self.stream_watchdog_grace_period,
         )
         self.stream_watchdog_trigger_times = deque(maxlen=8)
         self.message_stream_notification_window = max(self.message_stream_watchdog_timeout * 2, 3600)
@@ -13896,10 +13968,11 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】Token刷新循环已退出")
 
     async def create_chat(self, ws, toid, item_id='891198795482'):
+        create_mid = generate_mid()
         msg = {
             "lwp": "/r/SingleChatConversation/create",
             "headers": {
-                "mid": generate_mid()
+                "mid": create_mid
             },
             "body": [
                 {
@@ -13917,6 +13990,7 @@ class XianyuLive:
             ]
         }
         await ws.send(json.dumps(msg))
+        return create_mid
 
     async def send_msg(self, ws, cid, toid, text):
         send_mid = generate_mid()

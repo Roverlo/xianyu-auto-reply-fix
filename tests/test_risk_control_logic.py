@@ -54,6 +54,8 @@ def _install_import_stubs():
         "slider_consecutive_failure_threshold": 2,
         "slider_consecutive_pause_seconds": 7200,
         "hard_risk_backoff_seconds": 7200,
+        "message_stream_watchdog_timeout_seconds": 1800,
+        "message_stream_initial_silence_reconnect_seconds": 900,
     }
     sys.modules["config"] = config
 
@@ -199,6 +201,32 @@ class RiskControlLogicTest(unittest.TestCase):
 
             XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
             self.assertTrue(self.live._should_skip_token_refresh_for_login_backoff())
+
+    def test_create_chat_response_extracts_cid(self):
+        response = {
+            "body": {
+                "singleChatConversation": {
+                    "cid": "62216320925@goofish",
+                }
+            }
+        }
+
+        self.assertEqual(
+            self.live._extract_chat_id_from_create_chat_response(response),
+            "62216320925",
+        )
+
+    def test_stream_initial_silence_threshold_can_be_shorter_than_idle_timeout(self):
+        self.live.heartbeat_interval = 15
+        self.live.session_keepalive_interval = 600
+        self.live.stream_watchdog_grace_period = 120
+        self.live.message_stream_watchdog_timeout = 1800
+        self.live.message_stream_initial_silence_reconnect_timeout = 900
+
+        self.assertLess(
+            self.live.message_stream_initial_silence_reconnect_timeout,
+            self.live.message_stream_watchdog_timeout,
+        )
 
 
 if __name__ == "__main__":
