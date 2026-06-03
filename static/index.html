@@ -4695,14 +4695,34 @@
         </div>
         <div class="modal-body">
           <form id="redeemBatchForm">
+            <div class="form-check form-switch mb-3">
+              <input class="form-check-input" type="checkbox" id="redeemBatchBulkEnabled" onchange="toggleRedeemBatchBulkFields()">
+              <label class="form-check-label" for="redeemBatchBulkEnabled">
+                按规格批量创建
+              </label>
+            </div>
             <div class="row">
               <div class="col-md-8 mb-3">
-                <label class="form-label">兑换码池名称 <span class="text-danger">*</span></label>
-                <input type="text" class="form-control" id="redeemBatchName" required>
+                <label class="form-label" id="redeemBatchNameLabel">兑换码池名称 <span class="text-danger">*</span></label>
+                <input type="text" class="form-control" id="redeemBatchName" placeholder="例如：商品A-月卡" required>
+                <div class="form-text" id="redeemBatchNameHelp">单独创建一个兑换码池</div>
               </div>
               <div class="col-md-4 mb-3">
                 <label class="form-label">低库存预警</label>
                 <input type="number" class="form-control" id="redeemWarningThreshold" value="5" min="0">
+              </div>
+            </div>
+            <div id="redeemBatchBulkFields" style="display: none;">
+              <div class="row">
+                <div class="col-md-6 mb-3">
+                  <label class="form-label">规格名称 <span class="text-danger">*</span></label>
+                  <input type="text" class="form-control" id="redeemBatchSpecName" placeholder="例如：套餐、时长、版本">
+                </div>
+                <div class="col-md-6 mb-3">
+                  <label class="form-label">规格值 <span class="text-danger">*</span></label>
+                  <textarea class="form-control" id="redeemBatchSpecValues" rows="3" placeholder="例如：月卡&#10;季卡&#10;年卡，也可以用逗号分隔"></textarea>
+                  <div class="form-text">每个规格值会创建一个兑换码池，池名自动生成为“前缀-规格值”</div>
+                </div>
               </div>
             </div>
             <div class="row">
@@ -4719,7 +4739,7 @@
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-          <button type="button" class="btn btn-primary" onclick="saveRedeemBatch()">创建池</button>
+          <button type="button" class="btn btn-primary" id="saveRedeemBatchBtn" onclick="saveRedeemBatch()">创建池</button>
         </div>
       </div>
     </div>

@@ -8314,24 +8314,60 @@ async function showRedeemBatchModal() {
     document.getElementById('redeemBatchForm')?.reset();
     document.getElementById('redeemWarningThreshold').value = '5';
     document.getElementById('redeemBatchEnabled').checked = true;
+    document.getElementById('redeemBatchBulkEnabled').checked = false;
+    toggleRedeemBatchBulkFields();
     new bootstrap.Modal(document.getElementById('redeemBatchModal')).show();
 }
 
+function toggleRedeemBatchBulkFields() {
+    const bulkEnabled = document.getElementById('redeemBatchBulkEnabled')?.checked || false;
+    const fields = document.getElementById('redeemBatchBulkFields');
+    const nameLabel = document.getElementById('redeemBatchNameLabel');
+    const nameHelp = document.getElementById('redeemBatchNameHelp');
+    const saveButton = document.getElementById('saveRedeemBatchBtn');
+    if (fields) fields.style.display = bulkEnabled ? 'block' : 'none';
+    if (nameLabel) nameLabel.innerHTML = bulkEnabled ? '池名称前缀 <span class="text-danger">*</span>' : '兑换码池名称 <span class="text-danger">*</span>';
+    if (nameHelp) nameHelp.textContent = bulkEnabled ? '例如填写“商品A”，会按规格值生成“商品A-月卡 / 商品A-季卡”' : '单独创建一个兑换码池';
+    if (saveButton) saveButton.textContent = bulkEnabled ? '批量创建池' : '创建池';
+}
+
 async function saveRedeemBatch() {
+    const saveButton = document.getElementById('saveRedeemBatchBtn');
+    const originalButtonHtml = saveButton ? saveButton.innerHTML : '';
     const name = document.getElementById('redeemBatchName').value.trim();
+    const bulkEnabled = document.getElementById('redeemBatchBulkEnabled')?.checked || false;
     if (!name) {
-        showToast('请填写兑换码池名称', 'warning');
+        showToast(bulkEnabled ? '请填写池名称前缀' : '请填写兑换码池名称', 'warning');
         return;
     }
-    const payload = {
-        name,
+    const specName = document.getElementById('redeemBatchSpecName')?.value.trim() || '';
+    const specValues = parseSpecValueList(document.getElementById('redeemBatchSpecValues')?.value || '');
+    if (bulkEnabled && (!specName || specValues.length === 0)) {
+        showToast('批量创建需要填写规格名称和至少一个规格值', 'warning');
+        return;
+    }
+    const basePayload = {
         keyword: name,
         warning_threshold: parseInt(document.getElementById('redeemWarningThreshold').value, 10) || 0,
         enabled: document.getElementById('redeemBatchEnabled').checked,
         description: document.getElementById('redeemBatchDescription').value.trim() || null
     };
+    const payloads = bulkEnabled
+        ? specValues.map(specValue => ({
+            ...basePayload,
+            name: `${name}-${specValue}`,
+            spec_name: specName,
+            spec_value: specValue
+        }))
+        : [{ ...basePayload, name, keyword: name }];
     try {
-        const response = await fetch(`${apiBase}/redeem-code-batches`, {
+        if (saveButton) {
+            saveButton.disabled = true;
+            saveButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>创建中';
+        }
+        const results = [];
+        for (const payload of payloads) {
+            const response = await fetch(`${apiBase}/redeem-code-batches`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${authToken}`,
@@ -8339,16 +8375,35 @@ async function saveRedeemBatch() {
             },
             body: JSON.stringify(payload)
         });
-        if (!response.ok) {
-            const error = await response.json().catch(() => ({}));
-            throw new Error(error.detail || '创建失败');
+            if (response.ok) {
+                const result = await response.json().catch(() => ({}));
+                results.push({ ok: true, name: payload.name, result });
+            } else {
+                const error = await response.json().catch(() => ({}));
+                results.push({ ok: false, name: payload.name, error: error.detail || '创建失败' });
+            }
+        }
+        const successCount = results.filter(item => item.ok).length;
+        const failedResults = results.filter(item => !item.ok);
+        if (successCount === 0) {
+            throw new Error(failedResults[0]?.error || '创建失败');
         }
         bootstrap.Modal.getInstance(document.getElementById('redeemBatchModal')).hide();
-        showToast('兑换码池创建成功，请在卡券管理里关联到对应规格', 'success');
+        if (bulkEnabled) {
+            showToast(`已创建 ${successCount} 个兑换码池${failedResults.length ? `，失败 ${failedResults.length} 个` : ''}`, failedResults.length ? 'warning' : 'success');
+            if (failedResults.length) console.warn('部分兑换码池创建失败:', failedResults);
+        } else {
+            showToast('兑换码池创建成功，请在卡券管理里关联到对应规格', 'success');
+        }
         await loadRedeemCodeBatches();
     } catch (error) {
         console.error('创建兑换码池失败:', error);
         showToast(`创建失败: ${error.message}`, 'danger');
+    } finally {
+        if (saveButton) {
+            saveButton.disabled = false;
+            saveButton.innerHTML = originalButtonHtml || (bulkEnabled ? '批量创建池' : '创建池');
+        }
     }
 }
 
