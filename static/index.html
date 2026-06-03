@@ -1637,7 +1637,7 @@
           <i class="bi bi-credit-card me-2"></i>
           卡券管理
         </h2>
-        <p class="text-muted mb-0">管理虚拟商品的卡券数据，支持API、固定文字和批量数据</p>
+        <p class="text-muted mb-0">管理虚拟商品的卡券数据，支持API、固定文字和兑换码</p>
       </div>
       <div class="content-body">
         <!-- 卡券列表 -->
@@ -1705,7 +1705,7 @@
                 </div>
                 <div class="stat-item">
                   <div class="d-flex justify-content-between">
-                    <span>批量数据</span>
+                    <span>兑换码</span>
                     <span class="badge bg-warning" id="dataCards">0</span>
                   </div>
                 </div>
@@ -4051,7 +4051,7 @@
                 <option value="api">API接口</option>
                 <option value="yifan_api">亦凡API</option>
                 <option value="text">固定文字</option>
-                <option value="data">批量数据</option>
+                <option value="data">兑换码</option>
                 <option value="image">图片</option>
               </select>
             </div>
@@ -4214,16 +4214,15 @@
               </div>
             </div>
 
-            <!-- 批量数据配置 -->
+            <!-- 兑换码配置 -->
             <div id="dataFields" class="card mb-3" style="display: none;">
               <div class="card-header">
-                <h6 class="mb-0">批量数据配置</h6>
+                <h6 class="mb-0">兑换码配置</h6>
               </div>
               <div class="card-body">
-                <div class="mb-3">
-                  <label class="form-label">数据内容 (一行一个)</label>
-                  <textarea class="form-control" id="dataContent" rows="10" placeholder="请输入数据，每行一个：&#10;卡号1:密码1&#10;卡号2:密码2&#10;或者&#10;兑换码1&#10;兑换码2"></textarea>
-                  <small class="form-text text-muted">支持格式：卡号:密码 或 单独的兑换码</small>
+                <input type="hidden" id="dataContent" value="">
+                <div class="alert alert-info mb-0">
+                  兑换码在“兑换码池”页面导入。创建卡券后，在卡券列表点击关联按钮选择已创建的兑换码池。
                 </div>
               </div>
             </div>
@@ -4377,7 +4376,7 @@
                 <option value="api">API接口</option>
                 <option value="yifan_api">亦凡API</option>
                 <option value="text">固定文字</option>
-                <option value="data">批量数据</option>
+                <option value="data">兑换码</option>
                 <option value="image">图片</option>
               </select>
             </div>
@@ -4540,16 +4539,15 @@
               </div>
             </div>
 
-            <!-- 批量数据配置 -->
+            <!-- 兑换码配置 -->
             <div id="editDataFields" class="card mb-3" style="display: none;">
               <div class="card-header">
-                <h6 class="mb-0">批量数据配置</h6>
+                <h6 class="mb-0">兑换码配置</h6>
               </div>
               <div class="card-body">
-                <div class="mb-3">
-                  <label class="form-label">数据内容 (一行一个)</label>
-                  <textarea class="form-control" id="editDataContent" rows="10"></textarea>
-                  <small class="form-text text-muted">支持格式：卡号:密码 或 单独的兑换码</small>
+                <input type="hidden" id="editDataContent" value="">
+                <div class="alert alert-info mb-0">
+                  兑换码由已关联的兑换码池提供。如需更换池，请在卡券列表点击关联按钮。
                 </div>
               </div>
             </div>
@@ -4756,7 +4754,7 @@
           <div class="alert alert-warning mb-0">
             <small>
               <i class="bi bi-exclamation-triangle me-1"></i>
-              未绑定兑换码池的批量数据卡券会被标红，并禁止自动发货。
+              未绑定兑换码池的兑换码卡券会被标红，并禁止自动发货。
             </small>
           </div>
         </div>

@@ -7862,7 +7862,7 @@ function formatCardOptionLabel(card) {
             typeText = '固定文字';
             break;
         case 'data':
-            typeText = '兑换码/批量数据';
+            typeText = '兑换码';
             break;
         case 'image':
             typeText = '图片';
@@ -8571,7 +8571,7 @@ function renderCardsList(cards) {
         typeBadge = '<span class="badge bg-success">固定文字</span>';
         break;
         case 'data':
-        typeBadge = '<span class="badge bg-warning">批量数据</span>';
+        typeBadge = '<span class="badge bg-warning">兑换码</span>';
         break;
         case 'image':
         typeBadge = '<span class="badge bg-primary">图片</span>';
@@ -9334,7 +9334,7 @@ function renderDeliveryRulesList(rules) {
             cardTypeBadge = '<span class="badge bg-success">固定文字</span>';
             break;
         case 'data':
-            cardTypeBadge = '<span class="badge bg-warning">批量数据</span>';
+            cardTypeBadge = '<span class="badge bg-warning">兑换码</span>';
             break;
         case 'image':
             cardTypeBadge = '<span class="badge bg-primary">图片</span>';
