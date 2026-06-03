@@ -4424,6 +4424,14 @@ class XianyuLive:
                         'error': '批量数据预占完成失败，已中止后续确认发货'
                     }
                 reservation_already_finalized = bool(finalize_state.get('already_finalized'))
+            elif meta.get('redeem_code_id'):
+                finalize_state = db_manager.finalize_redeem_code(meta.get('redeem_code_id'))
+                if not finalize_state.get('success'):
+                    return {
+                        'success': False,
+                        'error': '兑换码状态完成失败，已中止后续确认发货'
+                    }
+                reservation_already_finalized = bool(finalize_state.get('already_finalized'))
             elif not card_id or card_type != 'data':
                 return {
                     'success': False,
@@ -4476,6 +4484,10 @@ class XianyuLive:
         meta = delivery_meta or {}
         reservation_id = meta.get('data_reservation_id')
         if not reservation_id:
+            redeem_code_id = meta.get('redeem_code_id')
+            if redeem_code_id:
+                from db_manager import db_manager
+                return db_manager.mark_redeem_code_sent(redeem_code_id)
             return True
 
         from db_manager import db_manager
@@ -4485,10 +4497,38 @@ class XianyuLive:
         meta = delivery_meta or {}
         reservation_id = meta.get('data_reservation_id')
         if not reservation_id:
+            redeem_code_id = meta.get('redeem_code_id')
+            if redeem_code_id:
+                from db_manager import db_manager
+                return db_manager.release_redeem_code(redeem_code_id, error=error)
             return True
 
         from db_manager import db_manager
         return db_manager.release_batch_data_reservation(reservation_id, error=error)
+
+    def _release_prepared_redeem_units(self, prepared_units=None, reserved_units_by_index=None,
+                                       error: str = None) -> int:
+        released_count = 0
+        released_ids = set()
+
+        for prepared_unit in prepared_units or []:
+            meta = (prepared_unit or {}).get('rule_meta') or {}
+            redeem_code_id = meta.get('redeem_code_id')
+            if not redeem_code_id or redeem_code_id in released_ids:
+                continue
+            if self._release_data_reservation_if_needed(meta, error=error):
+                released_count += 1
+            released_ids.add(redeem_code_id)
+
+        for reservation in (reserved_units_by_index or {}).values():
+            redeem_code_id = (reservation or {}).get('id')
+            if not redeem_code_id or redeem_code_id in released_ids:
+                continue
+            if self._release_data_reservation_if_needed({'redeem_code_id': redeem_code_id}, error=error):
+                released_count += 1
+            released_ids.add(redeem_code_id)
+
+        return released_count
 
     def _get_pending_delivery_finalization_meta(self, order_id: str, delivery_unit_index: int = 1):
         if not order_id:
@@ -5699,6 +5739,9 @@ class XianyuLive:
                         'data_line': delivery_result.get('data_line'),
                         'data_reservation_id': delivery_result.get('data_reservation_id'),
                         'data_reservation_status': delivery_result.get('data_reservation_status'),
+                        'redeem_code_id': delivery_result.get('redeem_code_id'),
+                        'redeem_code_batch_id': delivery_result.get('redeem_code_batch_id'),
+                        'redeem_code_status': delivery_result.get('redeem_code_status'),
                         'delivery_unit_index': delivery_result.get('delivery_unit_index')
                     }
                 else:
@@ -6255,9 +6298,17 @@ class XianyuLive:
                     successful_send_count = 0
                     last_delivery_error = None
                     prepared_units = []
+                    progress_summary_before_prepare = self._summarize_delivery_progress(
+                        order_id,
+                        expected_quantity=quantity_to_send
+                    ) if order_id else None
+                    if progress_summary_before_prepare:
+                        unit_indexes_to_prepare = list(progress_summary_before_prepare.get('remaining_unit_indexes') or [])
+                    else:
+                        unit_indexes_to_prepare = list(range(1, quantity_to_send + 1))
+                    redeem_reservations_by_unit = {}
 
-                    for i in range(quantity_to_send):
-                        unit_index = i + 1
+                    for unit_index in range(1, quantity_to_send + 1):
                         rule_meta = {}
                         try:
                             pending_finalize_meta = self._get_pending_delivery_finalization_meta(order_id, unit_index)
@@ -6313,6 +6364,9 @@ class XianyuLive:
                                 )
                                 continue
 
+                            if unit_index not in unit_indexes_to_prepare:
+                                continue
+
                             delivery_result = await self._auto_delivery(
                                 item_id,
                                 item_title,
@@ -6321,7 +6375,8 @@ class XianyuLive:
                                 chat_id,
                                 send_user_name,
                                 include_meta=True,
-                                delivery_unit_index=unit_index
+                                delivery_unit_index=unit_index,
+                                reserved_delivery_unit=redeem_reservations_by_unit.get(unit_index)
                             )
 
                             if isinstance(delivery_result, dict):
@@ -6343,8 +6398,66 @@ class XianyuLive:
                                     'data_line': delivery_result.get('data_line'),
                                     'data_reservation_id': delivery_result.get('data_reservation_id'),
                                     'data_reservation_status': delivery_result.get('data_reservation_status'),
+                                    'redeem_code_id': delivery_result.get('redeem_code_id'),
+                                    'redeem_code_batch_id': delivery_result.get('redeem_code_batch_id'),
+                                    'redeem_code_status': delivery_result.get('redeem_code_status'),
                                     'delivery_unit_index': delivery_result.get('delivery_unit_index')
                                 }
+                                if (
+                                    delivery_result.get('redeem_code_id')
+                                    and quantity_to_send > 1
+                                    and not redeem_reservations_by_unit
+                                ):
+                                    remaining_redeem_units = [
+                                        index for index in unit_indexes_to_prepare
+                                        if index != unit_index
+                                    ]
+                                    if remaining_redeem_units:
+                                        reservation_result = db_manager.reserve_redeem_codes_for_rule(
+                                            rule={
+                                                'id': delivery_result.get('rule_id'),
+                                                'card_id': delivery_result.get('card_id'),
+                                                'keyword': delivery_result.get('rule_keyword'),
+                                                'spec_name': delivery_result.get('spec_name'),
+                                                'spec_value': delivery_result.get('spec_value'),
+                                                'spec_name_2': delivery_result.get('spec_name_2'),
+                                                'spec_value_2': delivery_result.get('spec_value_2'),
+                                            },
+                                            order_id=order_id,
+                                            unit_indexes=remaining_redeem_units,
+                                            cookie_id=self.cookie_id,
+                                            item_id=item_id,
+                                            buyer_id=send_user_id,
+                                            buyer_nick=send_user_name,
+                                            user_id=self.user_id,
+                                        )
+                                        if not reservation_result.get('ok'):
+                                            self._release_data_reservation_if_needed(
+                                                rule_meta,
+                                                error=reservation_result.get('error') or '兑换码库存不足'
+                                            )
+                                            failure_reason = (
+                                                f"兑换码库存不足，订单还需 {len(unit_indexes_to_prepare)} 个，"
+                                                f"当前可用 {reservation_result.get('available_count', 0)} 个"
+                                            )
+                                            last_delivery_error = failure_reason
+                                            self._record_delivery_log(
+                                                order_id=order_id,
+                                                item_id=item_id,
+                                                buyer_id=send_user_id,
+                                                buyer_nick=send_user_name,
+                                                status='failed',
+                                                reason=failure_reason,
+                                                channel='auto',
+                                                rule_meta=rule_meta
+                                            )
+                                            logger.error(failure_reason)
+                                            prepared_units = []
+                                            break
+                                        redeem_reservations_by_unit = {
+                                            int(item.get('unit_index') or 0): item
+                                            for item in (reservation_result.get('reservations') or [])
+                                        }
                             else:
                                 delivery_content = delivery_result
                                 delivery_error = None
@@ -6353,6 +6466,13 @@ class XianyuLive:
                             if not delivery_content:
                                 failure_reason = delivery_error or f"第 {unit_index}/{quantity_to_send} 个卡券内容获取失败"
                                 last_delivery_error = failure_reason
+                                if rule_meta.get('redeem_code_id') or redeem_reservations_by_unit:
+                                    self._release_prepared_redeem_units(
+                                        prepared_units,
+                                        redeem_reservations_by_unit,
+                                        error=failure_reason
+                                    )
+                                    prepared_units = []
                                 self._record_delivery_log(
                                     order_id=order_id,
                                     item_id=item_id,
@@ -6364,6 +6484,8 @@ class XianyuLive:
                                     rule_meta=rule_meta
                                 )
                                 logger.warning(failure_reason)
+                                if rule_meta.get('redeem_code_id') or redeem_reservations_by_unit:
+                                    break
                                 continue
 
                             if not delivery_steps:
@@ -6372,6 +6494,13 @@ class XianyuLive:
                                 failure_reason = f"第 {unit_index}/{quantity_to_send} 个卡券发货步骤构建失败"
                                 last_delivery_error = failure_reason
                                 self._release_data_reservation_if_needed(rule_meta, error=failure_reason)
+                                if rule_meta.get('redeem_code_id') or redeem_reservations_by_unit:
+                                    self._release_prepared_redeem_units(
+                                        prepared_units,
+                                        redeem_reservations_by_unit,
+                                        error=failure_reason
+                                    )
+                                    prepared_units = []
                                 self._record_delivery_log(
                                     order_id=order_id,
                                     item_id=item_id,
@@ -6383,6 +6512,8 @@ class XianyuLive:
                                     rule_meta=rule_meta
                                 )
                                 logger.error(failure_reason)
+                                if rule_meta.get('redeem_code_id') or redeem_reservations_by_unit:
+                                    break
                                 continue
 
                             prepared_units.append({
@@ -6395,6 +6526,13 @@ class XianyuLive:
                         except Exception as e:
                             self._release_data_reservation_if_needed(rule_meta, error=f'准备发货失败: {self._safe_str(e)}')
                             last_delivery_error = f"准备第 {unit_index}/{quantity_to_send} 个卡券失败: {self._safe_str(e)}"
+                            if rule_meta.get('redeem_code_id') or redeem_reservations_by_unit:
+                                self._release_prepared_redeem_units(
+                                    prepared_units,
+                                    redeem_reservations_by_unit,
+                                    error=last_delivery_error
+                                )
+                                prepared_units = []
                             self._record_delivery_log(
                                 order_id=order_id,
                                 item_id=item_id,
@@ -6406,6 +6544,8 @@ class XianyuLive:
                                 rule_meta=rule_meta
                             )
                             logger.error(last_delivery_error)
+                            if rule_meta.get('redeem_code_id') or redeem_reservations_by_unit:
+                                break
 
                     send_groups = self._build_delivery_send_groups(prepared_units, quantity_to_send)
                     total_send_groups = len(send_groups)
@@ -12073,7 +12213,8 @@ class XianyuLive:
 
     async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None,
                              chat_id: str = None, send_user_name: str = None, include_meta: bool = False,
-                             data_preview_index: int = 0, delivery_unit_index: int = 1):
+                             data_preview_index: int = 0, delivery_unit_index: int = 1,
+                             reserved_delivery_unit: dict = None):
         """自动发货功能 - 匹配规则并准备发货内容，不直接提交副作用。"""
         try:
             matched_rule_context = None
@@ -12114,11 +12255,18 @@ class XianyuLive:
                         "item_config_mode": item_config_mode_value,
                         "card_id": matched_rule.get('card_id') if matched_rule else None,
                         "card_description": matched_rule.get('card_description') if matched_rule else None,
+                        "spec_name": matched_rule.get('spec_name') if matched_rule else None,
+                        "spec_value": matched_rule.get('spec_value') if matched_rule else None,
+                        "spec_name_2": matched_rule.get('spec_name_2') if matched_rule else None,
+                        "spec_value_2": matched_rule.get('spec_value_2') if matched_rule else None,
                         "delivery_steps": delivery_steps_value or [],
                         "data_card_pending_consume": False,
                         "data_line": None,
                         "data_reservation_id": None,
                         "data_reservation_status": None,
+                        "redeem_code_id": None,
+                        "redeem_code_batch_id": None,
+                        "redeem_code_status": None,
                         "delivery_unit_index": delivery_unit_index
                     }
                 return content if success else None
@@ -12419,6 +12567,10 @@ class XianyuLive:
                 logger.error(block_reason)
                 return build_result(False, error=block_reason, matched_rule=rule, match_mode_value='blocked_rule_mode_mismatch')
 
+            reserved_delivery_unit = dict(reserved_delivery_unit or {})
+            if reserved_delivery_unit and rule.get('card_type') != 'data':
+                reserved_delivery_unit = {}
+
             # 注释掉自动发货时的商品信息保存逻辑，避免重复保存导致item_detail字段内容累积
             # 商品信息应该在商品列表获取、订单详情获取等其他环节已经保存过了
             # 保存商品信息到数据库（需要有商品标题才保存）
@@ -12531,14 +12683,33 @@ class XianyuLive:
                     delivery_content = rule['text_content']
 
                 elif rule['card_type'] == 'data':
-                    # 批量数据类型：先原子预占，再发送，避免并发订单拿到同一条卡密
-                    data_reservation = db_manager.reserve_batch_data(
-                        card_id=rule['card_id'],
-                        order_id=order_id,
-                        unit_index=delivery_unit_index,
-                        cookie_id=self.cookie_id,
-                        buyer_id=send_user_id,
-                    )
+                    # 结构化兑换码优先；没有绑定兑换码批次时兼容旧的 data_content 行池。
+                    if reserved_delivery_unit:
+                        data_reservation = reserved_delivery_unit
+                        data_reservation['source'] = 'redeem_code'
+                    else:
+                        data_reservation = db_manager.reserve_redeem_code_for_rule(
+                            rule=rule,
+                            order_id=order_id,
+                            unit_index=delivery_unit_index,
+                            cookie_id=self.cookie_id,
+                            item_id=item_id,
+                            buyer_id=send_user_id,
+                            buyer_nick=send_user_name,
+                            user_id=self.user_id,
+                        )
+                        if data_reservation:
+                            data_reservation['source'] = 'redeem_code'
+                        else:
+                            data_reservation = db_manager.reserve_batch_data(
+                                card_id=rule['card_id'],
+                                order_id=order_id,
+                                unit_index=delivery_unit_index,
+                                cookie_id=self.cookie_id,
+                                buyer_id=send_user_id,
+                            )
+                            if data_reservation:
+                                data_reservation['source'] = 'data_card'
                     if data_reservation:
                         data_line = data_reservation.get('reserved_content')
                         delivery_content = data_line
@@ -12559,6 +12730,13 @@ class XianyuLive:
                     delivery_steps = self._build_delivery_steps(delivery_content, rule.get('card_description', ''))
                     if not delivery_steps:
                         logger.warning(f"发货步骤构建失败: 规则ID={rule['id']}")
+                        self._release_data_reservation_if_needed(
+                            {
+                                'data_reservation_id': data_reservation.get('id') if data_reservation and data_reservation.get('source') == 'data_card' else None,
+                                'redeem_code_id': data_reservation.get('id') if data_reservation and data_reservation.get('source') == 'redeem_code' else None,
+                            },
+                            error=f"发货步骤构建失败: 规则ID={rule['id']}"
+                        )
                         return build_result(False, error=f"发货步骤构建失败: 规则ID={rule['id']}", matched_rule=rule, match_mode_value=match_mode)
 
                     if len(delivery_steps) == 1 and delivery_steps[0].get('type') == 'text':
@@ -12579,12 +12757,24 @@ class XianyuLive:
                         result['card_id'] = rule.get('card_id')
                         result['data_card_pending_consume'] = bool(rule['card_type'] == 'data')
                         result['data_line'] = data_line
-                        result['data_reservation_id'] = data_reservation.get('id') if data_reservation else None
-                        result['data_reservation_status'] = data_reservation.get('status') if data_reservation else None
+                        if data_reservation and data_reservation.get('source') == 'redeem_code':
+                            result['redeem_code_id'] = data_reservation.get('id')
+                            result['redeem_code_batch_id'] = data_reservation.get('batch_id')
+                            result['redeem_code_status'] = data_reservation.get('status')
+                        else:
+                            result['data_reservation_id'] = data_reservation.get('id') if data_reservation else None
+                            result['data_reservation_status'] = data_reservation.get('status') if data_reservation else None
                         result['delivery_unit_index'] = delivery_unit_index
                     return result
                 else:
                     logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")
+                    self._release_data_reservation_if_needed(
+                        {
+                            'data_reservation_id': data_reservation.get('id') if data_reservation and data_reservation.get('source') == 'data_card' else None,
+                            'redeem_code_id': data_reservation.get('id') if data_reservation and data_reservation.get('source') == 'redeem_code' else None,
+                        },
+                        error=f"获取发货内容失败: 规则ID={rule['id']}"
+                    )
                     return build_result(False, error=f"获取发货内容失败: 规则ID={rule['id']}", matched_rule=rule, match_mode_value=match_mode)
             else:
                 # 没有订单ID，记录日志但不处理发货内容

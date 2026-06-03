@@ -9026,6 +9026,113 @@ async def update_card_with_image(
 
 
 # 自动发货规则API
+@app.get("/redeem-code-batches")
+def get_redeem_code_batches(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取兑换码批次和库存统计。"""
+    try:
+        from db_manager import db_manager
+        return db_manager.get_redeem_code_batches(current_user['user_id'])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/redeem-code-batches")
+def create_redeem_code_batch(batch_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """创建兑换码批次。"""
+    try:
+        from db_manager import db_manager
+        user_id = current_user['user_id']
+        batch_id = db_manager.create_redeem_code_batch(
+            name=batch_data.get('name'),
+            keyword=batch_data.get('keyword'),
+            user_id=user_id,
+            card_id=batch_data.get('card_id'),
+            rule_id=batch_data.get('rule_id'),
+            spec_name=batch_data.get('spec_name'),
+            spec_value=batch_data.get('spec_value'),
+            spec_name_2=batch_data.get('spec_name_2'),
+            spec_value_2=batch_data.get('spec_value_2'),
+            warning_threshold=batch_data.get('warning_threshold', 5),
+            enabled=batch_data.get('enabled', True),
+            description=batch_data.get('description'),
+        )
+        return {"id": batch_id, "message": "兑换码批次创建成功"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/redeem-code-batches/{batch_id}")
+def update_redeem_code_batch(batch_id: int, batch_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新兑换码批次。"""
+    try:
+        from db_manager import db_manager
+        allowed_fields = {
+            'name', 'keyword', 'card_id', 'rule_id', 'spec_name', 'spec_value',
+            'spec_name_2', 'spec_value_2', 'warning_threshold', 'enabled', 'description'
+        }
+        updates = {key: batch_data.get(key) for key in allowed_fields if key in batch_data}
+        success = db_manager.update_redeem_code_batch(batch_id, current_user['user_id'], **updates)
+        if not success:
+            raise HTTPException(status_code=404, detail="兑换码批次不存在")
+        return {"message": "兑换码批次更新成功"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/redeem-code-batches/{batch_id}/import")
+def import_redeem_codes(batch_id: int, payload: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """导入兑换码，一行一个。"""
+    try:
+        from db_manager import db_manager
+        result = db_manager.import_redeem_codes(
+            batch_id=batch_id,
+            user_id=current_user['user_id'],
+            raw_codes=payload.get('codes') or payload.get('content') or ''
+        )
+        return {"message": "兑换码导入完成", **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/redeem-codes")
+def get_redeem_codes(batch_id: int = None, status: str = None, order_id: str = None,
+                     buyer_id: str = None, limit: int = 200,
+                     current_user: Dict[str, Any] = Depends(get_current_user)):
+    """查询兑换码明细，默认只返回掩码。"""
+    try:
+        from db_manager import db_manager
+        return {
+            "codes": db_manager.get_redeem_codes(
+                user_id=current_user['user_id'],
+                batch_id=batch_id,
+                status=status,
+                order_id=order_id,
+                buyer_id=buyer_id,
+                limit=limit,
+            )
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/redeem-code-stats")
+def get_redeem_code_stats(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取兑换码总统计。"""
+    try:
+        from db_manager import db_manager
+        return db_manager.get_redeem_code_stats(current_user['user_id'])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/delivery-rules")
 def get_delivery_rules(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取发货规则列表"""
@@ -13510,6 +13617,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
 
         unit_results = []
         prepared_units = []
+        redeem_reservations_by_unit = {}
 
         def format_delivery_reason(reason: str, order_spec_mode: str = None, rule_spec_mode: str = None, item_config_mode: str = None) -> str:
             context_parts = []
@@ -13535,7 +13643,8 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 order_id=order_id,
                 send_user_id=buyer_id,
                 include_meta=True,
-                delivery_unit_index=unit_index
+                delivery_unit_index=unit_index,
+                reserved_delivery_unit=redeem_reservations_by_unit.get(unit_index)
             )
 
             if isinstance(delivery_result, dict):
@@ -13554,7 +13663,65 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 data_line = delivery_result.get('data_line')
                 data_reservation_id = delivery_result.get('data_reservation_id')
                 data_reservation_status = delivery_result.get('data_reservation_status')
+                redeem_code_id = delivery_result.get('redeem_code_id')
+                redeem_code_batch_id = delivery_result.get('redeem_code_batch_id')
+                redeem_code_status = delivery_result.get('redeem_code_status')
                 failure_reason = delivery_result.get('error')
+                if redeem_code_id and len(remaining_unit_indexes) > 1 and not redeem_reservations_by_unit:
+                    remaining_redeem_units = [
+                        index for index in remaining_unit_indexes
+                        if index != unit_index
+                    ]
+                    if remaining_redeem_units:
+                        reservation_result = db_manager.reserve_redeem_codes_for_rule(
+                            rule={
+                                'id': rule_id,
+                                'card_id': card_id,
+                                'keyword': rule_keyword,
+                                'spec_name': delivery_result.get('spec_name'),
+                                'spec_value': delivery_result.get('spec_value'),
+                                'spec_name_2': delivery_result.get('spec_name_2'),
+                                'spec_value_2': delivery_result.get('spec_value_2'),
+                            },
+                            order_id=order_id,
+                            unit_indexes=remaining_redeem_units,
+                            cookie_id=cookie_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                            buyer_nick=order.get('buyer_nick'),
+                            user_id=user_id,
+                        )
+                        if not reservation_result.get('ok'):
+                            fail_reason = (
+                                f"兑换码库存不足，订单还需 {len(remaining_unit_indexes)} 个，"
+                                f"当前可用 {reservation_result.get('available_count', 0)} 个"
+                            )
+                            xianyu_instance._release_data_reservation_if_needed(
+                                {'redeem_code_id': redeem_code_id},
+                                error=reservation_result.get('error') or fail_reason
+                            )
+                            db_manager.create_delivery_log(
+                                user_id=user_id,
+                                cookie_id=cookie_id,
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=buyer_id,
+                                buyer_nick=order.get('buyer_nick'),
+                                rule_id=rule_id,
+                                rule_keyword=rule_keyword,
+                                card_type=card_type,
+                                match_mode=match_mode,
+                                channel='manual',
+                                status='failed',
+                                reason=format_delivery_reason(fail_reason, order_spec_mode, rule_spec_mode, item_config_mode)
+                            )
+                            unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
+                            prepared_units = []
+                            break
+                        redeem_reservations_by_unit = {
+                            int(item.get('unit_index') or 0): item
+                            for item in (reservation_result.get('reservations') or [])
+                        }
             else:
                 delivery_content = delivery_result
                 delivery_steps = []
@@ -13571,6 +13738,9 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 data_line = None
                 data_reservation_id = None
                 data_reservation_status = None
+                redeem_code_id = None
+                redeem_code_batch_id = None
+                redeem_code_status = None
                 failure_reason = None
 
             if delivery_success:
@@ -13579,9 +13749,16 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 if not delivery_steps:
                     fail_reason = f"第 {unit_index} 个发货单元发货步骤构建失败"
                     xianyu_instance._release_data_reservation_if_needed(
-                        {'data_reservation_id': data_reservation_id},
+                        {'data_reservation_id': data_reservation_id, 'redeem_code_id': redeem_code_id},
                         error=fail_reason
                     )
+                    if redeem_code_id or redeem_reservations_by_unit:
+                        xianyu_instance._release_prepared_redeem_units(
+                            prepared_units,
+                            redeem_reservations_by_unit,
+                            error=fail_reason
+                        )
+                        prepared_units = []
                     db_manager.create_delivery_log(
                         user_id=user_id,
                         cookie_id=cookie_id,
@@ -13598,6 +13775,8 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                         reason=format_delivery_reason(fail_reason, order_spec_mode, rule_spec_mode, item_config_mode)
                     )
                     unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
+                    if redeem_code_id or redeem_reservations_by_unit:
+                        break
                     continue
 
                 prepared_units.append({
@@ -13618,11 +13797,25 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                         'data_line': data_line,
                         'data_reservation_id': data_reservation_id,
                         'data_reservation_status': data_reservation_status,
+                        'redeem_code_id': redeem_code_id,
+                        'redeem_code_batch_id': redeem_code_batch_id,
+                        'redeem_code_status': redeem_code_status,
                         'delivery_unit_index': unit_index,
                     }
                 })
             else:
                 fail_reason = failure_reason or f"第 {unit_index} 个发货单元未匹配到发货规则，请检查卡券和发货规则配置"
+                if redeem_code_id or redeem_reservations_by_unit:
+                    xianyu_instance._release_data_reservation_if_needed(
+                        {'redeem_code_id': redeem_code_id},
+                        error=fail_reason
+                    )
+                    xianyu_instance._release_prepared_redeem_units(
+                        prepared_units,
+                        redeem_reservations_by_unit,
+                        error=fail_reason
+                    )
+                    prepared_units = []
                 db_manager.create_delivery_log(
                     user_id=user_id,
                     cookie_id=cookie_id,
@@ -13639,6 +13832,8 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                     reason=format_delivery_reason(fail_reason, order_spec_mode, rule_spec_mode, item_config_mode)
                 )
                 unit_results.append({'unit_index': unit_index, 'status': 'failed', 'error': fail_reason})
+                if redeem_code_id or redeem_reservations_by_unit:
+                    break
 
         ws = getattr(xianyu_instance, 'ws', None)
         manual_chat_id = buyer_id

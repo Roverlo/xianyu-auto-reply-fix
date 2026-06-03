@@ -1019,6 +1019,7 @@ Cookie数量: {cookie_count}
             self._ensure_scheduled_rate_logs_table(cursor)
             self._ensure_scheduled_red_flower_logs_table(cursor)
             self._ensure_scheduled_task_logs_table(cursor)
+            self._ensure_redeem_code_tables(cursor)
             self._ensure_product_publish_tables(cursor)
 
             # 迁移notification_templates表以支持新的模板类型
@@ -1228,6 +1229,66 @@ Cookie数量: {cookie_count}
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_user_time ON publish_logs(user_id, created_at DESC)")
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_batch ON publish_logs(batch_id)")
         self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_publish_logs_account_status ON publish_logs(account_id, status, created_at DESC)")
+
+    def _ensure_redeem_code_tables(self, cursor):
+        """Ensure structured redeem-code inventory tables exist."""
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS redeem_code_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            name TEXT NOT NULL,
+            keyword TEXT NOT NULL,
+            card_id INTEGER,
+            rule_id INTEGER,
+            spec_name TEXT,
+            spec_value TEXT,
+            spec_name_2 TEXT,
+            spec_value_2 TEXT,
+            warning_threshold INTEGER DEFAULT 5,
+            enabled BOOLEAN DEFAULT TRUE,
+            description TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE SET NULL,
+            FOREIGN KEY (rule_id) REFERENCES delivery_rules(id) ON DELETE SET NULL
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_redeem_code_batches_user_enabled ON redeem_code_batches(user_id, enabled)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_redeem_code_batches_rule ON redeem_code_batches(rule_id)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_redeem_code_batches_card ON redeem_code_batches(card_id)")
+
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS redeem_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            code_hash TEXT NOT NULL,
+            code_cipher TEXT NOT NULL,
+            code_preview TEXT,
+            status TEXT NOT NULL DEFAULT 'available',
+            order_id TEXT,
+            cookie_id TEXT,
+            item_id TEXT,
+            buyer_id TEXT,
+            buyer_nick TEXT,
+            unit_index INTEGER,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reserved_at TIMESTAMP,
+            sent_at TIMESTAMP,
+            consumed_at TIMESTAMP,
+            released_at TIMESTAMP,
+            expires_at TIMESTAMP,
+            FOREIGN KEY (batch_id) REFERENCES redeem_code_batches(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        ''')
+        self._execute_sql(cursor, "CREATE UNIQUE INDEX IF NOT EXISTS idx_redeem_codes_batch_hash ON redeem_codes(batch_id, code_hash)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_redeem_codes_user_status ON redeem_codes(user_id, status)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch_status ON redeem_codes(batch_id, status)")
+        self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_redeem_codes_order_unit ON redeem_codes(order_id, unit_index)")
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image和yifan_api类型"""
@@ -5934,6 +5995,583 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"恢复超时批量数据预占失败: {e}")
                 return 0
+
+    # ==================== Redeem code inventory ====================
+
+    def _normalize_redeem_spec_part(self, value: Any) -> str:
+        return re.sub(r'[\s\u3000]+', '', str(value or '').strip().lower())
+
+    def _hash_redeem_code(self, code: str) -> str:
+        return hashlib.sha256(str(code or '').strip().encode('utf-8')).hexdigest()
+
+    def _mask_redeem_code(self, code: str) -> str:
+        text = str(code or '').strip()
+        if len(text) <= 4:
+            return '*' * len(text)
+        if len(text) <= 10:
+            return f"{text[:2]}***{text[-2:]}"
+        return f"{text[:4]}***{text[-4:]}"
+
+    def create_redeem_code_batch(self, name: str, keyword: str, user_id: int,
+                                 card_id: int = None, rule_id: int = None,
+                                 spec_name: str = None, spec_value: str = None,
+                                 spec_name_2: str = None, spec_value_2: str = None,
+                                 warning_threshold: int = 5, enabled: bool = True,
+                                 description: str = None):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                clean_name = str(name or '').strip()
+                clean_keyword = str(keyword or '').strip()
+                if not clean_name or not clean_keyword:
+                    raise ValueError("批次名称和商品关键字不能为空")
+
+                if card_id is not None:
+                    self._execute_sql(cursor, "SELECT 1 FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
+                    if not cursor.fetchone():
+                        raise ValueError(f"卡券不存在或无权访问: {card_id}")
+
+                if rule_id is not None:
+                    self._execute_sql(cursor, "SELECT 1 FROM delivery_rules WHERE id = ? AND user_id = ?", (rule_id, user_id))
+                    if not cursor.fetchone():
+                        raise ValueError(f"发货规则不存在或无权访问: {rule_id}")
+
+                self._execute_sql(cursor, '''
+                INSERT INTO redeem_code_batches (
+                    user_id, name, keyword, card_id, rule_id, spec_name, spec_value,
+                    spec_name_2, spec_value_2, warning_threshold, enabled, description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id, clean_name, clean_keyword, card_id, rule_id,
+                    str(spec_name or '').strip() or None,
+                    str(spec_value or '').strip() or None,
+                    str(spec_name_2 or '').strip() or None,
+                    str(spec_value_2 or '').strip() or None,
+                    max(0, int(warning_threshold or 0)),
+                    bool(enabled),
+                    description,
+                ))
+                self.conn.commit()
+                return cursor.lastrowid
+            except Exception as e:
+                logger.error(f"创建兑换码批次失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def update_redeem_code_batch(self, batch_id: int, user_id: int, **updates):
+        allowed_fields = {
+            'name', 'keyword', 'card_id', 'rule_id', 'spec_name', 'spec_value',
+            'spec_name_2', 'spec_value_2', 'warning_threshold', 'enabled', 'description'
+        }
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                fields = []
+                params = []
+                for field, value in updates.items():
+                    if field not in allowed_fields:
+                        continue
+                    if field in {'name', 'keyword'} and not str(value or '').strip():
+                        raise ValueError("批次名称和商品关键字不能为空")
+                    if field == 'warning_threshold':
+                        value = max(0, int(value or 0))
+                    fields.append(f"{field} = ?")
+                    params.append(value)
+
+                if not fields:
+                    return True
+
+                fields.append("updated_at = CURRENT_TIMESTAMP")
+                params.extend([batch_id, user_id])
+                self._execute_sql(cursor, f'''
+                UPDATE redeem_code_batches
+                SET {', '.join(fields)}
+                WHERE id = ? AND user_id = ?
+                ''', params)
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新兑换码批次失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def get_redeem_code_batch_by_id(self, batch_id: int, user_id: int = None):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                params = [batch_id]
+                user_filter = ""
+                if user_id is not None:
+                    user_filter = " AND b.user_id = ?"
+                    params.append(user_id)
+                self._execute_sql(cursor, f'''
+                SELECT b.id, b.user_id, b.name, b.keyword, b.card_id, b.rule_id,
+                       b.spec_name, b.spec_value, b.spec_name_2, b.spec_value_2,
+                       b.warning_threshold, b.enabled, b.description, b.created_at, b.updated_at
+                FROM redeem_code_batches b
+                WHERE b.id = ?{user_filter}
+                ''', params)
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                keys = [
+                    'id', 'user_id', 'name', 'keyword', 'card_id', 'rule_id',
+                    'spec_name', 'spec_value', 'spec_name_2', 'spec_value_2',
+                    'warning_threshold', 'enabled', 'description', 'created_at', 'updated_at'
+                ]
+                data = dict(zip(keys, row))
+                data['enabled'] = bool(data.get('enabled'))
+                return data
+            except Exception as e:
+                logger.error(f"获取兑换码批次失败: {e}")
+                return None
+
+    def _build_redeem_batch_stats_sql(self, where_sql: str = ""):
+        return f'''
+            SELECT b.id, b.user_id, b.name, b.keyword, b.card_id, b.rule_id,
+                   b.spec_name, b.spec_value, b.spec_name_2, b.spec_value_2,
+                   b.warning_threshold, b.enabled, b.description, b.created_at, b.updated_at,
+                   COUNT(c.id) AS total_count,
+                   SUM(CASE WHEN c.status = 'available' THEN 1 ELSE 0 END) AS available_count,
+                   SUM(CASE WHEN c.status = 'reserved' THEN 1 ELSE 0 END) AS reserved_count,
+                   SUM(CASE WHEN c.status = 'sent' THEN 1 ELSE 0 END) AS sent_count,
+                   SUM(CASE WHEN c.status = 'consumed' THEN 1 ELSE 0 END) AS consumed_count,
+                   SUM(CASE WHEN c.released_at IS NOT NULL OR c.status IN ('released', 'expired') THEN 1 ELSE 0 END) AS released_count
+            FROM redeem_code_batches b
+            LEFT JOIN redeem_codes c ON c.batch_id = b.id
+            {where_sql}
+            GROUP BY b.id
+        '''
+
+    def _format_redeem_batch_row(self, row):
+        keys = [
+            'id', 'user_id', 'name', 'keyword', 'card_id', 'rule_id',
+            'spec_name', 'spec_value', 'spec_name_2', 'spec_value_2',
+            'warning_threshold', 'enabled', 'description', 'created_at', 'updated_at',
+            'total_count', 'available_count', 'reserved_count', 'sent_count',
+            'consumed_count', 'released_count'
+        ]
+        data = dict(zip(keys, row))
+        for key in ('total_count', 'available_count', 'reserved_count', 'sent_count', 'consumed_count', 'released_count'):
+            data[key] = int(data.get(key) or 0)
+        data['enabled'] = bool(data.get('enabled'))
+        data['low_stock'] = data['enabled'] and data['available_count'] <= int(data.get('warning_threshold') or 0)
+        return data
+
+    def get_redeem_code_batches(self, user_id: int):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    self._build_redeem_batch_stats_sql("WHERE b.user_id = ?") + " ORDER BY b.created_at DESC, b.id DESC",
+                    (user_id,)
+                )
+                return [self._format_redeem_batch_row(row) for row in cursor.fetchall()]
+            except Exception as e:
+                logger.error(f"获取兑换码批次列表失败: {e}")
+                return []
+
+    def import_redeem_codes(self, batch_id: int, user_id: int, raw_codes: str):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                batch = self.get_redeem_code_batch_by_id(batch_id, user_id)
+                if not batch:
+                    raise ValueError("兑换码批次不存在或无权访问")
+
+                seen = set()
+                normalized_codes = []
+                duplicate_in_upload = 0
+                for line in str(raw_codes or '').splitlines():
+                    code = line.strip()
+                    if not code:
+                        continue
+                    code_hash = self._hash_redeem_code(code)
+                    if code_hash in seen:
+                        duplicate_in_upload += 1
+                        continue
+                    seen.add(code_hash)
+                    normalized_codes.append((code, code_hash))
+
+                inserted = 0
+                duplicate_in_batch = 0
+                duplicate_global = 0
+                for code, code_hash in normalized_codes:
+                    self._execute_sql(cursor, "SELECT batch_id FROM redeem_codes WHERE code_hash = ? LIMIT 1", (code_hash,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        if int(existing[0]) == int(batch_id):
+                            duplicate_in_batch += 1
+                        else:
+                            duplicate_global += 1
+                        continue
+
+                    self._execute_sql(cursor, '''
+                    INSERT INTO redeem_codes (
+                        batch_id, user_id, code_hash, code_cipher, code_preview, status
+                    ) VALUES (?, ?, ?, ?, ?, 'available')
+                    ''', (batch_id, user_id, code_hash, self._encrypt_secret(code), self._mask_redeem_code(code)))
+                    inserted += 1
+
+                self.conn.commit()
+                return {
+                    'inserted': inserted,
+                    'duplicate_in_upload': duplicate_in_upload,
+                    'duplicate_in_batch': duplicate_in_batch,
+                    'duplicate_global': duplicate_global,
+                    'total_input': len(normalized_codes) + duplicate_in_upload,
+                }
+            except Exception as e:
+                logger.error(f"导入兑换码失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def get_redeem_codes(self, user_id: int, batch_id: int = None, status: str = None,
+                         order_id: str = None, buyer_id: str = None, limit: int = 200):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                where = ["c.user_id = ?"]
+                params = [user_id]
+                if batch_id:
+                    where.append("c.batch_id = ?")
+                    params.append(batch_id)
+                if status:
+                    if status == 'released':
+                        where.append("c.released_at IS NOT NULL")
+                    else:
+                        where.append("c.status = ?")
+                        params.append(status)
+                if order_id:
+                    where.append("c.order_id LIKE ?")
+                    params.append(f"%{order_id}%")
+                if buyer_id:
+                    where.append("(c.buyer_id LIKE ? OR c.buyer_nick LIKE ?)")
+                    params.extend([f"%{buyer_id}%", f"%{buyer_id}%"])
+                safe_limit = max(1, min(int(limit or 200), 500))
+                params.append(safe_limit)
+                cursor.execute(f'''
+                SELECT c.id, c.batch_id, b.name AS batch_name, c.code_hash, c.code_preview,
+                       c.status, c.order_id, c.cookie_id, c.item_id, c.buyer_id, c.buyer_nick,
+                       c.unit_index, c.last_error, c.created_at, c.updated_at, c.reserved_at,
+                       c.sent_at, c.consumed_at, c.released_at
+                FROM redeem_codes c
+                LEFT JOIN redeem_code_batches b ON b.id = c.batch_id
+                WHERE {' AND '.join(where)}
+                ORDER BY datetime(c.updated_at) DESC, c.id DESC
+                LIMIT ?
+                ''', params)
+                keys = [
+                    'id', 'batch_id', 'batch_name', 'code_hash', 'code_preview', 'status',
+                    'order_id', 'cookie_id', 'item_id', 'buyer_id', 'buyer_nick', 'unit_index',
+                    'last_error', 'created_at', 'updated_at', 'reserved_at', 'sent_at',
+                    'consumed_at', 'released_at'
+                ]
+                return [dict(zip(keys, row)) for row in cursor.fetchall()]
+            except Exception as e:
+                logger.error(f"查询兑换码明细失败: {e}")
+                return []
+
+    def get_redeem_code_stats(self, user_id: int):
+        batches = self.get_redeem_code_batches(user_id)
+        low_stock_batches = [batch for batch in batches if batch.get('low_stock')]
+        today_sent = 0
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT COUNT(*)
+                FROM redeem_codes
+                WHERE user_id = ? AND sent_at IS NOT NULL AND date(sent_at) = date('now', 'localtime')
+                ''', (user_id,))
+                row = cursor.fetchone()
+                today_sent = int(row[0] or 0) if row else 0
+            except Exception as e:
+                logger.error(f"获取兑换码今日发放统计失败: {e}")
+        return {
+            'total_count': sum(batch['total_count'] for batch in batches),
+            'available_count': sum(batch['available_count'] for batch in batches),
+            'reserved_count': sum(batch['reserved_count'] for batch in batches),
+            'sent_count': sum(batch['sent_count'] for batch in batches),
+            'consumed_count': sum(batch['consumed_count'] for batch in batches),
+            'today_sent_count': today_sent,
+            'low_stock_count': len(low_stock_batches),
+            'low_stock_batches': low_stock_batches,
+        }
+
+    def find_redeem_code_batches_for_rule(self, rule: Dict[str, Any], user_id: int = None):
+        if not rule:
+            return []
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                where = ["b.enabled = 1"]
+                params = []
+                if user_id is not None:
+                    where.append("b.user_id = ?")
+                    params.append(user_id)
+                link_clauses = []
+                for column, value in (('rule_id', rule.get('id')), ('card_id', rule.get('card_id')), ('keyword', rule.get('keyword'))):
+                    if value not in (None, ''):
+                        link_clauses.append(f"b.{column} = ?")
+                        params.append(value)
+                if not link_clauses:
+                    return []
+                where.append("(" + " OR ".join(link_clauses) + ")")
+                for column, value in (
+                    ('spec_name', rule.get('spec_name')),
+                    ('spec_value', rule.get('spec_value')),
+                    ('spec_name_2', rule.get('spec_name_2')),
+                    ('spec_value_2', rule.get('spec_value_2')),
+                ):
+                    where.append(f"REPLACE(REPLACE(LOWER(TRIM(COALESCE(b.{column}, ''))), ' ', ''), '　', '') = ?")
+                    params.append(self._normalize_redeem_spec_part(value))
+                cursor.execute(
+                    self._build_redeem_batch_stats_sql("WHERE " + " AND ".join(where)) + " ORDER BY b.id ASC",
+                    params
+                )
+                return [self._format_redeem_batch_row(row) for row in cursor.fetchall()]
+            except Exception as e:
+                logger.error(f"匹配兑换码批次失败: {e}")
+                return []
+
+    def has_sufficient_redeem_codes_for_rule(self, rule: Dict[str, Any], quantity: int = 1, user_id: int = None):
+        batches = self.find_redeem_code_batches_for_rule(rule, user_id=user_id)
+        if not batches:
+            return {'uses_redeem_codes': False, 'ok': True, 'available_count': 0, 'batch_count': 0}
+        if len(batches) != 1:
+            return {'uses_redeem_codes': True, 'ok': False, 'available_count': 0, 'batch_count': len(batches), 'error': '兑换码批次匹配不唯一'}
+        required = max(1, int(quantity or 1))
+        available_count = int(batches[0].get('available_count') or 0)
+        return {
+            'uses_redeem_codes': True,
+            'ok': available_count >= required,
+            'available_count': available_count,
+            'required_count': required,
+            'batch_count': 1,
+            'batch': batches[0],
+            'error': None if available_count >= required else '兑换码库存不足',
+        }
+
+    def reserve_redeem_codes_for_rule(self, rule: Dict[str, Any], order_id: str, unit_indexes: List[int],
+                                      cookie_id: str = None, item_id: str = None,
+                                      buyer_id: str = None, buyer_nick: str = None,
+                                      user_id: int = None, ttl_minutes: int = 30):
+        clean_unit_indexes = []
+        for unit_index in unit_indexes or []:
+            try:
+                safe_unit_index = max(1, int(unit_index))
+            except (TypeError, ValueError):
+                continue
+            if safe_unit_index not in clean_unit_indexes:
+                clean_unit_indexes.append(safe_unit_index)
+
+        if not clean_unit_indexes:
+            return {
+                'uses_redeem_codes': False,
+                'ok': True,
+                'reservations': [],
+                'required_count': 0,
+                'available_count': 0,
+            }
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                batches = self.find_redeem_code_batches_for_rule(rule, user_id=user_id)
+                if not batches:
+                    return {
+                        'uses_redeem_codes': False,
+                        'ok': True,
+                        'reservations': [],
+                        'required_count': len(clean_unit_indexes),
+                        'available_count': 0,
+                    }
+                if len(batches) != 1:
+                    raise ValueError(f"兑换码批次匹配不唯一: {len(batches)}")
+
+                batch = batches[0]
+                batch_id = batch['id']
+                reservations = []
+                missing_unit_indexes = []
+
+                for unit_index in clean_unit_indexes:
+                    self._execute_sql(cursor, '''
+                    SELECT id, batch_id, code_cipher, status, order_id, unit_index
+                    FROM redeem_codes
+                    WHERE batch_id = ? AND order_id = ? AND unit_index = ?
+                      AND status IN ('reserved', 'sent', 'consumed')
+                    ORDER BY id DESC LIMIT 1
+                    ''', (batch_id, order_id, unit_index))
+                    existing = cursor.fetchone()
+                    if existing:
+                        reservations.append({
+                            'id': existing[0],
+                            'batch_id': existing[1],
+                            'reserved_content': self._decrypt_secret(existing[2]),
+                            'status': existing[3],
+                            'order_id': existing[4],
+                            'unit_index': existing[5],
+                            'batch': batch,
+                            'source': 'redeem_code',
+                        })
+                    else:
+                        missing_unit_indexes.append(unit_index)
+
+                required_new_count = len(missing_unit_indexes)
+                if required_new_count:
+                    self._execute_sql(cursor, '''
+                    SELECT id, code_cipher
+                    FROM redeem_codes
+                    WHERE batch_id = ? AND status = 'available'
+                    ORDER BY id ASC
+                    LIMIT ?
+                    ''', (batch_id, required_new_count))
+                    available_rows = cursor.fetchall()
+                    if len(available_rows) < required_new_count:
+                        self.conn.rollback()
+                        return {
+                            'uses_redeem_codes': True,
+                            'ok': False,
+                            'reservations': [],
+                            'required_count': len(clean_unit_indexes),
+                            'available_count': len(available_rows),
+                            'batch_count': 1,
+                            'batch': batch,
+                            'error': '兑换码库存不足',
+                        }
+
+                    for unit_index, (code_id, code_cipher) in zip(missing_unit_indexes, available_rows):
+                        self._execute_sql(cursor, '''
+                        UPDATE redeem_codes
+                        SET status = 'reserved',
+                            order_id = ?, cookie_id = ?, item_id = ?, buyer_id = ?, buyer_nick = ?,
+                            unit_index = ?, reserved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP,
+                            expires_at = datetime('now', ?), last_error = NULL
+                        WHERE id = ? AND status = 'available'
+                        ''', (order_id, cookie_id, item_id, buyer_id, buyer_nick, unit_index, f'+{int(ttl_minutes)} minutes', code_id))
+                        if cursor.rowcount != 1:
+                            self.conn.rollback()
+                            return {
+                                'uses_redeem_codes': True,
+                                'ok': False,
+                                'reservations': [],
+                                'required_count': len(clean_unit_indexes),
+                                'available_count': len(available_rows),
+                                'batch_count': 1,
+                                'batch': batch,
+                                'error': '兑换码预占冲突',
+                            }
+                        reservations.append({
+                            'id': code_id,
+                            'batch_id': batch_id,
+                            'reserved_content': self._decrypt_secret(code_cipher),
+                            'status': 'reserved',
+                            'order_id': order_id,
+                            'unit_index': unit_index,
+                            'batch': batch,
+                            'source': 'redeem_code',
+                        })
+
+                self.conn.commit()
+                reservations.sort(key=lambda item: int(item.get('unit_index') or 0))
+                return {
+                    'uses_redeem_codes': True,
+                    'ok': True,
+                    'reservations': reservations,
+                    'required_count': len(clean_unit_indexes),
+                    'available_count': int(batch.get('available_count') or 0),
+                    'batch_count': 1,
+                    'batch': batch,
+                }
+            except Exception as e:
+                logger.error(f"批量预占兑换码失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def reserve_redeem_code_for_rule(self, rule: Dict[str, Any], order_id: str, unit_index: int = 1,
+                                     cookie_id: str = None, item_id: str = None,
+                                     buyer_id: str = None, buyer_nick: str = None,
+                                     user_id: int = None, ttl_minutes: int = 30):
+        result = self.reserve_redeem_codes_for_rule(
+            rule=rule,
+            order_id=order_id,
+            unit_indexes=[unit_index],
+            cookie_id=cookie_id,
+            item_id=item_id,
+            buyer_id=buyer_id,
+            buyer_nick=buyer_nick,
+            user_id=user_id,
+            ttl_minutes=ttl_minutes,
+        )
+        if not result.get('uses_redeem_codes'):
+            return None
+        if not result.get('ok'):
+            raise ValueError(result.get('error') or '兑换码预占失败')
+        reservations = result.get('reservations') or []
+        return reservations[0] if reservations else None
+
+    def mark_redeem_code_sent(self, code_id: int):
+        return self._transition_redeem_code_status(code_id, {'reserved', 'sent', 'consumed'}, 'sent', 'sent_at')
+
+    def finalize_redeem_code(self, code_id: int):
+        return self._transition_redeem_code_status(code_id, {'reserved', 'sent', 'consumed'}, 'consumed', 'consumed_at', return_detail=True)
+
+    def release_redeem_code(self, code_id: int, error: str = None, expired: bool = False):
+        target = 'expired' if expired else 'available'
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT status FROM redeem_codes WHERE id = ?", (code_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                status = row[0]
+                if status in {'sent', 'consumed'}:
+                    return False
+                if status in {'released', 'expired', 'available'}:
+                    return True
+                self._execute_sql(cursor, '''
+                UPDATE redeem_codes
+                SET status = ?, order_id = NULL, cookie_id = NULL, item_id = NULL,
+                    buyer_id = NULL, buyer_nick = NULL, unit_index = NULL,
+                    last_error = ?, released_at = CURRENT_TIMESTAMP,
+                    expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (target, error, code_id))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"释放兑换码失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def _transition_redeem_code_status(self, code_id: int, allowed: set, target: str,
+                                       timestamp_field: str, return_detail: bool = False):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT status FROM redeem_codes WHERE id = ?", (code_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return {'success': False, 'already_finalized': False} if return_detail else False
+                current_status = row[0]
+                if current_status == target:
+                    return {'success': True, 'already_finalized': True} if return_detail else True
+                if current_status not in allowed:
+                    return {'success': False, 'already_finalized': False} if return_detail else False
+                self._execute_sql(cursor, f'''
+                UPDATE redeem_codes
+                SET status = ?, {timestamp_field} = CURRENT_TIMESTAMP,
+                    expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (target, code_id))
+                self.conn.commit()
+                return {'success': True, 'already_finalized': False} if return_detail else True
+            except Exception as e:
+                logger.error(f"兑换码状态流转失败: {e}")
+                self.conn.rollback()
+                return {'success': False, 'already_finalized': False} if return_detail else False
 
     def peek_batch_data(self, card_id: int, line_index: int = 0):
         """预览批量数据指定位置的记录，不执行消费。"""

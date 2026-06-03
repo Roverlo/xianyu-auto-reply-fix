@@ -131,6 +131,9 @@ function showSection(sectionName) {
     case 'cards':           // 【卡券管理菜单】
         loadCards();
         break;
+    case 'redeem-codes':
+        loadRedeemCodes();
+        break;
     case 'auto-delivery':   // 【自动发货菜单】
         loadDeliveryRules();
         break;
@@ -7789,6 +7792,258 @@ async function saveAccountNotification() {
 }
 
 // ================================
+let redeemCodeBatchesCache = [];
+
+async function loadRedeemCodes() {
+    await Promise.all([
+        loadRedeemCodeStats(),
+        loadRedeemCodeBatches(),
+        loadRedeemCodeRecords()
+    ]);
+}
+
+async function loadRedeemCodeStats() {
+    try {
+        const response = await fetch(`${apiBase}/redeem-code-stats`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        if (!response.ok) throw new Error('stats failed');
+        const stats = await response.json();
+        document.getElementById('redeemTotalCount').textContent = stats.total_count || 0;
+        document.getElementById('redeemAvailableCount').textContent = stats.available_count || 0;
+        document.getElementById('redeemTodaySentCount').textContent = stats.today_sent_count || 0;
+        document.getElementById('redeemLowStockCount').textContent = stats.low_stock_count || 0;
+    } catch (error) {
+        console.error('加载兑换码统计失败:', error);
+        showToast('加载兑换码统计失败', 'danger');
+    }
+}
+
+async function loadRedeemCodeBatches() {
+    try {
+        const response = await fetch(`${apiBase}/redeem-code-batches`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        if (!response.ok) throw new Error('batches failed');
+        redeemCodeBatchesCache = await response.json();
+        renderRedeemCodeBatches(redeemCodeBatchesCache);
+        updateRedeemBatchSelects(redeemCodeBatchesCache);
+    } catch (error) {
+        console.error('加载兑换码批次失败:', error);
+        showToast('加载兑换码批次失败', 'danger');
+    }
+}
+
+function formatRedeemSpec(batch) {
+    const first = [batch.spec_name, batch.spec_value].filter(Boolean).join(':');
+    const second = [batch.spec_name_2, batch.spec_value_2].filter(Boolean).join(':');
+    return [first, second].filter(Boolean).join(' / ') || '<span class="text-muted">无规格</span>';
+}
+
+function renderRedeemCodeBatches(batches) {
+    const tbody = document.getElementById('redeemBatchesTableBody');
+    if (!tbody) return;
+    if (!batches || batches.length === 0) {
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="6" class="text-center py-4 text-muted">
+                    <i class="bi bi-upc-scan fs-1 d-block mb-3"></i>
+                    <h5>暂无兑换码批次</h5>
+                </td>
+            </tr>
+        `;
+        return;
+    }
+    tbody.innerHTML = batches.map(batch => {
+        const stockBadge = batch.low_stock
+            ? `<span class="badge bg-warning text-dark">${batch.available_count}</span>`
+            : `<span class="badge bg-success">${batch.available_count}</span>`;
+        const statusBadge = batch.enabled
+            ? '<span class="badge bg-success">启用</span>'
+            : '<span class="badge bg-secondary">停用</span>';
+        return `
+            <tr>
+                <td>
+                    <div class="fw-semibold">${escapeHtml(batch.name || '')}</div>
+                    <small class="text-muted">ID ${batch.id}</small>
+                </td>
+                <td>${escapeHtml(batch.keyword || '')}</td>
+                <td>${formatRedeemSpec(batch)}</td>
+                <td>
+                    未发 ${stockBadge}
+                    <div class="small text-muted">总 ${batch.total_count || 0} / 预占 ${batch.reserved_count || 0} / 已发 ${batch.sent_count || 0} / 已消耗 ${batch.consumed_count || 0}</div>
+                </td>
+                <td>${statusBadge}</td>
+                <td>
+                    <button class="btn btn-outline-primary btn-sm" onclick="selectRedeemBatchForImport(${batch.id})">
+                        <i class="bi bi-upload"></i>
+                    </button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function updateRedeemBatchSelects(batches) {
+    const importSelect = document.getElementById('redeemImportBatchSelect');
+    if (importSelect) {
+        importSelect.innerHTML = '<option value="">请选择批次</option>' + (batches || []).map(batch =>
+            `<option value="${batch.id}">${escapeHtml(batch.name || '')} (${batch.available_count || 0}/${batch.total_count || 0})</option>`
+        ).join('');
+    }
+}
+
+async function loadRedeemBatchReferenceSelects() {
+    const [cardsResponse, rulesResponse] = await Promise.all([
+        fetch(`${apiBase}/cards`, { headers: { 'Authorization': `Bearer ${authToken}` } }),
+        fetch(`${apiBase}/delivery-rules`, { headers: { 'Authorization': `Bearer ${authToken}` } })
+    ]);
+    const cards = cardsResponse.ok ? await cardsResponse.json() : [];
+    const rules = rulesResponse.ok ? await rulesResponse.json() : [];
+    const cardSelect = document.getElementById('redeemBatchCardId');
+    const ruleSelect = document.getElementById('redeemBatchRuleId');
+    if (cardSelect) {
+        cardSelect.innerHTML = '<option value="">不绑定</option>' + cards.map(card =>
+            `<option value="${card.id}">${escapeHtml(card.name || '')}${card.type ? ` (${escapeHtml(card.type)})` : ''}</option>`
+        ).join('');
+    }
+    if (ruleSelect) {
+        ruleSelect.innerHTML = '<option value="">不绑定</option>' + rules.map(rule =>
+            `<option value="${rule.id}">${escapeHtml(rule.keyword || '')} -> ${escapeHtml(rule.card_name || '')}</option>`
+        ).join('');
+    }
+}
+
+async function showRedeemBatchModal() {
+    document.getElementById('redeemBatchForm')?.reset();
+    document.getElementById('redeemWarningThreshold').value = '5';
+    document.getElementById('redeemBatchEnabled').checked = true;
+    try {
+        await loadRedeemBatchReferenceSelects();
+    } catch (error) {
+        console.error('加载兑换码绑定选项失败:', error);
+    }
+    new bootstrap.Modal(document.getElementById('redeemBatchModal')).show();
+}
+
+async function saveRedeemBatch() {
+    const name = document.getElementById('redeemBatchName').value.trim();
+    const keyword = document.getElementById('redeemBatchKeyword').value.trim();
+    if (!name || !keyword) {
+        showToast('请填写批次名称和商品关键字', 'warning');
+        return;
+    }
+    const payload = {
+        name,
+        keyword,
+        card_id: document.getElementById('redeemBatchCardId').value || null,
+        rule_id: document.getElementById('redeemBatchRuleId').value || null,
+        spec_name: document.getElementById('redeemSpecName').value.trim() || null,
+        spec_value: document.getElementById('redeemSpecValue').value.trim() || null,
+        spec_name_2: document.getElementById('redeemSpecName2').value.trim() || null,
+        spec_value_2: document.getElementById('redeemSpecValue2').value.trim() || null,
+        warning_threshold: parseInt(document.getElementById('redeemWarningThreshold').value, 10) || 0,
+        enabled: document.getElementById('redeemBatchEnabled').checked,
+        description: document.getElementById('redeemBatchDescription').value.trim() || null
+    };
+    try {
+        const response = await fetch(`${apiBase}/redeem-code-batches`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || '创建失败');
+        }
+        bootstrap.Modal.getInstance(document.getElementById('redeemBatchModal')).hide();
+        showToast('兑换码批次创建成功', 'success');
+        await loadRedeemCodes();
+    } catch (error) {
+        console.error('创建兑换码批次失败:', error);
+        showToast(`创建失败: ${error.message}`, 'danger');
+    }
+}
+
+function selectRedeemBatchForImport(batchId) {
+    const select = document.getElementById('redeemImportBatchSelect');
+    if (select) select.value = String(batchId);
+    document.getElementById('redeemImportCodes')?.focus();
+}
+
+async function importRedeemCodes() {
+    const batchId = document.getElementById('redeemImportBatchSelect').value;
+    const codes = document.getElementById('redeemImportCodes').value;
+    if (!batchId) {
+        showToast('请选择要导入的批次', 'warning');
+        return;
+    }
+    if (!codes.trim()) {
+        showToast('请输入兑换码', 'warning');
+        return;
+    }
+    try {
+        const response = await fetch(`${apiBase}/redeem-code-batches/${batchId}/import`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ codes })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || '导入失败');
+        document.getElementById('redeemImportCodes').value = '';
+        showToast(`导入完成：新增 ${result.inserted || 0}，重复 ${((result.duplicate_in_upload || 0) + (result.duplicate_in_batch || 0) + (result.duplicate_global || 0))}`, 'success');
+        await loadRedeemCodes();
+    } catch (error) {
+        console.error('导入兑换码失败:', error);
+        showToast(`导入失败: ${error.message}`, 'danger');
+    }
+}
+
+async function loadRedeemCodeRecords() {
+    const params = new URLSearchParams();
+    const status = document.getElementById('redeemStatusFilter')?.value;
+    const orderId = document.getElementById('redeemOrderFilter')?.value.trim();
+    if (status) params.set('status', status);
+    if (orderId) params.set('order_id', orderId);
+    params.set('limit', '100');
+    try {
+        const response = await fetch(`${apiBase}/redeem-codes?${params.toString()}`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        if (!response.ok) throw new Error('records failed');
+        const data = await response.json();
+        renderRedeemCodeRecords(data.codes || []);
+    } catch (error) {
+        console.error('加载兑换码记录失败:', error);
+        showToast('加载兑换码记录失败', 'danger');
+    }
+}
+
+function renderRedeemCodeRecords(records) {
+    const tbody = document.getElementById('redeemCodesTableBody');
+    if (!tbody) return;
+    if (!records || records.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-4">暂无记录</td></tr>';
+        return;
+    }
+    tbody.innerHTML = records.map(record => `
+        <tr>
+            <td><code>${escapeHtml(record.code_preview || '')}</code></td>
+            <td>${escapeHtml(record.batch_name || '')}</td>
+            <td><span class="badge bg-secondary">${escapeHtml(record.status || '')}</span></td>
+            <td>${escapeHtml(record.order_id || '-')}</td>
+            <td>${escapeHtml(record.buyer_nick || record.buyer_id || '-')}</td>
+            <td>${escapeHtml(record.sent_at || record.reserved_at || record.updated_at || '-')}</td>
+        </tr>
+    `).join('');
+}
+
 // 【卡券管理菜单】相关功能
 // ================================
 
