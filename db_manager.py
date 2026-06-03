@@ -4664,15 +4664,23 @@ Cookie数量: {cookie_count}
                     if not spec_name or not spec_value:
                         raise ValueError("多规格卡券必须提供规格名称和规格值")
 
-                    # 检查唯一性：卡券名称+规格名称+规格值
+                    # 检查唯一性：卡券名称+规格1+规格2
                     cursor = self.conn.cursor()
                     cursor.execute('''
                     SELECT COUNT(*) FROM cards
-                    WHERE name = ? AND spec_name = ? AND spec_value = ? AND user_id = ?
-                    ''', (name, spec_name, spec_value, user_id))
+                    WHERE name = ?
+                      AND TRIM(COALESCE(spec_name, '')) = TRIM(COALESCE(?, ''))
+                      AND TRIM(COALESCE(spec_value, '')) = TRIM(COALESCE(?, ''))
+                      AND TRIM(COALESCE(spec_name_2, '')) = TRIM(COALESCE(?, ''))
+                      AND TRIM(COALESCE(spec_value_2, '')) = TRIM(COALESCE(?, ''))
+                      AND user_id = ?
+                    ''', (name, spec_name, spec_value, spec_name_2, spec_value_2, user_id))
 
                     if cursor.fetchone()[0] > 0:
-                        raise ValueError(f"卡券已存在：{name} - {spec_name}:{spec_value}")
+                        spec_label = f"{spec_name}:{spec_value}"
+                        if spec_name_2 or spec_value_2:
+                            spec_label += f" / {spec_name_2 or ''}:{spec_value_2 or ''}"
+                        raise ValueError(f"卡券已存在：{name} - {spec_label}")
                 else:
                     # 检查唯一性：仅卡券名称
                     cursor = self.conn.cursor()

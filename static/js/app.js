@@ -132,7 +132,11 @@ function showSection(sectionName) {
         loadCards();
         break;
     case 'redeem-codes':
-        loadRedeemCodes();
+        loadRedeemCodeBatches();
+        break;
+    case 'redeem-records':
+        loadRedeemRecordFilters();
+        loadRedeemCodeRecords();
         break;
     case 'auto-delivery':   // 【自动发货菜单】
         loadDeliveryRules();
@@ -7800,10 +7804,7 @@ let cardsCache = [];
 const REDEEM_CONFIG_DEFAULT_MESSAGE = '您好，您的兑换码是：\n{DELIVERY_CONTENT}\n\n请尽快使用，感谢购买。';
 
 async function loadRedeemCodes() {
-    await Promise.all([
-        loadRedeemCodeBatches(),
-        loadRedeemCodeRecords()
-    ]);
+    await loadRedeemCodeBatches();
 }
 
 async function loadRedeemCodeBatches() {
@@ -7947,8 +7948,8 @@ function renderRedeemCodeBatches(batches) {
                 </td>
                 <td>${statusBadge}</td>
                 <td>
-                    <button class="btn btn-outline-primary btn-sm" onclick="selectRedeemBatchForImport(${batch.id})">
-                        <i class="bi bi-upload"></i>
+                    <button class="btn btn-outline-primary btn-sm" onclick="showRedeemImportModal(${batch.id})">
+                        <i class="bi bi-upload me-1"></i>导入
                     </button>
                 </td>
             </tr>
@@ -7957,15 +7958,32 @@ function renderRedeemCodeBatches(batches) {
 }
 
 function updateRedeemBatchSelects(batches) {
-        const importSelect = document.getElementById('redeemImportBatchSelect');
-        const cardBindSelect = document.getElementById('cardRedeemBatchSelect');
-    if (importSelect) {
-        importSelect.innerHTML = '<option value="">请选择兑换码池</option>' + (batches || []).map(batch =>
-            `<option value="${batch.id}">${escapeHtml(batch.name || '')} (${batch.available_count || 0}/${batch.total_count || 0})</option>`
-        ).join('');
-    }
+    const cardBindSelect = document.getElementById('cardRedeemBatchSelect');
+    const recordBatchFilter = document.getElementById('redeemRecordBatchFilter');
     if (cardBindSelect) {
         updateCardRedeemBatchSelectOptions();
+    }
+    if (recordBatchFilter) {
+        updateRedeemRecordBatchFilterOptions(recordBatchFilter.value);
+    }
+}
+
+function updateRedeemRecordBatchFilterOptions(selectedBatchId = '') {
+    const select = document.getElementById('redeemRecordBatchFilter');
+    if (!select) return;
+    select.innerHTML = '<option value="">全部兑换码池</option>' + (redeemCodeBatchesCache || []).map(batch =>
+        `<option value="${batch.id}">${escapeHtml(batch.name || '')}</option>`
+    ).join('');
+    if (selectedBatchId) {
+        select.value = String(selectedBatchId);
+    }
+}
+
+async function loadRedeemRecordFilters() {
+    if (!redeemCodeBatchesCache.length) {
+        await loadRedeemCodeBatches();
+    } else {
+        updateRedeemRecordBatchFilterOptions(document.getElementById('redeemRecordBatchFilter')?.value || '');
     }
 }
 
@@ -8280,7 +8298,7 @@ async function saveRedeemConfigWizard() {
         bootstrap.Modal.getInstance(document.getElementById('redeemConfigWizardModal')).hide();
         const importResult = result.import_result || {};
         showToast(`配置已创建：批次 ${result.batch_id}，导入 ${importResult.inserted || 0} 个兑换码`, 'success');
-        await loadRedeemCodes();
+        await loadRedeemCodeBatches();
     } catch (error) {
         console.error('创建兑换码发货配置失败:', error);
         showToast(`创建失败: ${error.message}`, 'danger');
@@ -8327,7 +8345,7 @@ async function saveRedeemBatch() {
         }
         bootstrap.Modal.getInstance(document.getElementById('redeemBatchModal')).hide();
         showToast('兑换码池创建成功，请在卡券管理里关联到对应规格', 'success');
-        await loadRedeemCodes();
+        await loadRedeemCodeBatches();
     } catch (error) {
         console.error('创建兑换码池失败:', error);
         showToast(`创建失败: ${error.message}`, 'danger');
@@ -8398,7 +8416,7 @@ async function saveCardRedeemBatchBinding() {
         }
         bootstrap.Modal.getInstance(document.getElementById('cardRedeemBatchModal')).hide();
         showToast('兑换码池已关联到卡券规格', 'success');
-        await Promise.all([loadCards(), loadRedeemCodes(), loadDeliveryRules()]);
+        await Promise.all([loadCards(), loadRedeemCodeBatches(), loadDeliveryRules()]);
     } catch (error) {
         console.error('关联兑换码池失败:', error);
         showToast(`关联失败: ${error.message}`, 'danger');
@@ -8422,21 +8440,29 @@ async function unbindCardRedeemBatch() {
         }
         bootstrap.Modal.getInstance(document.getElementById('cardRedeemBatchModal')).hide();
         showToast('兑换码池关联已解除', 'success');
-        await Promise.all([loadCards(), loadRedeemCodes(), loadDeliveryRules()]);
+        await Promise.all([loadCards(), loadRedeemCodeBatches(), loadDeliveryRules()]);
     } catch (error) {
         console.error('解除兑换码池关联失败:', error);
         showToast(`解除失败: ${error.message}`, 'danger');
     }
 }
 
-function selectRedeemBatchForImport(batchId) {
-    const select = document.getElementById('redeemImportBatchSelect');
-    if (select) select.value = String(batchId);
-    document.getElementById('redeemImportCodes')?.focus();
+function showRedeemImportModal(batchId) {
+    const batch = (redeemCodeBatchesCache || []).find(item => String(item.id) === String(batchId));
+    if (!batch) {
+        showToast('未找到兑换码池', 'warning');
+        return;
+    }
+    document.getElementById('redeemImportBatchId').value = batch.id;
+    document.getElementById('redeemImportBatchName').textContent = batch.name || `池 ${batch.id}`;
+    document.getElementById('redeemImportBatchStock').textContent = `可用 ${batch.available_count || 0} / 总 ${batch.total_count || 0}`;
+    document.getElementById('redeemImportCodes').value = '';
+    new bootstrap.Modal(document.getElementById('redeemImportModal')).show();
+    setTimeout(() => document.getElementById('redeemImportCodes')?.focus(), 150);
 }
 
 async function importRedeemCodes() {
-    const batchId = document.getElementById('redeemImportBatchSelect').value;
+    const batchId = document.getElementById('redeemImportBatchId').value;
     const codes = document.getElementById('redeemImportCodes').value;
     if (!batchId) {
         showToast('请选择要导入的批次', 'warning');
@@ -8458,8 +8484,9 @@ async function importRedeemCodes() {
         const result = await response.json();
         if (!response.ok) throw new Error(result.detail || '导入失败');
         document.getElementById('redeemImportCodes').value = '';
+        bootstrap.Modal.getInstance(document.getElementById('redeemImportModal'))?.hide();
         showToast(`导入完成：新增 ${result.inserted || 0}，重复 ${((result.duplicate_in_upload || 0) + (result.duplicate_in_batch || 0) + (result.duplicate_global || 0))}`, 'success');
-        await loadRedeemCodes();
+        await loadRedeemCodeBatches();
     } catch (error) {
         console.error('导入兑换码失败:', error);
         showToast(`导入失败: ${error.message}`, 'danger');
@@ -8468,8 +8495,10 @@ async function importRedeemCodes() {
 
 async function loadRedeemCodeRecords() {
     const params = new URLSearchParams();
+    const batchId = document.getElementById('redeemRecordBatchFilter')?.value;
     const status = document.getElementById('redeemStatusFilter')?.value;
     const orderId = document.getElementById('redeemOrderFilter')?.value.trim();
+    if (batchId) params.set('batch_id', batchId);
     if (status) params.set('status', status);
     if (orderId) params.set('order_id', orderId);
     params.set('limit', '100');
@@ -8793,6 +8822,18 @@ function toggleMultiSpecFields() {
     document.getElementById('multiSpecFields').style.display = isMultiSpec ? 'block' : 'none';
 }
 
+function parseSpecValueList(rawValue) {
+    const seen = new Set();
+    return String(rawValue || '')
+        .split(/[\n,，、;；]+/)
+        .map(value => value.trim())
+        .filter(value => {
+            if (!value || seen.has(value)) return false;
+            seen.add(value);
+            return true;
+        });
+}
+
 // 初始化卡券图片文件选择器
 function initCardImageFileSelector() {
     const fileInput = document.getElementById('cardImageFile');
@@ -9083,9 +9124,15 @@ function clearAddCardForm() {
 
 // 保存卡券
 async function saveCard() {
+    const saveButton = document.getElementById('saveCardBtn');
+    const originalButtonHtml = saveButton ? saveButton.innerHTML : '';
     try {
+    if (saveButton) {
+        saveButton.disabled = true;
+        saveButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中';
+    }
     const cardType = document.getElementById('cardType').value;
-    const cardName = document.getElementById('cardName').value;
+    const cardName = document.getElementById('cardName').value.trim();
 
     if (!cardType || !cardName) {
         showToast('请填写必填字段', 'warning');
@@ -9094,21 +9141,25 @@ async function saveCard() {
 
     // 检查多规格设置
     const isMultiSpec = document.getElementById('isMultiSpec').checked;
-    const specName = document.getElementById('specName').value;
-    const specValue = document.getElementById('specValue').value;
-    const specName2 = document.getElementById('specName2').value;
-    const specValue2 = document.getElementById('specValue2').value;
+    const specName = document.getElementById('specName').value.trim();
+    const specValues = parseSpecValueList(document.getElementById('specValue').value);
+    const specName2 = document.getElementById('specName2').value.trim();
+    const specValue2 = document.getElementById('specValue2').value.trim();
 
     // 调试日志
     console.log('[DEBUG] 创建卡券 - isMultiSpec:', isMultiSpec);
     console.log('[DEBUG] 创建卡券 - specName:', specName);
-    console.log('[DEBUG] 创建卡券 - specValue:', specValue);
+    console.log('[DEBUG] 创建卡券 - specValues:', specValues);
     console.log('[DEBUG] 创建卡券 - specName2:', specName2);
     console.log('[DEBUG] 创建卡券 - specValue2:', specValue2);
 
     // 验证多规格字段
-    if (isMultiSpec && (!specName || !specValue)) {
-        showToast('多规格卡券必须填写规格1名称和规格1值', 'warning');
+    if (isMultiSpec && (!specName || specValues.length === 0)) {
+        showToast('多规格卡券必须填写规格1名称和至少一个规格1值', 'warning');
+        return;
+    }
+    if (isMultiSpec && ((specName2 && !specValue2) || (!specName2 && specValue2))) {
+        showToast('规格2名称和规格2值需要同时填写', 'warning');
         return;
     }
 
@@ -9120,7 +9171,7 @@ async function saveCard() {
         enabled: true,
         is_multi_spec: isMultiSpec,
         spec_name: isMultiSpec ? specName : null,
-        spec_value: isMultiSpec ? specValue : null,
+        spec_value: isMultiSpec ? specValues[0] : null,
         spec_name_2: isMultiSpec ? specName2 : null,
         spec_value_2: isMultiSpec ? specValue2 : null
     };
@@ -9225,43 +9276,71 @@ async function saveCard() {
     // 获取"生成对应发货规则"开关状态
     const generateDeliveryRule = document.getElementById('generateDeliveryRule').checked;
     
-    const response = await fetch(`${apiBase}/cards`, {
+    const cardPayloads = isMultiSpec
+        ? specValues.map(specValue => ({ ...cardData, spec_value: specValue }))
+        : [cardData];
+
+    const results = [];
+    for (const payload of cardPayloads) {
+        const response = await fetch(`${apiBase}/cards`, {
         method: 'POST',
         headers: {
         'Authorization': `Bearer ${authToken}`,
         'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-            ...cardData,
+            ...payload,
             generate_delivery_rule: generateDeliveryRule
         })
     });
 
-    if (response.ok) {
-        showToast('卡券保存成功', 'success');
+        if (response.ok) {
+            const result = await response.json().catch(() => ({}));
+            results.push({ ok: true, specValue: payload.spec_value, result });
+        } else {
+            let errorMessage = '保存失败';
+            try {
+            const errorData = await response.json();
+            errorMessage = errorData.error || errorData.detail || errorMessage;
+            } catch (e) {
+            try {
+                const errorText = await response.text();
+                errorMessage = errorText || errorMessage;
+            } catch (e2) {
+                errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+            }
+            }
+            results.push({ ok: false, specValue: payload.spec_value, error: errorMessage });
+        }
+    }
+
+    const successCount = results.filter(item => item.ok).length;
+    const failedResults = results.filter(item => !item.ok);
+
+    if (successCount > 0) {
+        const message = isMultiSpec
+            ? `已创建 ${successCount} 张规格卡券${failedResults.length ? `，失败 ${failedResults.length} 张` : ''}`
+            : '卡券保存成功';
+        showToast(message, failedResults.length ? 'warning' : 'success');
         bootstrap.Modal.getInstance(document.getElementById('addCardModal')).hide();
         // 清空表单
         clearAddCardForm();
         loadCards();
+        if (failedResults.length) {
+            console.warn('部分规格卡券创建失败:', failedResults);
+        }
     } else {
-        let errorMessage = '保存失败';
-        try {
-        const errorData = await response.json();
-        errorMessage = errorData.error || errorData.detail || errorMessage;
-        } catch (e) {
-        // 如果不是JSON格式，尝试获取文本
-        try {
-            const errorText = await response.text();
-            errorMessage = errorText || errorMessage;
-        } catch (e2) {
-            errorMessage = `HTTP ${response.status}: ${response.statusText}`;
-        }
-        }
-        showToast(`保存失败: ${errorMessage}`, 'danger');
+        const firstError = failedResults[0]?.error || '保存失败';
+        showToast(`保存失败: ${firstError}`, 'danger');
     }
     } catch (error) {
     console.error('保存卡券失败:', error);
     showToast(`网络错误: ${error.message}`, 'danger');
+    } finally {
+    if (saveButton) {
+        saveButton.disabled = false;
+        saveButton.innerHTML = originalButtonHtml;
+    }
     }
 }
 // ================================

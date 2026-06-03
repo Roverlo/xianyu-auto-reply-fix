@@ -122,7 +122,13 @@
       <div class="nav-item" data-menu-id="redeem-codes">
         <a href="javascript:void(0)" class="nav-link" onclick="showSection('redeem-codes')">
           <i class="bi bi-upc-scan"></i>
-          <span>兑换码库存</span>
+          <span>兑换码池</span>
+        </a>
+      </div>
+      <div class="nav-item" data-menu-id="redeem-records">
+        <a href="javascript:void(0)" class="nav-link" onclick="showSection('redeem-records')">
+          <i class="bi bi-clock-history"></i>
+          <span>发放记录</span>
         </a>
       </div>
       <div class="nav-item" data-menu-id="auto-delivery">
@@ -1716,98 +1722,86 @@
       </div>
     </div>
 
-    <!-- 自动发货内容 -->
     <div id="redeem-codes-section" class="content-section">
-      <div class="content-header">
+      <div class="content-header d-flex justify-content-between align-items-center gap-3 flex-wrap">
         <h2 class="mb-0">
           <i class="bi bi-upc-scan me-2"></i>
           兑换码池
         </h2>
+        <div class="btn-group btn-group-sm">
+          <button class="btn btn-outline-secondary" onclick="loadRedeemCodeBatches()" title="刷新">
+            <i class="bi bi-arrow-clockwise"></i>
+          </button>
+          <button class="btn btn-primary" onclick="showRedeemBatchModal()">
+            <i class="bi bi-plus-lg me-1"></i>新建兑换码池
+          </button>
+        </div>
       </div>
       <div class="content-body">
-        <div class="row g-3">
-          <div class="col-lg-8">
-            <div class="card mb-3">
-              <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="mb-0">兑换码池</h5>
-                <div class="btn-group btn-group-sm">
-                  <button class="btn btn-outline-secondary" onclick="loadRedeemCodes()">
-                    <i class="bi bi-arrow-clockwise"></i>
-                  </button>
-                  <button class="btn btn-primary" onclick="showRedeemBatchModal()">
-                    <i class="bi bi-plus-lg me-1"></i>新建兑换码池
-                  </button>
-                </div>
-              </div>
-              <div class="card-body">
-                <div class="table-responsive">
-                  <table class="table table-hover align-middle">
-                    <thead>
-                      <tr>
-                        <th>兑换码池</th>
-                        <th>关联卡券</th>
-                        <th>规格</th>
-                        <th>库存</th>
-                        <th>状态</th>
-                        <th>操作</th>
-                      </tr>
-                    </thead>
-                    <tbody id="redeemBatchesTableBody"></tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-
-            <div class="card">
-              <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="mb-0">发放记录</h5>
-                <div class="d-flex gap-2">
-                  <select class="form-select form-select-sm" id="redeemStatusFilter" onchange="loadRedeemCodeRecords()">
-                    <option value="">全部状态</option>
-                    <option value="available">未发</option>
-                    <option value="reserved">预占</option>
-                    <option value="sent">已发</option>
-                    <option value="consumed">已消耗</option>
-                    <option value="released">已释放</option>
-                    <option value="expired">已过期</option>
-                  </select>
-                  <input class="form-control form-control-sm" id="redeemOrderFilter" placeholder="订单号" onkeydown="if(event.key==='Enter') loadRedeemCodeRecords()">
-                </div>
-              </div>
-              <div class="card-body">
-                <div class="table-responsive">
-                  <table class="table table-sm table-hover align-middle">
-                    <thead>
-                      <tr>
-                        <th>兑换码</th>
-                        <th>批次</th>
-                        <th>状态</th>
-                        <th>订单</th>
-                        <th>买家</th>
-                        <th>时间</th>
-                      </tr>
-                    </thead>
-                    <tbody id="redeemCodesTableBody"></tbody>
-                  </table>
-                </div>
-              </div>
+        <div class="card">
+          <div class="card-body">
+            <div class="table-responsive">
+              <table class="table table-hover align-middle">
+                <thead>
+                  <tr>
+                    <th>兑换码池</th>
+                    <th>关联卡券</th>
+                    <th>规格</th>
+                    <th>库存</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="redeemBatchesTableBody"></tbody>
+              </table>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
 
-          <div class="col-lg-4">
-            <div class="card">
-              <div class="card-header">
-                <h5 class="mb-0">导入兑换码</h5>
-              </div>
-              <div class="card-body">
-                <label class="form-label">选择批次</label>
-                <select class="form-select mb-3" id="redeemImportBatchSelect"></select>
-                <label class="form-label">兑换码内容</label>
-                <textarea class="form-control mb-3" id="redeemImportCodes" rows="12" placeholder="一行一个兑换码"></textarea>
-                <button class="btn btn-success w-100" onclick="importRedeemCodes()">
-                  <i class="bi bi-upload me-1"></i>导入
-                </button>
-              </div>
+    <div id="redeem-records-section" class="content-section">
+      <div class="content-header d-flex justify-content-between align-items-center gap-3 flex-wrap">
+        <h2 class="mb-0">
+          <i class="bi bi-clock-history me-2"></i>
+          发放记录
+        </h2>
+        <div class="d-flex gap-2 flex-wrap">
+          <select class="form-select form-select-sm" id="redeemRecordBatchFilter" onchange="loadRedeemCodeRecords()">
+            <option value="">全部兑换码池</option>
+          </select>
+          <select class="form-select form-select-sm" id="redeemStatusFilter" onchange="loadRedeemCodeRecords()">
+            <option value="">全部状态</option>
+            <option value="available">未发</option>
+            <option value="reserved">预占</option>
+            <option value="sent">已发</option>
+            <option value="consumed">已消耗</option>
+            <option value="released">已释放</option>
+            <option value="expired">已过期</option>
+          </select>
+          <input class="form-control form-control-sm" id="redeemOrderFilter" placeholder="订单号" onkeydown="if(event.key==='Enter') loadRedeemCodeRecords()">
+          <button class="btn btn-sm btn-outline-secondary" onclick="loadRedeemCodeRecords()" title="筛选">
+            <i class="bi bi-search"></i>
+          </button>
+        </div>
+      </div>
+      <div class="content-body">
+        <div class="card">
+          <div class="card-body">
+            <div class="table-responsive">
+              <table class="table table-sm table-hover align-middle">
+                <thead>
+                  <tr>
+                    <th>兑换码</th>
+                    <th>兑换码池</th>
+                    <th>状态</th>
+                    <th>订单</th>
+                    <th>买家</th>
+                    <th>时间</th>
+                  </tr>
+                </thead>
+                <tbody id="redeemCodesTableBody"></tbody>
+              </table>
             </div>
           </div>
         </div>
@@ -4310,8 +4304,8 @@
                 <div class="col-md-6">
                   <div class="mb-3">
                     <label class="form-label">规格1值 <span class="text-danger">*</span></label>
-                    <input type="text" class="form-control" id="specValue" placeholder="例如：30天、红色、XL">
-                    <div class="form-text">规格1的具体值，如30天、红色等</div>
+                    <textarea class="form-control" id="specValue" rows="3" placeholder="例如：30天&#10;90天&#10;年卡，也可以用逗号分隔"></textarea>
+                    <div class="form-text">可填写多个规格值，一行一个或用逗号/顿号分隔；保存后自动创建多张对应规格卡券</div>
                   </div>
                 </div>
               </div>
@@ -4335,8 +4329,9 @@
                 <i class="bi bi-info-circle"></i>
                 <strong>多规格说明：</strong>
                 <ul class="mb-0 mt-2">
-                  <li>同一卡券名称可以创建多个不同规格的卡券</li>
-                  <li>卡券名称+规格1+规格2必须唯一</li>
+                  <li>同一个规格名称下有多个规格值时，直接在“规格1值”里批量填写</li>
+                  <li>系统会按每个规格值创建一张同名卡券，后续在卡券列表分别关联兑换码池</li>
+                  <li>卡券名称+规格1+规格2必须唯一，重复值会自动去重</li>
                   <li>自动发货时会优先匹配精确规格，找不到时使用普通卡券兜底</li>
                   <li>规格2为可选项，仅在商品有双规格时需要填写</li>
                 </ul>
@@ -4346,7 +4341,7 @@
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-          <button type="button" class="btn btn-primary" onclick="saveCard()">保存卡券</button>
+          <button type="button" class="btn btn-primary" id="saveCardBtn" onclick="saveCard()">保存卡券</button>
         </div>
       </div>
     </div>
@@ -4725,6 +4720,35 @@
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
           <button type="button" class="btn btn-primary" onclick="saveRedeemBatch()">创建池</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="redeemImportModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">
+            <i class="bi bi-upload me-2"></i>
+            导入兑换码
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <input type="hidden" id="redeemImportBatchId">
+          <div class="mb-3">
+            <div class="fw-semibold" id="redeemImportBatchName">-</div>
+            <div class="small text-muted" id="redeemImportBatchStock">-</div>
+          </div>
+          <label class="form-label">兑换码内容</label>
+          <textarea class="form-control" id="redeemImportCodes" rows="12" placeholder="一行一个兑换码"></textarea>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+          <button type="button" class="btn btn-primary" onclick="importRedeemCodes()">
+            <i class="bi bi-upload me-1"></i>导入
+          </button>
         </div>
       </div>
     </div>
