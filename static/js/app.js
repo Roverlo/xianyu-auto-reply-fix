@@ -7801,27 +7801,9 @@ const REDEEM_CONFIG_DEFAULT_MESSAGE = '您好，您的兑换码是：\n{DELIVERY
 
 async function loadRedeemCodes() {
     await Promise.all([
-        loadRedeemCodeStats(),
         loadRedeemCodeBatches(),
         loadRedeemCodeRecords()
     ]);
-}
-
-async function loadRedeemCodeStats() {
-    try {
-        const response = await fetch(`${apiBase}/redeem-code-stats`, {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
-        if (!response.ok) throw new Error('stats failed');
-        const stats = await response.json();
-        document.getElementById('redeemTotalCount').textContent = stats.total_count || 0;
-        document.getElementById('redeemAvailableCount').textContent = stats.available_count || 0;
-        document.getElementById('redeemTodaySentCount').textContent = stats.today_sent_count || 0;
-        document.getElementById('redeemLowStockCount').textContent = stats.low_stock_count || 0;
-    } catch (error) {
-        console.error('加载兑换码统计失败:', error);
-        showToast('加载兑换码统计失败', 'danger');
-    }
 }
 
 async function loadRedeemCodeBatches() {

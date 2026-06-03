@@ -1721,59 +1721,10 @@
       <div class="content-header">
         <h2 class="mb-0">
           <i class="bi bi-upc-scan me-2"></i>
-          兑换码库存
+          兑换码池
         </h2>
-        <p class="text-muted mb-0">按商品规格管理兑换码，自动发货时一次只发一个且不重复</p>
       </div>
       <div class="content-body">
-        <div class="row g-3 mb-3">
-          <div class="col-md-3">
-            <div class="card">
-              <div class="card-body d-flex justify-content-between align-items-center">
-                <span>总库存</span>
-                <span class="badge bg-primary" id="redeemTotalCount">0</span>
-              </div>
-            </div>
-          </div>
-          <div class="col-md-3">
-            <div class="card">
-              <div class="card-body d-flex justify-content-between align-items-center">
-                <span>未发</span>
-                <span class="badge bg-success" id="redeemAvailableCount">0</span>
-              </div>
-            </div>
-          </div>
-          <div class="col-md-3">
-            <div class="card">
-              <div class="card-body d-flex justify-content-between align-items-center">
-                <span>今日已发</span>
-                <span class="badge bg-info" id="redeemTodaySentCount">0</span>
-              </div>
-            </div>
-          </div>
-          <div class="col-md-3">
-            <div class="card">
-              <div class="card-body d-flex justify-content-between align-items-center">
-                <span>低库存</span>
-                <span class="badge bg-warning" id="redeemLowStockCount">0</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="alert alert-primary d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3 mb-3">
-          <div class="d-flex align-items-center gap-3">
-            <i class="bi bi-lightning-charge fs-3"></i>
-            <div>
-              <div class="fw-semibold">先建池，再到卡券管理里关联规格</div>
-              <div class="small mb-0">兑换码池独立创建和补码；商品规格发货时，只从卡券已关联的池里按顺序取可用码。</div>
-            </div>
-          </div>
-          <button class="btn btn-primary" onclick="showRedeemBatchModal()">
-            <i class="bi bi-plus-circle me-1"></i>新建兑换码池
-          </button>
-        </div>
-
         <div class="row g-3">
           <div class="col-lg-8">
             <div class="card mb-3">
@@ -1784,7 +1735,7 @@
                     <i class="bi bi-arrow-clockwise"></i>
                   </button>
                   <button class="btn btn-primary" onclick="showRedeemBatchModal()">
-                    <i class="bi bi-plus-lg me-1"></i>新建池
+                    <i class="bi bi-plus-lg me-1"></i>新建兑换码池
                   </button>
                 </div>
               </div>
