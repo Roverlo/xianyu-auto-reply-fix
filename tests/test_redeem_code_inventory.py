@@ -179,6 +179,75 @@ class RedeemCodeInventoryTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["status"], "available")
 
+    def test_create_redeem_delivery_config_builds_all_links(self):
+        result = self.db.create_redeem_code_delivery_config(
+            user_id=self.user_id,
+            keyword="pro member",
+            config_name="pro-month",
+            spec_name="plan",
+            spec_value="pro",
+            warning_threshold=2,
+            codes="P001\nP002\nP001\n",
+        )
+
+        card = self.db.get_card_by_id(result["card_id"], self.user_id)
+        self.assertEqual(card["type"], "data")
+        self.assertTrue(card["is_multi_spec"])
+        self.assertEqual(card["spec_name"], "plan")
+        self.assertEqual(card["spec_value"], "pro")
+        self.assertIn("{DELIVERY_CONTENT}", card["description"])
+
+        rule = self.db.get_delivery_rule_by_id(result["rule_id"], self.user_id)
+        self.assertEqual(rule["keyword"], "pro member")
+        self.assertEqual(rule["card_id"], result["card_id"])
+
+        batch = self.db.get_redeem_code_batch_by_id(result["batch_id"], self.user_id)
+        self.assertEqual(batch["card_id"], result["card_id"])
+        self.assertEqual(batch["rule_id"], result["rule_id"])
+        self.assertEqual(batch["warning_threshold"], 2)
+
+        self.assertEqual(result["import_result"]["inserted"], 2)
+        self.assertEqual(result["import_result"]["duplicate_in_upload"], 1)
+
+        matched_rule = self.db.get_delivery_rule_by_id(result["rule_id"], self.user_id)
+        reserved = self.db.reserve_redeem_code_for_rule(
+            matched_rule,
+            order_id="order-config-1",
+            unit_index=1,
+            user_id=self.user_id,
+            buyer_id="buyer-1",
+        )
+        self.assertEqual(reserved["reserved_content"], "P001")
+
+    def test_redeem_delivery_items_include_order_specs(self):
+        cookie_id = "cookie-spec"
+        self.assertTrue(self.db.save_cookie(cookie_id, "foo=bar", user_id=self.user_id))
+        self.assertTrue(self.db.save_item_basic_info(
+            cookie_id=cookie_id,
+            item_id="item-1",
+            item_title="MobaXterm",
+            item_price="19.9",
+            item_detail="MobaXterm 商品说明",
+        ))
+        self.db.insert_or_update_order(
+            order_id="order-spec-1",
+            item_id="item-1",
+            buyer_id="buyer-1",
+            cookie_id=cookie_id,
+            spec_name="软件",
+            spec_value="26.3汉化专业版",
+            quantity="1",
+        )
+
+        items = self.db.get_redeem_code_delivery_items(self.user_id)
+        item = next((entry for entry in items if entry["item_id"] == "item-1"), None)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["keyword_suggestion"], "MobaXterm")
+        self.assertEqual(item["spec_count"], 1)
+        self.assertEqual(item["specs"][0]["spec_name"], "软件")
+        self.assertEqual(item["specs"][0]["spec_value"], "26.3汉化专业版")
+        self.assertEqual(item["specs"][0]["source"], "orders")
+
 
 if __name__ == "__main__":
     unittest.main()

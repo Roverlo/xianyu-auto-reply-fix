@@ -7793,6 +7793,10 @@ async function saveAccountNotification() {
 
 // ================================
 let redeemCodeBatchesCache = [];
+let redeemDeliveryItemsCache = [];
+let redeemDeliveryAccountsCache = [];
+
+const REDEEM_CONFIG_DEFAULT_MESSAGE = '您好，您的兑换码是：\n{DELIVERY_CONTENT}\n\n请尽快使用，感谢购买。';
 
 async function loadRedeemCodes() {
     await Promise.all([
@@ -7911,6 +7915,289 @@ async function loadRedeemBatchReferenceSelects() {
         ruleSelect.innerHTML = '<option value="">不绑定</option>' + rules.map(rule =>
             `<option value="${rule.id}">${escapeHtml(rule.keyword || '')} -> ${escapeHtml(rule.card_name || '')}</option>`
         ).join('');
+    }
+}
+
+function getRedeemDeliveryItemKey(item) {
+    return `${item.cookie_id || ''}::${item.item_id || ''}`;
+}
+
+function getRedeemSpecKey(spec, index) {
+    return [
+        spec.spec_name || '',
+        spec.spec_value || '',
+        spec.spec_name_2 || '',
+        spec.spec_value_2 || '',
+        index
+    ].join('::');
+}
+
+function formatRedeemDeliverySpecOption(spec) {
+    const first = [spec.spec_name, spec.spec_value].filter(Boolean).join(':');
+    const second = [spec.spec_name_2, spec.spec_value_2].filter(Boolean).join(':');
+    const label = [first, second].filter(Boolean).join(' / ') || '无规格';
+    const sourceText = spec.source === 'orders' && spec.order_count
+        ? `订单 ${spec.order_count} 次`
+        : (spec.source || '商品详情');
+    return `${label}（${sourceText}）`;
+}
+
+async function loadRedeemDeliveryItems(force = false) {
+    const hint = document.getElementById('redeemConfigItemHint');
+    if (!force && redeemDeliveryItemsCache.length > 0) {
+        renderRedeemDeliveryItemSelectors();
+        return;
+    }
+    if (hint) hint.textContent = '正在读取已同步商品...';
+    try {
+        const response = await fetch(`${apiBase}/redeem-code-delivery-items`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        if (!response.ok) throw new Error('items failed');
+        const data = await response.json();
+        redeemDeliveryItemsCache = data.items || [];
+        redeemDeliveryAccountsCache = [...new Set(redeemDeliveryItemsCache.map(item => item.cookie_id).filter(Boolean))];
+        renderRedeemDeliveryItemSelectors();
+    } catch (error) {
+        console.error('加载兑换码发货商品失败:', error);
+        if (hint) hint.textContent = '商品读取失败，可手动填写关键字和规格。';
+        showToast('加载已发布商品失败', 'danger');
+    }
+}
+
+function renderRedeemDeliveryItemSelectors() {
+    const accountSelect = document.getElementById('redeemConfigAccountSelect');
+    const itemSelect = document.getElementById('redeemConfigItemSelect');
+    const hint = document.getElementById('redeemConfigItemHint');
+    if (!accountSelect || !itemSelect) return;
+
+    const previousAccount = accountSelect.value;
+    accountSelect.innerHTML = '<option value="">全部账号</option>' + redeemDeliveryAccountsCache.map(accountId =>
+        `<option value="${escapeHtml(accountId)}">${escapeHtml(accountId)}</option>`
+    ).join('');
+    if (previousAccount && redeemDeliveryAccountsCache.includes(previousAccount)) {
+        accountSelect.value = previousAccount;
+    }
+
+    const selectedAccount = accountSelect.value;
+    const items = selectedAccount
+        ? redeemDeliveryItemsCache.filter(item => item.cookie_id === selectedAccount)
+        : redeemDeliveryItemsCache;
+
+    itemSelect.innerHTML = '<option value="">手动填写</option>' + items.map(item => {
+        const title = item.item_title || item.item_id || '未命名商品';
+        const specText = item.spec_count ? `${item.spec_count} 个规格` : '未识别规格';
+        return `<option value="${escapeHtml(getRedeemDeliveryItemKey(item))}">${escapeHtml(title)} - ${escapeHtml(item.cookie_id || '')}（${specText}）</option>`;
+    }).join('');
+
+    if (hint) {
+        if (!redeemDeliveryItemsCache.length) {
+            hint.textContent = '还没有本地商品数据，可以先同步账号商品，或直接手动填写。';
+        } else {
+            const withSpecs = redeemDeliveryItemsCache.filter(item => item.spec_count > 0).length;
+            hint.textContent = `已读取 ${redeemDeliveryItemsCache.length} 个商品，其中 ${withSpecs} 个有可选规格。`;
+        }
+    }
+    renderRedeemConfigSpecSelect(null);
+}
+
+function getSelectedRedeemDeliveryItem() {
+    const itemSelect = document.getElementById('redeemConfigItemSelect');
+    const itemKey = itemSelect?.value;
+    if (!itemKey) return null;
+    return redeemDeliveryItemsCache.find(item => getRedeemDeliveryItemKey(item) === itemKey) || null;
+}
+
+function renderRedeemConfigSpecSelect(item) {
+    const specSelect = document.getElementById('redeemConfigSpecSelect');
+    const hint = document.getElementById('redeemConfigItemHint');
+    if (!specSelect) return;
+
+    if (!item) {
+        specSelect.innerHTML = '<option value="">手动填写规格</option>';
+        return;
+    }
+
+    const specs = item.specs || [];
+    if (!specs.length) {
+        specSelect.innerHTML = '<option value="">未识别到规格，手动填写</option>';
+        if (hint) hint.textContent = '这个商品本地还没有可识别规格。可同步账号商品详情，或直接手动填写规格。';
+        return;
+    }
+
+    specSelect.innerHTML = '<option value="">请选择规格</option>' + specs.map((spec, index) =>
+        `<option value="${escapeHtml(getRedeemSpecKey(spec, index))}">${escapeHtml(formatRedeemDeliverySpecOption(spec))}</option>`
+    ).join('');
+}
+
+function handleRedeemConfigAccountChange() {
+    renderRedeemDeliveryItemSelectors();
+}
+
+function handleRedeemConfigItemChange() {
+    const item = getSelectedRedeemDeliveryItem();
+    renderRedeemConfigSpecSelect(item);
+    if (item) {
+        const keywordInput = document.getElementById('redeemConfigKeyword');
+        const nameInput = document.getElementById('redeemConfigName');
+        if (keywordInput && !keywordInput.value.trim()) {
+            keywordInput.value = item.keyword_suggestion || item.item_title || item.item_id || '';
+        }
+        if (nameInput && !nameInput.value.trim()) {
+            nameInput.value = item.item_title || '';
+        }
+    }
+}
+
+function handleRedeemConfigSpecChange() {
+    const item = getSelectedRedeemDeliveryItem();
+    const specSelect = document.getElementById('redeemConfigSpecSelect');
+    if (!item || !specSelect?.value) return;
+    const spec = (item.specs || []).find((candidate, index) => getRedeemSpecKey(candidate, index) === specSelect.value);
+    if (!spec) return;
+    document.getElementById('redeemConfigSpecName').value = spec.spec_name || '';
+    document.getElementById('redeemConfigSpecValue').value = spec.spec_value || '';
+    document.getElementById('redeemConfigSpecName2').value = spec.spec_name_2 || '';
+    document.getElementById('redeemConfigSpecValue2').value = spec.spec_value_2 || '';
+
+    const nameInput = document.getElementById('redeemConfigName');
+    const keywordInput = document.getElementById('redeemConfigKeyword');
+    if (nameInput && !nameInput.value.trim()) {
+        const specLabel = [spec.spec_value, spec.spec_value_2].filter(Boolean).join('-');
+        nameInput.value = [keywordInput?.value || item.item_title || '', specLabel].filter(Boolean).join('-');
+    }
+}
+
+function updateRedeemConfigCodeCount() {
+    const textarea = document.getElementById('redeemConfigCodes');
+    const target = document.getElementById('redeemConfigCodeCount');
+    if (!textarea || !target) return;
+    const count = textarea.value.split(/\r?\n/).map(line => line.trim()).filter(Boolean).length;
+    target.textContent = `${count} 个`;
+}
+
+async function syncRedeemConfigSelectedAccountItems() {
+    const accountSelect = document.getElementById('redeemConfigAccountSelect');
+    const accountId = accountSelect?.value || (redeemDeliveryAccountsCache.length === 1 ? redeemDeliveryAccountsCache[0] : '');
+    if (!accountId) {
+        showToast('请先选择要同步的账号', 'warning');
+        return;
+    }
+
+    const button = document.getElementById('redeemConfigSyncItemsBtn');
+    const originalHtml = button ? button.innerHTML : '';
+    try {
+        if (button) {
+            button.disabled = true;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>同步中';
+        }
+        const response = await fetch(`${apiBase}/items/get-all-from-account`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ cookie_id: accountId })
+        });
+        const result = await response.json();
+        if (!response.ok || result.success === false) {
+            throw new Error(result.message || result.detail || '同步失败');
+        }
+        showToast(result.message || '商品同步完成', 'success');
+        await loadRedeemDeliveryItems(true);
+        document.getElementById('redeemConfigAccountSelect').value = accountId;
+        renderRedeemDeliveryItemSelectors();
+    } catch (error) {
+        console.error('同步账号商品失败:', error);
+        showToast(`同步商品失败: ${error.message}`, 'danger');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = originalHtml;
+        }
+    }
+}
+
+async function showRedeemConfigWizardModal() {
+    document.getElementById('redeemConfigWizardForm')?.reset();
+    document.getElementById('redeemConfigWarningThreshold').value = '5';
+    document.getElementById('redeemConfigDelaySeconds').value = '0';
+    document.getElementById('redeemConfigEnabled').checked = true;
+    document.getElementById('redeemConfigMessageTemplate').value = REDEEM_CONFIG_DEFAULT_MESSAGE;
+    updateRedeemConfigCodeCount();
+    new bootstrap.Modal(document.getElementById('redeemConfigWizardModal')).show();
+    await loadRedeemDeliveryItems();
+}
+
+async function saveRedeemConfigWizard() {
+    const keyword = document.getElementById('redeemConfigKeyword').value.trim();
+    if (!keyword) {
+        showToast('请填写商品关键字', 'warning');
+        return;
+    }
+    const specName = document.getElementById('redeemConfigSpecName').value.trim();
+    const specValue = document.getElementById('redeemConfigSpecValue').value.trim();
+    const specName2 = document.getElementById('redeemConfigSpecName2').value.trim();
+    const specValue2 = document.getElementById('redeemConfigSpecValue2').value.trim();
+    if ((specName && !specValue) || (!specName && specValue)) {
+        showToast('规格1名称和规格1值需要同时填写', 'warning');
+        return;
+    }
+    if ((specName2 && !specValue2) || (!specName2 && specValue2)) {
+        showToast('规格2名称和规格2值需要同时填写', 'warning');
+        return;
+    }
+    if ((specName2 || specValue2) && !(specName && specValue)) {
+        showToast('填写规格2前请先填写规格1', 'warning');
+        return;
+    }
+
+    const payload = {
+        keyword,
+        config_name: document.getElementById('redeemConfigName').value.trim() || null,
+        spec_name: specName || null,
+        spec_value: specValue || null,
+        spec_name_2: specName2 || null,
+        spec_value_2: specValue2 || null,
+        warning_threshold: parseInt(document.getElementById('redeemConfigWarningThreshold').value, 10) || 0,
+        delay_seconds: parseInt(document.getElementById('redeemConfigDelaySeconds').value, 10) || 0,
+        enabled: document.getElementById('redeemConfigEnabled').checked,
+        message_template: document.getElementById('redeemConfigMessageTemplate').value.trim() || REDEEM_CONFIG_DEFAULT_MESSAGE,
+        codes: document.getElementById('redeemConfigCodes').value,
+        description: document.getElementById('redeemConfigDescription').value.trim() || null
+    };
+
+    const button = document.getElementById('redeemConfigWizardSaveBtn');
+    const originalHtml = button ? button.innerHTML : '';
+    try {
+        if (button) {
+            button.disabled = true;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>创建中';
+        }
+        const response = await fetch(`${apiBase}/redeem-code-delivery-configs`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(result.detail || '创建失败');
+        }
+        bootstrap.Modal.getInstance(document.getElementById('redeemConfigWizardModal')).hide();
+        const importResult = result.import_result || {};
+        showToast(`配置已创建：批次 ${result.batch_id}，导入 ${importResult.inserted || 0} 个兑换码`, 'success');
+        await loadRedeemCodes();
+    } catch (error) {
+        console.error('创建兑换码发货配置失败:', error);
+        showToast(`创建失败: ${error.message}`, 'danger');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = originalHtml;
+        }
     }
 }
 

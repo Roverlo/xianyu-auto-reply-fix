@@ -9133,6 +9133,45 @@ def get_redeem_code_stats(current_user: Dict[str, Any] = Depends(get_current_use
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/redeem-code-delivery-items")
+def get_redeem_code_delivery_items(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取当前用户已同步商品及可识别规格，供兑换码发货配置向导使用。"""
+    try:
+        from db_manager import db_manager
+        return {"items": db_manager.get_redeem_code_delivery_items(current_user['user_id'])}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/redeem-code-delivery-configs")
+def create_redeem_code_delivery_config(config_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """一键创建兑换码发货配置：卡券、发货规则、库存批次和首批导入。"""
+    try:
+        from db_manager import db_manager
+        result = db_manager.create_redeem_code_delivery_config(
+            user_id=current_user['user_id'],
+            keyword=config_data.get('keyword'),
+            codes=config_data.get('codes') or '',
+            config_name=config_data.get('config_name'),
+            card_name=config_data.get('card_name'),
+            batch_name=config_data.get('batch_name'),
+            spec_name=config_data.get('spec_name'),
+            spec_value=config_data.get('spec_value'),
+            spec_name_2=config_data.get('spec_name_2'),
+            spec_value_2=config_data.get('spec_value_2'),
+            warning_threshold=config_data.get('warning_threshold', 5),
+            enabled=config_data.get('enabled', True),
+            message_template=config_data.get('message_template'),
+            delay_seconds=config_data.get('delay_seconds', 0),
+            description=config_data.get('description'),
+        )
+        return {"message": "兑换码发货配置创建成功", **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/delivery-rules")
 def get_delivery_rules(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取发货规则列表"""

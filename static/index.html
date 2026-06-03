@@ -1761,6 +1761,19 @@
           </div>
         </div>
 
+        <div class="alert alert-primary d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3 mb-3">
+          <div class="d-flex align-items-center gap-3">
+            <i class="bi bi-lightning-charge fs-3"></i>
+            <div>
+              <div class="fw-semibold">一键配置兑换码发货</div>
+              <div class="small mb-0">填写商品关键字、规格和兑换码后，自动创建卡券、发货规则和库存批次。</div>
+            </div>
+          </div>
+          <button class="btn btn-primary" onclick="showRedeemConfigWizardModal()">
+            <i class="bi bi-plus-circle me-1"></i>一键配置发码
+          </button>
+        </div>
+
         <div class="row g-3">
           <div class="col-lg-8">
             <div class="card mb-3">
@@ -1769,6 +1782,9 @@
                 <div class="btn-group btn-group-sm">
                   <button class="btn btn-outline-secondary" onclick="loadRedeemCodes()">
                     <i class="bi bi-arrow-clockwise"></i>
+                  </button>
+                  <button class="btn btn-success" onclick="showRedeemConfigWizardModal()">
+                    <i class="bi bi-lightning-charge me-1"></i>一键配置
                   </button>
                   <button class="btn btn-primary" onclick="showRedeemBatchModal()">
                     <i class="bi bi-plus-lg me-1"></i>新建批次
@@ -4799,6 +4815,124 @@
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
           <button type="button" class="btn btn-primary" onclick="saveRedeemBatch()">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="redeemConfigWizardModal" tabindex="-1">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">
+            <i class="bi bi-lightning-charge me-2"></i>
+            一键配置兑换码发货
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <form id="redeemConfigWizardForm">
+            <div class="row">
+              <div class="col-md-3 mb-3">
+                <label class="form-label">账号</label>
+                <select class="form-select" id="redeemConfigAccountSelect" onchange="handleRedeemConfigAccountChange()">
+                  <option value="">全部账号</option>
+                </select>
+              </div>
+              <div class="col-md-5 mb-3">
+                <label class="form-label">已发布商品</label>
+                <select class="form-select" id="redeemConfigItemSelect" onchange="handleRedeemConfigItemChange()">
+                  <option value="">加载商品中...</option>
+                </select>
+              </div>
+              <div class="col-md-4 mb-3">
+                <label class="form-label">规格组合</label>
+                <select class="form-select" id="redeemConfigSpecSelect" onchange="handleRedeemConfigSpecChange()">
+                  <option value="">先选择商品</option>
+                </select>
+              </div>
+            </div>
+            <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+              <div class="small text-muted" id="redeemConfigItemHint">正在读取已同步商品...</div>
+              <div class="btn-group btn-group-sm">
+                <button type="button" class="btn btn-outline-secondary" onclick="loadRedeemDeliveryItems(true)">
+                  <i class="bi bi-arrow-clockwise me-1"></i>刷新商品
+                </button>
+                <button type="button" class="btn btn-outline-primary" id="redeemConfigSyncItemsBtn" onclick="syncRedeemConfigSelectedAccountItems()">
+                  <i class="bi bi-cloud-download me-1"></i>同步账号商品
+                </button>
+              </div>
+            </div>
+            <div class="row">
+              <div class="col-md-6 mb-3">
+                <label class="form-label">商品关键字 <span class="text-danger">*</span></label>
+                <input type="text" class="form-control" id="redeemConfigKeyword" placeholder="例如：月卡、会员、礼包" required>
+              </div>
+              <div class="col-md-6 mb-3">
+                <label class="form-label">配置名称</label>
+                <input type="text" class="form-control" id="redeemConfigName" placeholder="不填则按关键字和规格自动生成">
+              </div>
+            </div>
+            <div class="row">
+              <div class="col-md-3 mb-3">
+                <label class="form-label">规格1名称</label>
+                <input type="text" class="form-control" id="redeemConfigSpecName" placeholder="例如：时长">
+              </div>
+              <div class="col-md-3 mb-3">
+                <label class="form-label">规格1值</label>
+                <input type="text" class="form-control" id="redeemConfigSpecValue" placeholder="例如：月卡">
+              </div>
+              <div class="col-md-3 mb-3">
+                <label class="form-label">规格2名称</label>
+                <input type="text" class="form-control" id="redeemConfigSpecName2" placeholder="可选">
+              </div>
+              <div class="col-md-3 mb-3">
+                <label class="form-label">规格2值</label>
+                <input type="text" class="form-control" id="redeemConfigSpecValue2" placeholder="可选">
+              </div>
+            </div>
+            <div class="row">
+              <div class="col-md-4 mb-3">
+                <label class="form-label">低库存预警</label>
+                <input type="number" class="form-control" id="redeemConfigWarningThreshold" value="5" min="0">
+              </div>
+              <div class="col-md-4 mb-3">
+                <label class="form-label">延时发货时间</label>
+                <div class="input-group">
+                  <input type="number" class="form-control" id="redeemConfigDelaySeconds" value="0" min="0" max="3600">
+                  <span class="input-group-text">秒</span>
+                </div>
+              </div>
+              <div class="col-md-4 mb-3 d-flex align-items-end">
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" id="redeemConfigEnabled" checked>
+                  <label class="form-check-label" for="redeemConfigEnabled">立即启用</label>
+                </div>
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">发货话术</label>
+              <textarea class="form-control" id="redeemConfigMessageTemplate" rows="4"></textarea>
+              <small class="form-text text-muted">使用 <code>{DELIVERY_CONTENT}</code> 放置实际兑换码。</small>
+            </div>
+            <div class="mb-3">
+              <label class="form-label d-flex justify-content-between">
+                <span>兑换码</span>
+                <span class="text-muted small" id="redeemConfigCodeCount">0 个</span>
+              </label>
+              <textarea class="form-control" id="redeemConfigCodes" rows="12" placeholder="一行一个兑换码" oninput="updateRedeemConfigCodeCount()"></textarea>
+            </div>
+            <div class="mb-0">
+              <label class="form-label">备注</label>
+              <input type="text" class="form-control" id="redeemConfigDescription" placeholder="可选，仅后台记录">
+            </div>
+          </form>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+          <button type="button" class="btn btn-primary" id="redeemConfigWizardSaveBtn" onclick="saveRedeemConfigWizard()">
+            <i class="bi bi-check2-circle me-1"></i>创建配置
+          </button>
         </div>
       </div>
     </div>

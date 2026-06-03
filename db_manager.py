@@ -6012,6 +6012,431 @@ Cookie数量: {cookie_count}
             return f"{text[:2]}***{text[-2:]}"
         return f"{text[:4]}***{text[-4:]}"
 
+    def _prepare_redeem_code_import(self, raw_codes: str):
+        seen = set()
+        normalized_codes = []
+        duplicate_in_upload = 0
+        for line in str(raw_codes or '').splitlines():
+            code = line.strip()
+            if not code:
+                continue
+            code_hash = self._hash_redeem_code(code)
+            if code_hash in seen:
+                duplicate_in_upload += 1
+                continue
+            seen.add(code_hash)
+            normalized_codes.append((code, code_hash))
+        return normalized_codes, duplicate_in_upload, len(normalized_codes) + duplicate_in_upload
+
+    def _insert_redeem_codes_for_batch(self, cursor, batch_id: int, user_id: int, normalized_codes: List[Tuple[str, str]]):
+        inserted = 0
+        duplicate_in_batch = 0
+        duplicate_global = 0
+        for code, code_hash in normalized_codes:
+            self._execute_sql(cursor, "SELECT batch_id FROM redeem_codes WHERE code_hash = ? LIMIT 1", (code_hash,))
+            existing = cursor.fetchone()
+            if existing:
+                if int(existing[0]) == int(batch_id):
+                    duplicate_in_batch += 1
+                else:
+                    duplicate_global += 1
+                continue
+
+            self._execute_sql(cursor, '''
+            INSERT INTO redeem_codes (
+                batch_id, user_id, code_hash, code_cipher, code_preview, status
+            ) VALUES (?, ?, ?, ?, ?, 'available')
+            ''', (batch_id, user_id, code_hash, self._encrypt_secret(code), self._mask_redeem_code(code)))
+            inserted += 1
+
+        return {
+            'inserted': inserted,
+            'duplicate_in_batch': duplicate_in_batch,
+            'duplicate_global': duplicate_global,
+        }
+
+    def _default_redeem_delivery_config_name(self, keyword: str, spec_name: str = None, spec_value: str = None,
+                                             spec_name_2: str = None, spec_value_2: str = None) -> str:
+        parts = [str(keyword or '').strip()]
+        for name, value in ((spec_name, spec_value), (spec_name_2, spec_value_2)):
+            clean_name = str(name or '').strip()
+            clean_value = str(value or '').strip()
+            if clean_name and clean_value:
+                parts.append(f"{clean_name}{clean_value}")
+        clean_parts = [part for part in parts if part]
+        return "兑换码-" + "-".join(clean_parts) if clean_parts else "兑换码配置"
+
+    def _parse_redeem_spec_text(self, value: Any, source: str = 'item_detail') -> List[Dict[str, Any]]:
+        text = str(value or '').replace('：', ':').strip()
+        if not text or ':' not in text or len(text) > 500:
+            return []
+
+        pairs = []
+        for segment in re.split(r'[;\n\r|]+', text):
+            segment = segment.strip(" \t,，、[]【】()（）")
+            if ':' not in segment:
+                continue
+            left, right = segment.split(':', 1)
+            left = re.sub(r'^\w+##', '', left).strip()
+            right = re.sub(r'^\w+##', '', right).strip()
+            if not left or not right:
+                continue
+            if len(left) > 30 or len(right) > 120:
+                continue
+            if left.lower() in {'id', 'url', 'title', 'price', 'itemid'}:
+                continue
+            pairs.append((left, right))
+
+        if not pairs:
+            return []
+
+        first = pairs[0]
+        second = pairs[1] if len(pairs) > 1 else (None, None)
+        return [{
+            'spec_name': first[0],
+            'spec_value': first[1],
+            'spec_name_2': second[0],
+            'spec_value_2': second[1],
+            'source': source,
+        }]
+
+    def _extract_redeem_specs_from_item_detail(self, item_detail: Any) -> List[Dict[str, Any]]:
+        raw_text = str(item_detail or '').strip()
+        if not raw_text:
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+
+        def add_candidate(spec: Dict[str, Any], source: str = 'item_detail'):
+            spec_name = str(spec.get('spec_name') or '').strip()
+            spec_value = str(spec.get('spec_value') or '').strip()
+            spec_name_2 = str(spec.get('spec_name_2') or '').strip() or None
+            spec_value_2 = str(spec.get('spec_value_2') or '').strip() or None
+            if not spec_name or not spec_value:
+                return
+            candidates.append({
+                'spec_name': spec_name,
+                'spec_value': spec_value,
+                'spec_name_2': spec_name_2,
+                'spec_value_2': spec_value_2,
+                'source': spec.get('source') or source,
+            })
+
+        def parse_pair_dict(data: Dict[str, Any], path: str):
+            direct_pairs = (
+                ('spec_name', 'spec_value'),
+                ('specName', 'specValue'),
+                ('skuName', 'skuValue'),
+                ('attrName', 'attrValue'),
+                ('propertyName', 'propertyValue'),
+                ('propName', 'propValue'),
+            )
+            for name_key, value_key in direct_pairs:
+                if data.get(name_key) and data.get(value_key):
+                    add_candidate({
+                        'spec_name': data.get(name_key),
+                        'spec_value': data.get(value_key),
+                        'spec_name_2': data.get('spec_name_2') or data.get('specName2'),
+                        'spec_value_2': data.get('spec_value_2') or data.get('specValue2'),
+                    })
+
+            if data.get('spec_name') and data.get('spec_value') and data.get('spec_name_2') and data.get('spec_value_2'):
+                add_candidate(data)
+
+            path_lower = path.lower()
+            for key, text_value in data.items():
+                key_lower = str(key).lower()
+                if not isinstance(text_value, str):
+                    continue
+                if any(token in key_lower or token in path_lower for token in ('sku', 'spec', 'property', 'prop', 'attr')):
+                    for parsed in self._parse_redeem_spec_text(text_value, source='item_detail'):
+                        add_candidate(parsed)
+
+        def walk(value: Any, path: str = 'root', depth: int = 0):
+            if depth > 8:
+                return
+            if isinstance(value, dict):
+                parse_pair_dict(value, path)
+                for key, child in value.items():
+                    walk(child, f"{path}.{key}", depth + 1)
+            elif isinstance(value, list):
+                for index, child in enumerate(value[:200]):
+                    walk(child, f"{path}[{index}]", depth + 1)
+
+        try:
+            parsed = json.loads(raw_text)
+            walk(parsed)
+        except Exception:
+            for line in raw_text.splitlines():
+                if '规格' in line or 'sku' in line.lower():
+                    for parsed_line in self._parse_redeem_spec_text(line, source='item_detail_text'):
+                        add_candidate(parsed_line)
+
+        return self._dedupe_redeem_spec_candidates(candidates)
+
+    def _dedupe_redeem_spec_candidates(self, specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduped = []
+        seen = set()
+        for spec in specs or []:
+            key = (
+                self._normalize_redeem_spec_part(spec.get('spec_name')),
+                self._normalize_redeem_spec_part(spec.get('spec_value')),
+                self._normalize_redeem_spec_part(spec.get('spec_name_2')),
+                self._normalize_redeem_spec_part(spec.get('spec_value_2')),
+            )
+            if not key[0] or not key[1] or key in seen:
+                continue
+            seen.add(key)
+            deduped.append({
+                'spec_name': str(spec.get('spec_name') or '').strip(),
+                'spec_value': str(spec.get('spec_value') or '').strip(),
+                'spec_name_2': str(spec.get('spec_name_2') or '').strip() or None,
+                'spec_value_2': str(spec.get('spec_value_2') or '').strip() or None,
+                'source': spec.get('source') or 'unknown',
+                'order_count': int(spec.get('order_count') or 0),
+                'last_order_at': spec.get('last_order_at'),
+            })
+        return deduped
+
+    def get_redeem_code_delivery_items(self, user_id: int):
+        """Return current user's local items with detected spec combinations for redeem-code setup."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT i.cookie_id, i.item_id, i.item_title, i.item_price, i.item_detail,
+                       i.is_multi_spec, i.multi_quantity_delivery, i.updated_at
+                FROM item_info i
+                INNER JOIN cookies c ON c.id = i.cookie_id
+                WHERE c.user_id = ?
+                ORDER BY datetime(i.updated_at) DESC, i.id DESC
+                ''', (user_id,))
+                item_rows = cursor.fetchall()
+
+                cursor.execute('''
+                SELECT o.cookie_id, o.item_id, o.spec_name, o.spec_value,
+                       o.spec_name_2, o.spec_value_2, COUNT(*) AS order_count, MAX(o.updated_at) AS last_order_at
+                FROM orders o
+                INNER JOIN cookies c ON c.id = o.cookie_id
+                WHERE c.user_id = ?
+                  AND TRIM(COALESCE(o.item_id, '')) != ''
+                  AND TRIM(COALESCE(o.spec_name, '')) != ''
+                  AND TRIM(COALESCE(o.spec_value, '')) != ''
+                GROUP BY o.cookie_id, o.item_id, o.spec_name, o.spec_value, o.spec_name_2, o.spec_value_2
+                ORDER BY datetime(MAX(o.updated_at)) DESC
+                ''', (user_id,))
+                order_rows = cursor.fetchall()
+            except Exception as e:
+                logger.error(f"获取兑换码发货商品候选失败: {e}")
+                return []
+
+        items_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in item_rows:
+            cookie_id, item_id, item_title, item_price, item_detail, is_multi_spec, multi_quantity_delivery, updated_at = row
+            key = (str(cookie_id or ''), str(item_id or ''))
+            detail_specs = self._extract_redeem_specs_from_item_detail(item_detail)
+            items_by_key[key] = {
+                'cookie_id': cookie_id,
+                'item_id': item_id,
+                'item_title': item_title or f"商品 {item_id}",
+                'item_price': item_price,
+                'is_multi_spec': bool(is_multi_spec),
+                'multi_quantity_delivery': bool(multi_quantity_delivery),
+                'updated_at': updated_at,
+                'keyword_suggestion': item_title or item_id,
+                'specs': detail_specs,
+                'detail_has_specs': bool(detail_specs),
+                'from_orders_only': False,
+            }
+
+        for row in order_rows:
+            cookie_id, item_id, spec_name, spec_value, spec_name_2, spec_value_2, order_count, last_order_at = row
+            key = (str(cookie_id or ''), str(item_id or ''))
+            if key not in items_by_key:
+                items_by_key[key] = {
+                    'cookie_id': cookie_id,
+                    'item_id': item_id,
+                    'item_title': f"商品 {item_id}",
+                    'item_price': None,
+                    'is_multi_spec': True,
+                    'multi_quantity_delivery': False,
+                    'updated_at': last_order_at,
+                    'keyword_suggestion': item_id,
+                    'specs': [],
+                    'detail_has_specs': False,
+                    'from_orders_only': True,
+                }
+            items_by_key[key]['specs'].append({
+                'spec_name': spec_name,
+                'spec_value': spec_value,
+                'spec_name_2': spec_name_2,
+                'spec_value_2': spec_value_2,
+                'source': 'orders',
+                'order_count': int(order_count or 0),
+                'last_order_at': last_order_at,
+            })
+
+        items = []
+        for item in items_by_key.values():
+            item['specs'] = self._dedupe_redeem_spec_candidates(item.get('specs') or [])
+            item['spec_count'] = len(item['specs'])
+            item['needs_detail_sync'] = not item['specs']
+            items.append(item)
+
+        items.sort(key=lambda item: (item.get('updated_at') or '', item.get('item_id') or ''), reverse=True)
+        return items
+
+    def create_redeem_code_delivery_config(self, user_id: int, keyword: str, codes: str = None,
+                                           config_name: str = None, card_name: str = None,
+                                           batch_name: str = None, spec_name: str = None,
+                                           spec_value: str = None, spec_name_2: str = None,
+                                           spec_value_2: str = None, warning_threshold: int = 5,
+                                           enabled: bool = True, message_template: str = None,
+                                           delay_seconds: int = 0, description: str = None):
+        """Create card, delivery rule, redeem batch, and optional first import in one transaction."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                clean_keyword = str(keyword or '').strip()
+                if not clean_keyword:
+                    raise ValueError("商品关键字不能为空")
+
+                clean_spec_name = str(spec_name or '').strip() or None
+                clean_spec_value = str(spec_value or '').strip() or None
+                clean_spec_name_2 = str(spec_name_2 or '').strip() or None
+                clean_spec_value_2 = str(spec_value_2 or '').strip() or None
+
+                if bool(clean_spec_name) != bool(clean_spec_value):
+                    raise ValueError("规格1名称和规格1值必须同时填写")
+                if bool(clean_spec_name_2) != bool(clean_spec_value_2):
+                    raise ValueError("规格2名称和规格2值必须同时填写")
+                if (clean_spec_name_2 or clean_spec_value_2) and not (clean_spec_name and clean_spec_value):
+                    raise ValueError("填写规格2前必须先填写规格1")
+
+                is_multi_spec = bool(clean_spec_name and clean_spec_value)
+                clean_config_name = str(config_name or '').strip()
+                base_name = clean_config_name or self._default_redeem_delivery_config_name(
+                    clean_keyword, clean_spec_name, clean_spec_value, clean_spec_name_2, clean_spec_value_2
+                )
+                clean_card_name = str(card_name or '').strip() or base_name
+                clean_batch_name = str(batch_name or '').strip() or base_name
+                clean_message_template = str(message_template or '').strip() or "您好，您的兑换码是：\n{DELIVERY_CONTENT}\n\n请尽快使用，感谢购买。"
+                clean_description = str(description or '').strip() or "兑换码一键配置自动生成"
+                safe_warning_threshold = max(0, int(warning_threshold or 0))
+                safe_delay_seconds = max(0, min(int(delay_seconds or 0), 3600))
+                enabled_flag = bool(enabled)
+
+                if enabled_flag:
+                    self._execute_sql(cursor, '''
+                    SELECT id
+                    FROM redeem_code_batches
+                    WHERE user_id = ? AND enabled = 1 AND keyword = ?
+                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_name, ''))), ' ', ''), '　', '') = ?
+                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_value, ''))), ' ', ''), '　', '') = ?
+                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_name_2, ''))), ' ', ''), '　', '') = ?
+                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_value_2, ''))), ' ', ''), '　', '') = ?
+                    LIMIT 1
+                    ''', (
+                        user_id,
+                        clean_keyword,
+                        self._normalize_redeem_spec_part(clean_spec_name),
+                        self._normalize_redeem_spec_part(clean_spec_value),
+                        self._normalize_redeem_spec_part(clean_spec_name_2),
+                        self._normalize_redeem_spec_part(clean_spec_value_2),
+                    ))
+                    existing_batch = cursor.fetchone()
+                    if existing_batch:
+                        raise ValueError(f"已存在同商品关键字和规格的启用兑换码批次: {existing_batch[0]}")
+
+                if is_multi_spec:
+                    self._execute_sql(cursor, '''
+                    SELECT COUNT(*) FROM cards
+                    WHERE name = ? AND spec_name = ? AND spec_value = ? AND user_id = ?
+                    ''', (clean_card_name, clean_spec_name, clean_spec_value, user_id))
+                    if cursor.fetchone()[0] > 0:
+                        raise ValueError(f"卡券已存在：{clean_card_name} - {clean_spec_name}:{clean_spec_value}")
+                else:
+                    self._execute_sql(cursor, '''
+                    SELECT COUNT(*) FROM cards
+                    WHERE name = ? AND (is_multi_spec = 0 OR is_multi_spec IS NULL) AND user_id = ?
+                    ''', (clean_card_name, user_id))
+                    if cursor.fetchone()[0] > 0:
+                        raise ValueError(f"卡券名称已存在：{clean_card_name}")
+
+                self._execute_sql(cursor, '''
+                INSERT INTO cards (name, type, api_config, text_content, data_content, image_url,
+                                 description, enabled, delay_seconds, is_multi_spec,
+                                 spec_name, spec_value, spec_name_2, spec_value_2, user_id)
+                VALUES (?, 'data', NULL, NULL, '', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    clean_card_name,
+                    clean_message_template,
+                    enabled_flag,
+                    safe_delay_seconds,
+                    is_multi_spec,
+                    clean_spec_name if is_multi_spec else None,
+                    clean_spec_value if is_multi_spec else None,
+                    clean_spec_name_2 if is_multi_spec else None,
+                    clean_spec_value_2 if is_multi_spec else None,
+                    user_id,
+                ))
+                card_id = cursor.lastrowid
+
+                self._execute_sql(cursor, '''
+                INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id)
+                VALUES (?, ?, 1, ?, ?, ?)
+                ''', (
+                    clean_keyword,
+                    card_id,
+                    enabled_flag,
+                    f"兑换码库存自动发货 - {clean_card_name}",
+                    user_id,
+                ))
+                rule_id = cursor.lastrowid
+
+                self._execute_sql(cursor, '''
+                INSERT INTO redeem_code_batches (
+                    user_id, name, keyword, card_id, rule_id, spec_name, spec_value,
+                    spec_name_2, spec_value_2, warning_threshold, enabled, description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id,
+                    clean_batch_name,
+                    clean_keyword,
+                    card_id,
+                    rule_id,
+                    clean_spec_name,
+                    clean_spec_value,
+                    clean_spec_name_2,
+                    clean_spec_value_2,
+                    safe_warning_threshold,
+                    enabled_flag,
+                    clean_description,
+                ))
+                batch_id = cursor.lastrowid
+
+                normalized_codes, duplicate_in_upload, total_input = self._prepare_redeem_code_import(codes)
+                import_result = self._insert_redeem_codes_for_batch(cursor, batch_id, user_id, normalized_codes)
+                import_result.update({
+                    'duplicate_in_upload': duplicate_in_upload,
+                    'total_input': total_input,
+                })
+
+                self.conn.commit()
+                return {
+                    'card_id': card_id,
+                    'rule_id': rule_id,
+                    'batch_id': batch_id,
+                    'card_name': clean_card_name,
+                    'batch_name': clean_batch_name,
+                    'keyword': clean_keyword,
+                    'import_result': import_result,
+                }
+            except Exception as e:
+                logger.error(f"创建兑换码发货配置失败: {e}")
+                self.conn.rollback()
+                raise
+
     def create_redeem_code_batch(self, name: str, keyword: str, user_id: int,
                                  card_id: int = None, rule_id: int = None,
                                  spec_name: str = None, spec_value: str = None,
@@ -6179,47 +6604,14 @@ Cookie数量: {cookie_count}
                 if not batch:
                     raise ValueError("兑换码批次不存在或无权访问")
 
-                seen = set()
-                normalized_codes = []
-                duplicate_in_upload = 0
-                for line in str(raw_codes or '').splitlines():
-                    code = line.strip()
-                    if not code:
-                        continue
-                    code_hash = self._hash_redeem_code(code)
-                    if code_hash in seen:
-                        duplicate_in_upload += 1
-                        continue
-                    seen.add(code_hash)
-                    normalized_codes.append((code, code_hash))
-
-                inserted = 0
-                duplicate_in_batch = 0
-                duplicate_global = 0
-                for code, code_hash in normalized_codes:
-                    self._execute_sql(cursor, "SELECT batch_id FROM redeem_codes WHERE code_hash = ? LIMIT 1", (code_hash,))
-                    existing = cursor.fetchone()
-                    if existing:
-                        if int(existing[0]) == int(batch_id):
-                            duplicate_in_batch += 1
-                        else:
-                            duplicate_global += 1
-                        continue
-
-                    self._execute_sql(cursor, '''
-                    INSERT INTO redeem_codes (
-                        batch_id, user_id, code_hash, code_cipher, code_preview, status
-                    ) VALUES (?, ?, ?, ?, ?, 'available')
-                    ''', (batch_id, user_id, code_hash, self._encrypt_secret(code), self._mask_redeem_code(code)))
-                    inserted += 1
+                normalized_codes, duplicate_in_upload, total_input = self._prepare_redeem_code_import(raw_codes)
+                import_result = self._insert_redeem_codes_for_batch(cursor, batch_id, user_id, normalized_codes)
 
                 self.conn.commit()
                 return {
-                    'inserted': inserted,
+                    **import_result,
                     'duplicate_in_upload': duplicate_in_upload,
-                    'duplicate_in_batch': duplicate_in_batch,
-                    'duplicate_global': duplicate_global,
-                    'total_input': len(normalized_codes) + duplicate_in_upload,
+                    'total_input': total_input,
                 }
             except Exception as e:
                 logger.error(f"导入兑换码失败: {e}")
