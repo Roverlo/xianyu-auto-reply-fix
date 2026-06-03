@@ -1658,7 +1658,7 @@
                         <th>卡券名称</th>
                         <th>类型</th>
                         <th>规格信息</th>
-                        <th>数据量</th>
+                        <th>兑换码池/数据量</th>
                         <th>延时时间</th>
                         <th>状态</th>
                         <th>创建时间</th>
@@ -1667,7 +1667,7 @@
                     </thead>
                     <tbody id="cardsTableBody">
                       <tr>
-                        <td colspan="7" class="text-center py-4 text-muted">
+                        <td colspan="8" class="text-center py-4 text-muted">
                           <i class="bi bi-credit-card fs-1 d-block mb-3"></i>
                           <h5>暂无卡券数据</h5>
                           <p class="mb-0">点击"添加卡券"开始创建您的第一个卡券</p>
@@ -1765,12 +1765,12 @@
           <div class="d-flex align-items-center gap-3">
             <i class="bi bi-lightning-charge fs-3"></i>
             <div>
-              <div class="fw-semibold">一键配置兑换码发货</div>
-              <div class="small mb-0">填写商品关键字、规格和兑换码后，自动创建卡券、发货规则和库存批次。</div>
+              <div class="fw-semibold">先建池，再到卡券管理里关联规格</div>
+              <div class="small mb-0">兑换码池独立创建和补码；商品规格发货时，只从卡券已关联的池里按顺序取可用码。</div>
             </div>
           </div>
-          <button class="btn btn-primary" onclick="showRedeemConfigWizardModal()">
-            <i class="bi bi-plus-circle me-1"></i>一键配置发码
+          <button class="btn btn-primary" onclick="showRedeemBatchModal()">
+            <i class="bi bi-plus-circle me-1"></i>新建兑换码池
           </button>
         </div>
 
@@ -1778,16 +1778,13 @@
           <div class="col-lg-8">
             <div class="card mb-3">
               <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="mb-0">兑换码批次</h5>
+                <h5 class="mb-0">兑换码池</h5>
                 <div class="btn-group btn-group-sm">
                   <button class="btn btn-outline-secondary" onclick="loadRedeemCodes()">
                     <i class="bi bi-arrow-clockwise"></i>
                   </button>
-                  <button class="btn btn-success" onclick="showRedeemConfigWizardModal()">
-                    <i class="bi bi-lightning-charge me-1"></i>一键配置
-                  </button>
                   <button class="btn btn-primary" onclick="showRedeemBatchModal()">
-                    <i class="bi bi-plus-lg me-1"></i>新建批次
+                    <i class="bi bi-plus-lg me-1"></i>新建池
                   </button>
                 </div>
               </div>
@@ -1796,8 +1793,8 @@
                   <table class="table table-hover align-middle">
                     <thead>
                       <tr>
-                        <th>批次</th>
-                        <th>关键字</th>
+                        <th>兑换码池</th>
+                        <th>关联卡券</th>
                         <th>规格</th>
                         <th>库存</th>
                         <th>状态</th>
@@ -4741,80 +4738,81 @@
     </div>
   </div>
 
-  <!-- 添加发货规则模态框 -->
+  <!-- 新建兑换码池模态框 -->
   <div class="modal fade" id="redeemBatchModal" tabindex="-1">
     <div class="modal-dialog modal-lg">
       <div class="modal-content">
         <div class="modal-header">
           <h5 class="modal-title">
             <i class="bi bi-upc-scan me-2"></i>
-            新建兑换码批次
+            新建兑换码池
           </h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
           <form id="redeemBatchForm">
             <div class="row">
-              <div class="col-md-6 mb-3">
-                <label class="form-label">批次名称 <span class="text-danger">*</span></label>
+              <div class="col-md-8 mb-3">
+                <label class="form-label">兑换码池名称 <span class="text-danger">*</span></label>
                 <input type="text" class="form-control" id="redeemBatchName" required>
               </div>
-              <div class="col-md-6 mb-3">
-                <label class="form-label">商品关键字 <span class="text-danger">*</span></label>
-                <input type="text" class="form-control" id="redeemBatchKeyword" required>
-              </div>
-            </div>
-            <div class="row">
-              <div class="col-md-6 mb-3">
-                <label class="form-label">绑定卡券</label>
-                <select class="form-select" id="redeemBatchCardId">
-                  <option value="">不绑定</option>
-                </select>
-              </div>
-              <div class="col-md-6 mb-3">
-                <label class="form-label">绑定发货规则</label>
-                <select class="form-select" id="redeemBatchRuleId">
-                  <option value="">不绑定</option>
-                </select>
-              </div>
-            </div>
-            <div class="row">
-              <div class="col-md-3 mb-3">
-                <label class="form-label">规格1名称</label>
-                <input type="text" class="form-control" id="redeemSpecName">
-              </div>
-              <div class="col-md-3 mb-3">
-                <label class="form-label">规格1值</label>
-                <input type="text" class="form-control" id="redeemSpecValue">
-              </div>
-              <div class="col-md-3 mb-3">
-                <label class="form-label">规格2名称</label>
-                <input type="text" class="form-control" id="redeemSpecName2">
-              </div>
-              <div class="col-md-3 mb-3">
-                <label class="form-label">规格2值</label>
-                <input type="text" class="form-control" id="redeemSpecValue2">
-              </div>
-            </div>
-            <div class="row">
               <div class="col-md-4 mb-3">
                 <label class="form-label">低库存预警</label>
                 <input type="number" class="form-control" id="redeemWarningThreshold" value="5" min="0">
               </div>
-              <div class="col-md-8 mb-3">
+            </div>
+            <div class="row">
+              <div class="col-md-12 mb-3">
                 <label class="form-label">备注</label>
                 <input type="text" class="form-control" id="redeemBatchDescription">
               </div>
             </div>
             <div class="form-check form-switch">
               <input class="form-check-input" type="checkbox" id="redeemBatchEnabled" checked>
-              <label class="form-check-label" for="redeemBatchEnabled">启用批次</label>
+              <label class="form-check-label" for="redeemBatchEnabled">启用池</label>
             </div>
           </form>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-          <button type="button" class="btn btn-primary" onclick="saveRedeemBatch()">保存</button>
+          <button type="button" class="btn btn-primary" onclick="saveRedeemBatch()">创建池</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="cardRedeemBatchModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">
+            <i class="bi bi-diagram-3 me-2"></i>
+            关联兑换码池
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <input type="hidden" id="cardRedeemBindCardId">
+          <div class="mb-3">
+            <div class="fw-semibold" id="cardRedeemBindCardName">-</div>
+            <div class="small text-muted" id="cardRedeemBindCardSpec">-</div>
+          </div>
+          <div class="alert alert-light border" id="cardRedeemBindCurrent"></div>
+          <div class="mb-3">
+            <label class="form-label">选择已创建的兑换码池</label>
+            <select class="form-select" id="cardRedeemBatchSelect"></select>
+          </div>
+          <div class="alert alert-warning mb-0">
+            <small>
+              <i class="bi bi-exclamation-triangle me-1"></i>
+              未绑定兑换码池的批量数据卡券会被标红，并禁止自动发货。
+            </small>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-danger me-auto" onclick="unbindCardRedeemBatch()">解除关联</button>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+          <button type="button" class="btn btn-primary" onclick="saveCardRedeemBatchBinding()">保存关联</button>
         </div>
       </div>
     </div>

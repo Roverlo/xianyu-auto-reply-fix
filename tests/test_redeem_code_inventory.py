@@ -179,6 +179,71 @@ class RedeemCodeInventoryTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["status"], "available")
 
+    def test_data_card_requires_bound_redeem_pool(self):
+        unbound_card_id = self.db.create_card(
+            name="unbound-code",
+            card_type="data",
+            data_content="LEGACY-1\n",
+            is_multi_spec=True,
+            spec_name="plan",
+            spec_value="year",
+            user_id=self.user_id,
+        )
+        unbound_rule_id = self.db.create_delivery_rule(
+            keyword="unbound",
+            card_id=unbound_card_id,
+            user_id=self.user_id,
+        )
+        unbound_rule = self.db.get_delivery_rule_by_id(unbound_rule_id, self.user_id)
+
+        stock = self.db.has_sufficient_redeem_codes_for_rule(unbound_rule, quantity=1, user_id=self.user_id)
+        self.assertTrue(stock["uses_redeem_codes"])
+        self.assertFalse(stock["ok"])
+        self.assertEqual(stock["error"], "卡券未绑定兑换码池")
+
+        with self.assertRaises(ValueError):
+            self.db.reserve_redeem_code_for_rule(
+                unbound_rule,
+                order_id="order-unbound",
+                unit_index=1,
+                user_id=self.user_id,
+            )
+
+    def test_card_can_bind_existing_redeem_pool(self):
+        batch_id = self.db.create_redeem_code_batch(
+            name="pool-a",
+            keyword="pool-a",
+            user_id=self.user_id,
+        )
+        self.db.import_redeem_codes(batch_id, self.user_id, "POOL-A-1\nPOOL-A-2\n")
+
+        result = self.db.bind_redeem_code_batch_to_card(
+            batch_id=batch_id,
+            card_id=self.card_id,
+            user_id=self.user_id,
+        )
+        self.assertEqual(result["batch_id"], batch_id)
+        self.assertEqual(result["card_id"], self.card_id)
+        self.assertEqual(result["rule_id"], self.rule_id)
+
+        card = self.db.get_card_by_id(self.card_id, self.user_id)
+        self.assertTrue(card["redeem_inventory"]["uses_redeem_codes"])
+        self.assertEqual(card["redeem_inventory"]["batch_count"], 1)
+        self.assertEqual(card["redeem_inventory"]["available_count"], 2)
+        self.assertEqual(card["redeem_inventory"]["primary_batch"]["id"], batch_id)
+
+        rule = self.db.get_delivery_rule_by_id(self.rule_id, self.user_id)
+        self.assertEqual(rule["redeem_inventory"]["primary_batch"]["id"], batch_id)
+
+        reserved = self.db.reserve_redeem_code_for_rule(
+            rule,
+            order_id="order-bound",
+            unit_index=1,
+            user_id=self.user_id,
+            buyer_id="buyer-bound",
+        )
+        self.assertEqual(reserved["reserved_content"], "POOL-A-1")
+
     def test_create_redeem_delivery_config_builds_all_links(self):
         result = self.db.create_redeem_code_delivery_config(
             user_id=self.user_id,

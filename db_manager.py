@@ -4768,6 +4768,16 @@ Cookie数量: {cookie_count}
                         'updated_at': row[16]
                     })
 
+                inventory_by_card = self._get_redeem_inventory_summaries(
+                    user_id=user_id,
+                    card_ids=[card['id'] for card in cards],
+                )
+                for card in cards:
+                    card['redeem_inventory'] = inventory_by_card.get(
+                        card['id'],
+                        self._empty_redeem_inventory_summary(),
+                    )
+
                 return cards
             except Exception as e:
                 logger.error(f"获取卡券列表失败: {e}")
@@ -4805,7 +4815,7 @@ Cookie数量: {cookie_count}
                             # 如果解析失败，保持原始字符串
                             pass
 
-                    return {
+                    card = {
                         'id': row[0],
                         'name': row[1],
                         'type': row[2],
@@ -4824,6 +4834,11 @@ Cookie数量: {cookie_count}
                         'created_at': row[15],
                         'updated_at': row[16]
                     }
+                    card['redeem_inventory'] = self._get_redeem_inventory_summaries(
+                        user_id=user_id,
+                        card_ids=[card_id],
+                    ).get(card_id, self._empty_redeem_inventory_summary())
+                    return card
                 return None
             except Exception as e:
                 logger.error(f"获取卡券失败: {e}")
@@ -5035,6 +5050,19 @@ Cookie数量: {cookie_count}
                         'spec_value_2': row[15]
                     })
 
+                inventory_by_rule = self._get_redeem_inventory_summaries(
+                    user_id=user_id,
+                    rule_ids=[rule['id'] for rule in rules],
+                )
+                inventory_by_card = self._get_redeem_inventory_summaries(
+                    user_id=user_id,
+                    card_ids=[rule['card_id'] for rule in rules if rule.get('card_id') is not None],
+                )
+                for rule in rules:
+                    rule_inventory = inventory_by_rule.get(rule['id'])
+                    card_inventory = inventory_by_card.get(rule.get('card_id'))
+                    rule['redeem_inventory'] = card_inventory or rule_inventory or self._empty_redeem_inventory_summary()
+
                 return rules
             except Exception as e:
                 logger.error(f"获取发货规则列表失败: {e}")
@@ -5165,7 +5193,7 @@ Cookie数量: {cookie_count}
 
                 row = cursor.fetchone()
                 if row:
-                    return {
+                    rule = {
                         'id': row[0],
                         'keyword': row[1],
                         'card_id': row[2],
@@ -5183,6 +5211,16 @@ Cookie数量: {cookie_count}
                         'spec_name_2': row[14],
                         'spec_value_2': row[15]
                     }
+                    rule_inventory = self._get_redeem_inventory_summaries(
+                        user_id=user_id,
+                        rule_ids=[rule_id],
+                    ).get(rule_id)
+                    card_inventory = self._get_redeem_inventory_summaries(
+                        user_id=user_id,
+                        card_ids=[rule.get('card_id')],
+                    ).get(rule.get('card_id')) if rule.get('card_id') is not None else None
+                    rule['redeem_inventory'] = card_inventory or rule_inventory or self._empty_redeem_inventory_summary()
+                    return rule
                 return None
             except Exception as e:
                 logger.error(f"获取发货规则失败: {e}")
@@ -6447,9 +6485,9 @@ Cookie数量: {cookie_count}
             try:
                 cursor = self.conn.cursor()
                 clean_name = str(name or '').strip()
-                clean_keyword = str(keyword or '').strip()
-                if not clean_name or not clean_keyword:
-                    raise ValueError("批次名称和商品关键字不能为空")
+                clean_keyword = str(keyword or '').strip() or clean_name
+                if not clean_name:
+                    raise ValueError("兑换码池名称不能为空")
 
                 if card_id is not None:
                     self._execute_sql(cursor, "SELECT 1 FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
@@ -6556,6 +6594,7 @@ Cookie数量: {cookie_count}
             SELECT b.id, b.user_id, b.name, b.keyword, b.card_id, b.rule_id,
                    b.spec_name, b.spec_value, b.spec_name_2, b.spec_value_2,
                    b.warning_threshold, b.enabled, b.description, b.created_at, b.updated_at,
+                   card.name AS card_name, rule.keyword AS rule_keyword,
                    COUNT(c.id) AS total_count,
                    SUM(CASE WHEN c.status = 'available' THEN 1 ELSE 0 END) AS available_count,
                    SUM(CASE WHEN c.status = 'reserved' THEN 1 ELSE 0 END) AS reserved_count,
@@ -6564,6 +6603,8 @@ Cookie数量: {cookie_count}
                    SUM(CASE WHEN c.released_at IS NOT NULL OR c.status IN ('released', 'expired') THEN 1 ELSE 0 END) AS released_count
             FROM redeem_code_batches b
             LEFT JOIN redeem_codes c ON c.batch_id = b.id
+            LEFT JOIN cards card ON card.id = b.card_id
+            LEFT JOIN delivery_rules rule ON rule.id = b.rule_id
             {where_sql}
             GROUP BY b.id
         '''
@@ -6573,6 +6614,7 @@ Cookie数量: {cookie_count}
             'id', 'user_id', 'name', 'keyword', 'card_id', 'rule_id',
             'spec_name', 'spec_value', 'spec_name_2', 'spec_value_2',
             'warning_threshold', 'enabled', 'description', 'created_at', 'updated_at',
+            'card_name', 'rule_keyword',
             'total_count', 'available_count', 'reserved_count', 'sent_count',
             'consumed_count', 'released_count'
         ]
@@ -6582,6 +6624,100 @@ Cookie数量: {cookie_count}
         data['enabled'] = bool(data.get('enabled'))
         data['low_stock'] = data['enabled'] and data['available_count'] <= int(data.get('warning_threshold') or 0)
         return data
+
+    def _validate_redeem_batch_specs(self, spec_name: str = None, spec_value: str = None,
+                                     spec_name_2: str = None, spec_value_2: str = None):
+        clean_spec_name = str(spec_name or '').strip() or None
+        clean_spec_value = str(spec_value or '').strip() or None
+        clean_spec_name_2 = str(spec_name_2 or '').strip() or None
+        clean_spec_value_2 = str(spec_value_2 or '').strip() or None
+        if bool(clean_spec_name) != bool(clean_spec_value):
+            raise ValueError("规格1名称和规格1值必须同时填写")
+        if bool(clean_spec_name_2) != bool(clean_spec_value_2):
+            raise ValueError("规格2名称和规格2值必须同时填写")
+        if (clean_spec_name_2 or clean_spec_value_2) and not (clean_spec_name and clean_spec_value):
+            raise ValueError("填写规格2前必须先填写规格1")
+        return clean_spec_name, clean_spec_value, clean_spec_name_2, clean_spec_value_2
+
+    def _empty_redeem_inventory_summary(self):
+        return {
+            'uses_redeem_codes': False,
+            'batch_count': 0,
+            'total_count': 0,
+            'available_count': 0,
+            'reserved_count': 0,
+            'sent_count': 0,
+            'consumed_count': 0,
+            'released_count': 0,
+            'low_stock_count': 0,
+            'batch_ids': [],
+            'batches': [],
+            'primary_batch': None,
+        }
+
+    def _summarize_redeem_batches(self, batches: List[Dict[str, Any]]):
+        summary = self._empty_redeem_inventory_summary()
+        summary['batches'] = batches
+        summary['batch_ids'] = [batch.get('id') for batch in batches if batch.get('id') is not None]
+        summary['batch_count'] = len(batches)
+        summary['uses_redeem_codes'] = bool(batches)
+        for key in ('total_count', 'available_count', 'reserved_count', 'sent_count', 'consumed_count', 'released_count'):
+            summary[key] = sum(int(batch.get(key) or 0) for batch in batches)
+        summary['low_stock_count'] = sum(1 for batch in batches if batch.get('low_stock'))
+        summary['primary_batch'] = batches[0] if len(batches) == 1 else None
+        return summary
+
+    def _get_redeem_inventory_summaries(self, user_id: int = None,
+                                        card_ids: List[int] = None,
+                                        rule_ids: List[int] = None):
+        target_field = 'card_id' if card_ids is not None else 'rule_id'
+        target_ids = card_ids if card_ids is not None else rule_ids
+        clean_ids = []
+        for value in target_ids or []:
+            try:
+                int_value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if int_value not in clean_ids:
+                clean_ids.append(int_value)
+        if not clean_ids:
+            return {}
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                where = []
+                params = []
+                if user_id is not None:
+                    where.append("b.user_id = ?")
+                    params.append(user_id)
+                placeholders = ",".join("?" for _ in clean_ids)
+                where.append(f"b.{target_field} IN ({placeholders})")
+                params.extend(clean_ids)
+                cursor.execute(
+                    self._build_redeem_batch_stats_sql("WHERE " + " AND ".join(where)) + " ORDER BY b.enabled DESC, b.id ASC",
+                    params,
+                )
+                grouped = {value: [] for value in clean_ids}
+                for row in cursor.fetchall():
+                    batch = self._format_redeem_batch_row(row)
+                    target_value = batch.get(target_field)
+                    if target_value is None:
+                        continue
+                    try:
+                        target_value = int(target_value)
+                    except (TypeError, ValueError):
+                        continue
+                    if target_value in grouped:
+                        grouped[target_value].append(batch)
+                return {
+                    target_id: self._summarize_redeem_batches(batches)
+                    for target_id, batches in grouped.items()
+                    if batches
+                }
+            except Exception as e:
+                logger.error(f"获取兑换码库存关联摘要失败: {e}")
+                return {}
 
     def get_redeem_code_batches(self, user_id: int):
         with self.lock:
@@ -6595,6 +6731,140 @@ Cookie数量: {cookie_count}
             except Exception as e:
                 logger.error(f"获取兑换码批次列表失败: {e}")
                 return []
+
+    def bind_redeem_code_batch_to_card(self, batch_id: int, card_id: int, user_id: int,
+                                       rule_id: int = None, exclusive: bool = True):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+
+                self._execute_sql(cursor, '''
+                SELECT id, name, type, is_multi_spec, spec_name, spec_value, spec_name_2, spec_value_2
+                FROM cards
+                WHERE id = ? AND user_id = ?
+                ''', (card_id, user_id))
+                card = cursor.fetchone()
+                if not card:
+                    raise ValueError("卡券不存在或无权访问")
+                if card[2] != 'data':
+                    raise ValueError("只有批量数据卡券可以关联兑换码池")
+
+                self._execute_sql(cursor, '''
+                SELECT id, name, keyword
+                FROM redeem_code_batches
+                WHERE id = ? AND user_id = ?
+                ''', (batch_id, user_id))
+                batch = cursor.fetchone()
+                if not batch:
+                    raise ValueError("兑换码池不存在或无权访问")
+
+                target_rule_id = None
+                target_keyword = str(batch[2] or batch[1] or '').strip() or str(card[1] or '').strip()
+                if rule_id is not None:
+                    self._execute_sql(cursor, '''
+                    SELECT id, keyword, card_id
+                    FROM delivery_rules
+                    WHERE id = ? AND user_id = ?
+                    ''', (rule_id, user_id))
+                    rule = cursor.fetchone()
+                    if not rule:
+                        raise ValueError("发货规则不存在或无权访问")
+                    if int(rule[2]) != int(card_id):
+                        raise ValueError("发货规则必须绑定当前卡券")
+                    target_rule_id = int(rule[0])
+                    target_keyword = str(rule[1] or '').strip() or target_keyword
+                else:
+                    self._execute_sql(cursor, '''
+                    SELECT id, keyword
+                    FROM delivery_rules
+                    WHERE card_id = ? AND user_id = ? AND enabled = 1
+                    ORDER BY id ASC
+                    ''', (card_id, user_id))
+                    rules = cursor.fetchall()
+                    if len(rules) == 1:
+                        target_rule_id = int(rules[0][0])
+                        target_keyword = str(rules[0][1] or '').strip() or target_keyword
+
+                spec_name, spec_value, spec_name_2, spec_value_2 = self._validate_redeem_batch_specs(
+                    card[4] if card[3] else None,
+                    card[5] if card[3] else None,
+                    card[6] if card[3] else None,
+                    card[7] if card[3] else None,
+                )
+
+                if exclusive:
+                    self._execute_sql(cursor, '''
+                    UPDATE redeem_code_batches
+                    SET card_id = NULL, rule_id = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND card_id = ? AND id != ?
+                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_name, ''))), ' ', ''), '　', '') = ?
+                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_value, ''))), ' ', ''), '　', '') = ?
+                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_name_2, ''))), ' ', ''), '　', '') = ?
+                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_value_2, ''))), ' ', ''), '　', '') = ?
+                    ''', (
+                        user_id,
+                        card_id,
+                        batch_id,
+                        self._normalize_redeem_spec_part(spec_name),
+                        self._normalize_redeem_spec_part(spec_value),
+                        self._normalize_redeem_spec_part(spec_name_2),
+                        self._normalize_redeem_spec_part(spec_value_2),
+                    ))
+
+                self._execute_sql(cursor, '''
+                UPDATE redeem_code_batches
+                SET card_id = ?, rule_id = ?, keyword = ?,
+                    spec_name = ?, spec_value = ?, spec_name_2 = ?, spec_value_2 = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                ''', (
+                    card_id,
+                    target_rule_id,
+                    target_keyword,
+                    spec_name,
+                    spec_value,
+                    spec_name_2,
+                    spec_value_2,
+                    batch_id,
+                    user_id,
+                ))
+                self.conn.commit()
+                return {
+                    'batch_id': batch_id,
+                    'card_id': card_id,
+                    'rule_id': target_rule_id,
+                    'exclusive': bool(exclusive),
+                }
+            except Exception as e:
+                logger.error(f"关联卡券兑换码池失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def unbind_redeem_code_batch_from_card(self, card_id: int, user_id: int, batch_id: int = None):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT 1 FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
+                if not cursor.fetchone():
+                    raise ValueError("卡券不存在或无权访问")
+
+                params = [user_id, card_id]
+                batch_filter = ""
+                if batch_id is not None:
+                    batch_filter = " AND id = ?"
+                    params.append(batch_id)
+                self._execute_sql(cursor, f'''
+                UPDATE redeem_code_batches
+                SET card_id = NULL, rule_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND card_id = ?{batch_filter}
+                ''', params)
+                changed = cursor.rowcount
+                self.conn.commit()
+                return changed
+            except Exception as e:
+                logger.error(f"解除卡券兑换码池关联失败: {e}")
+                self.conn.rollback()
+                raise
 
     def import_redeem_codes(self, batch_id: int, user_id: int, raw_codes: str):
         with self.lock:
@@ -6697,32 +6967,47 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                where = ["b.enabled = 1"]
-                params = []
+                base_where = ["b.enabled = 1"]
+                base_params = []
                 if user_id is not None:
-                    where.append("b.user_id = ?")
-                    params.append(user_id)
-                link_clauses = []
-                for column, value in (('rule_id', rule.get('id')), ('card_id', rule.get('card_id')), ('keyword', rule.get('keyword'))):
-                    if value not in (None, ''):
-                        link_clauses.append(f"b.{column} = ?")
-                        params.append(value)
-                if not link_clauses:
+                    base_where.append("b.user_id = ?")
+                    base_params.append(user_id)
+
+                def append_spec_filters(where, params):
+                    for column, value in (
+                        ('spec_name', rule.get('spec_name')),
+                        ('spec_value', rule.get('spec_value')),
+                        ('spec_name_2', rule.get('spec_name_2')),
+                        ('spec_value_2', rule.get('spec_value_2')),
+                    ):
+                        where.append(f"REPLACE(REPLACE(LOWER(TRIM(COALESCE(b.{column}, ''))), ' ', ''), '　', '') = ?")
+                        params.append(self._normalize_redeem_spec_part(value))
+
+                def query_batches(link_column, link_value, with_specs=True):
+                    if link_value in (None, ''):
+                        return []
+                    where = list(base_where)
+                    params = list(base_params)
+                    where.append(f"b.{link_column} = ?")
+                    params.append(link_value)
+                    if with_specs:
+                        append_spec_filters(where, params)
+                    cursor.execute(
+                        self._build_redeem_batch_stats_sql("WHERE " + " AND ".join(where)) + " ORDER BY b.id ASC",
+                        params
+                    )
+                    return [self._format_redeem_batch_row(row) for row in cursor.fetchall()]
+
+                card_batches = query_batches('card_id', rule.get('card_id'), with_specs=True)
+                if card_batches:
+                    return card_batches
+                if rule.get('card_id') not in (None, '') or rule.get('card_type') == 'data':
                     return []
-                where.append("(" + " OR ".join(link_clauses) + ")")
-                for column, value in (
-                    ('spec_name', rule.get('spec_name')),
-                    ('spec_value', rule.get('spec_value')),
-                    ('spec_name_2', rule.get('spec_name_2')),
-                    ('spec_value_2', rule.get('spec_value_2')),
-                ):
-                    where.append(f"REPLACE(REPLACE(LOWER(TRIM(COALESCE(b.{column}, ''))), ' ', ''), '　', '') = ?")
-                    params.append(self._normalize_redeem_spec_part(value))
-                cursor.execute(
-                    self._build_redeem_batch_stats_sql("WHERE " + " AND ".join(where)) + " ORDER BY b.id ASC",
-                    params
-                )
-                return [self._format_redeem_batch_row(row) for row in cursor.fetchall()]
+
+                rule_batches = query_batches('rule_id', rule.get('id'), with_specs=True)
+                if rule_batches:
+                    return rule_batches
+                return query_batches('keyword', rule.get('keyword'), with_specs=True)
             except Exception as e:
                 logger.error(f"匹配兑换码批次失败: {e}")
                 return []
@@ -6730,6 +7015,15 @@ Cookie数量: {cookie_count}
     def has_sufficient_redeem_codes_for_rule(self, rule: Dict[str, Any], quantity: int = 1, user_id: int = None):
         batches = self.find_redeem_code_batches_for_rule(rule, user_id=user_id)
         if not batches:
+            if rule and rule.get('card_type') == 'data':
+                return {
+                    'uses_redeem_codes': True,
+                    'ok': False,
+                    'available_count': 0,
+                    'required_count': max(1, int(quantity or 1)),
+                    'batch_count': 0,
+                    'error': '卡券未绑定兑换码池',
+                }
             return {'uses_redeem_codes': False, 'ok': True, 'available_count': 0, 'batch_count': 0}
         if len(batches) != 1:
             return {'uses_redeem_codes': True, 'ok': False, 'available_count': 0, 'batch_count': len(batches), 'error': '兑换码批次匹配不唯一'}
@@ -6772,6 +7066,8 @@ Cookie数量: {cookie_count}
                 cursor = self.conn.cursor()
                 batches = self.find_redeem_code_batches_for_rule(rule, user_id=user_id)
                 if not batches:
+                    if rule and rule.get('card_type') == 'data':
+                        raise ValueError('卡券未绑定兑换码池，已阻止发货')
                     return {
                         'uses_redeem_codes': False,
                         'ok': True,

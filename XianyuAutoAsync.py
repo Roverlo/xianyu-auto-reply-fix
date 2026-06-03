@@ -12683,7 +12683,7 @@ class XianyuLive:
                     delivery_content = rule['text_content']
 
                 elif rule['card_type'] == 'data':
-                    # 结构化兑换码优先；没有绑定兑换码批次时兼容旧的 data_content 行池。
+                    # 兑换码发货必须先在卡券上绑定兑换码池，避免旧行池绕过库存台账。
                     if reserved_delivery_unit:
                         data_reservation = reserved_delivery_unit
                         data_reservation['source'] = 'redeem_code'
@@ -12700,16 +12700,6 @@ class XianyuLive:
                         )
                         if data_reservation:
                             data_reservation['source'] = 'redeem_code'
-                        else:
-                            data_reservation = db_manager.reserve_batch_data(
-                                card_id=rule['card_id'],
-                                order_id=order_id,
-                                unit_index=delivery_unit_index,
-                                cookie_id=self.cookie_id,
-                                buyer_id=send_user_id,
-                            )
-                            if data_reservation:
-                                data_reservation['source'] = 'data_card'
                     if data_reservation:
                         data_line = data_reservation.get('reserved_content')
                         delivery_content = data_line

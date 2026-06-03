@@ -9085,6 +9085,43 @@ def update_redeem_code_batch(batch_id: int, batch_data: dict, current_user: Dict
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/cards/{card_id}/redeem-code-batch")
+def bind_card_redeem_code_batch(card_id: int, payload: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """将已有兑换码池关联到当前卡券规格。"""
+    try:
+        from db_manager import db_manager
+        result = db_manager.bind_redeem_code_batch_to_card(
+            batch_id=payload.get('batch_id'),
+            card_id=card_id,
+            user_id=current_user['user_id'],
+            rule_id=payload.get('rule_id'),
+            exclusive=payload.get('exclusive', True),
+        )
+        return {"message": "兑换码池关联成功", **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/cards/{card_id}/redeem-code-batch")
+def unbind_card_redeem_code_batch(card_id: int, batch_id: int = None,
+                                  current_user: Dict[str, Any] = Depends(get_current_user)):
+    """解除卡券与兑换码池关联。"""
+    try:
+        from db_manager import db_manager
+        changed = db_manager.unbind_redeem_code_batch_from_card(
+            card_id=card_id,
+            user_id=current_user['user_id'],
+            batch_id=batch_id,
+        )
+        return {"message": "兑换码池关联已解除", "changed": changed}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/redeem-code-batches/{batch_id}/import")
 def import_redeem_codes(batch_id: int, payload: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """导入兑换码，一行一个。"""

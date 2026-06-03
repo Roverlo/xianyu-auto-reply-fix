@@ -7795,6 +7795,7 @@ async function saveAccountNotification() {
 let redeemCodeBatchesCache = [];
 let redeemDeliveryItemsCache = [];
 let redeemDeliveryAccountsCache = [];
+let cardsCache = [];
 
 const REDEEM_CONFIG_DEFAULT_MESSAGE = '您好，您的兑换码是：\n{DELIVERY_CONTENT}\n\n请尽快使用，感谢购买。';
 
@@ -7832,9 +7833,10 @@ async function loadRedeemCodeBatches() {
         redeemCodeBatchesCache = await response.json();
         renderRedeemCodeBatches(redeemCodeBatchesCache);
         updateRedeemBatchSelects(redeemCodeBatchesCache);
+        updateCardRedeemBatchSelectOptions();
     } catch (error) {
-        console.error('加载兑换码批次失败:', error);
-        showToast('加载兑换码批次失败', 'danger');
+        console.error('加载兑换码池失败:', error);
+        showToast('加载兑换码池失败', 'danger');
     }
 }
 
@@ -7842,6 +7844,87 @@ function formatRedeemSpec(batch) {
     const first = [batch.spec_name, batch.spec_value].filter(Boolean).join(':');
     const second = [batch.spec_name_2, batch.spec_value_2].filter(Boolean).join(':');
     return [first, second].filter(Boolean).join(' / ') || '<span class="text-muted">无规格</span>';
+}
+
+function getRedeemInventory(cardOrRule) {
+    return cardOrRule?.redeem_inventory || {
+        uses_redeem_codes: false,
+        batch_count: 0,
+        total_count: 0,
+        available_count: 0,
+        reserved_count: 0,
+        sent_count: 0,
+        consumed_count: 0,
+        low_stock_count: 0,
+        batches: [],
+        primary_batch: null
+    };
+}
+
+function formatRedeemPoolLabel(batch) {
+    if (!batch) return '未绑定兑换码池';
+    return `${batch.name || `池 ${batch.id}`}（可用 ${batch.available_count || 0} / 总 ${batch.total_count || 0}）`;
+}
+
+function formatCardOptionLabel(card) {
+    let displayText = card.name || `卡券 ${card.id}`;
+    let typeText;
+    switch(card.type) {
+        case 'api':
+            typeText = 'API';
+            break;
+        case 'yifan_api':
+            typeText = '亦凡API';
+            break;
+        case 'text':
+            typeText = '固定文字';
+            break;
+        case 'data':
+            typeText = '兑换码/批量数据';
+            break;
+        case 'image':
+            typeText = '图片';
+            break;
+        default:
+            typeText = '未知类型';
+    }
+    displayText += ` (${typeText})`;
+
+    if (card.is_multi_spec && card.spec_name && card.spec_value) {
+        let specInfo = `${card.spec_name}:${card.spec_value}`;
+        if (card.spec_name_2 && card.spec_value_2) {
+            specInfo += `, ${card.spec_name_2}:${card.spec_value_2}`;
+        }
+        displayText += ` [${specInfo}]`;
+    }
+
+    if (card.type === 'data') {
+        const inventory = getRedeemInventory(card);
+        const primaryBatch = inventory.primary_batch || (inventory.batches || [])[0];
+        displayText += primaryBatch
+            ? ` [池: ${formatRedeemPoolLabel(primaryBatch)}]`
+            : ' [未绑定兑换码池，禁止发货]';
+    }
+    return displayText;
+}
+
+function formatRedeemInventoryBadge(target) {
+    const inventory = getRedeemInventory(target);
+    const primaryBatch = inventory.primary_batch || (inventory.batches || [])[0];
+    if (!primaryBatch) {
+        return '<div class="small text-danger fw-semibold"><i class="bi bi-exclamation-triangle me-1"></i>未绑定兑换码池，禁止发货</div>';
+    }
+    if (!primaryBatch.enabled) {
+        return `<div class="small text-danger fw-semibold"><i class="bi bi-exclamation-triangle me-1"></i>池已停用，禁止发货：${escapeHtml(primaryBatch.name || '')}</div>`;
+    }
+    const stockClass = primaryBatch.low_stock ? 'bg-warning text-dark' : 'bg-success';
+    return `
+        <div class="small mt-1">
+            <span class="badge bg-dark-subtle text-dark border">池：${escapeHtml(primaryBatch.name || '')}</span>
+            <span class="badge ${stockClass}">可用 ${primaryBatch.available_count || 0}</span>
+            <span class="text-muted">总 ${primaryBatch.total_count || 0}</span>
+        </div>
+    `;
 }
 
 function renderRedeemCodeBatches(batches) {
@@ -7852,7 +7935,7 @@ function renderRedeemCodeBatches(batches) {
             <tr>
                 <td colspan="6" class="text-center py-4 text-muted">
                     <i class="bi bi-upc-scan fs-1 d-block mb-3"></i>
-                    <h5>暂无兑换码批次</h5>
+                    <h5>暂无兑换码池</h5>
                 </td>
             </tr>
         `;
@@ -7871,7 +7954,10 @@ function renderRedeemCodeBatches(batches) {
                     <div class="fw-semibold">${escapeHtml(batch.name || '')}</div>
                     <small class="text-muted">ID ${batch.id}</small>
                 </td>
-                <td>${escapeHtml(batch.keyword || '')}</td>
+                <td>
+                    ${batch.card_id ? `<span class="badge bg-primary">卡券 ${batch.card_id}</span>` : '<span class="text-danger small">未关联卡券</span>'}
+                    ${batch.rule_id ? `<div class="small text-muted">规则 ${batch.rule_id}</div>` : ''}
+                </td>
                 <td>${formatRedeemSpec(batch)}</td>
                 <td>
                     未发 ${stockBadge}
@@ -7889,15 +7975,38 @@ function renderRedeemCodeBatches(batches) {
 }
 
 function updateRedeemBatchSelects(batches) {
-    const importSelect = document.getElementById('redeemImportBatchSelect');
+        const importSelect = document.getElementById('redeemImportBatchSelect');
+        const cardBindSelect = document.getElementById('cardRedeemBatchSelect');
     if (importSelect) {
-        importSelect.innerHTML = '<option value="">请选择批次</option>' + (batches || []).map(batch =>
+        importSelect.innerHTML = '<option value="">请选择兑换码池</option>' + (batches || []).map(batch =>
             `<option value="${batch.id}">${escapeHtml(batch.name || '')} (${batch.available_count || 0}/${batch.total_count || 0})</option>`
         ).join('');
+    }
+    if (cardBindSelect) {
+        updateCardRedeemBatchSelectOptions();
+    }
+}
+
+function updateCardRedeemBatchSelectOptions(selectedBatchId = '') {
+    const select = document.getElementById('cardRedeemBatchSelect');
+    if (!select) return;
+    const options = (redeemCodeBatchesCache || []).map(batch => {
+        const linkedName = batch.card_name || (batch.card_id ? `卡券 ${batch.card_id}` : '');
+        const linked = linkedName ? ` - 已关联 ${linkedName}` : '';
+        const enabledText = batch.enabled ? '' : ' - 已停用';
+        const label = `${batch.name || `池 ${batch.id}`}（可用 ${batch.available_count || 0} / 总 ${batch.total_count || 0}${linked}${enabledText}）`;
+        return `<option value="${batch.id}">${escapeHtml(label)}</option>`;
+    }).join('');
+    select.innerHTML = '<option value="">请选择已创建的兑换码池</option>' + options;
+    if (selectedBatchId) {
+        select.value = String(selectedBatchId);
     }
 }
 
 async function loadRedeemBatchReferenceSelects() {
+    if (!document.getElementById('redeemBatchCardId') && !document.getElementById('redeemBatchRuleId')) {
+        return;
+    }
     const [cardsResponse, rulesResponse] = await Promise.all([
         fetch(`${apiBase}/cards`, { headers: { 'Authorization': `Bearer ${authToken}` } }),
         fetch(`${apiBase}/delivery-rules`, { headers: { 'Authorization': `Bearer ${authToken}` } })
@@ -8205,30 +8314,18 @@ async function showRedeemBatchModal() {
     document.getElementById('redeemBatchForm')?.reset();
     document.getElementById('redeemWarningThreshold').value = '5';
     document.getElementById('redeemBatchEnabled').checked = true;
-    try {
-        await loadRedeemBatchReferenceSelects();
-    } catch (error) {
-        console.error('加载兑换码绑定选项失败:', error);
-    }
     new bootstrap.Modal(document.getElementById('redeemBatchModal')).show();
 }
 
 async function saveRedeemBatch() {
     const name = document.getElementById('redeemBatchName').value.trim();
-    const keyword = document.getElementById('redeemBatchKeyword').value.trim();
-    if (!name || !keyword) {
-        showToast('请填写批次名称和商品关键字', 'warning');
+    if (!name) {
+        showToast('请填写兑换码池名称', 'warning');
         return;
     }
     const payload = {
         name,
-        keyword,
-        card_id: document.getElementById('redeemBatchCardId').value || null,
-        rule_id: document.getElementById('redeemBatchRuleId').value || null,
-        spec_name: document.getElementById('redeemSpecName').value.trim() || null,
-        spec_value: document.getElementById('redeemSpecValue').value.trim() || null,
-        spec_name_2: document.getElementById('redeemSpecName2').value.trim() || null,
-        spec_value_2: document.getElementById('redeemSpecValue2').value.trim() || null,
+        keyword: name,
         warning_threshold: parseInt(document.getElementById('redeemWarningThreshold').value, 10) || 0,
         enabled: document.getElementById('redeemBatchEnabled').checked,
         description: document.getElementById('redeemBatchDescription').value.trim() || null
@@ -8247,11 +8344,106 @@ async function saveRedeemBatch() {
             throw new Error(error.detail || '创建失败');
         }
         bootstrap.Modal.getInstance(document.getElementById('redeemBatchModal')).hide();
-        showToast('兑换码批次创建成功', 'success');
+        showToast('兑换码池创建成功，请在卡券管理里关联到对应规格', 'success');
         await loadRedeemCodes();
     } catch (error) {
-        console.error('创建兑换码批次失败:', error);
+        console.error('创建兑换码池失败:', error);
         showToast(`创建失败: ${error.message}`, 'danger');
+    }
+}
+
+function getCardByIdFromCache(cardId) {
+    return (cardsCache || []).find(card => String(card.id) === String(cardId)) || null;
+}
+
+async function showBindCardRedeemBatchModal(cardId) {
+    let card = getCardByIdFromCache(cardId);
+    if (!card) {
+        try {
+            const response = await fetch(`${apiBase}/cards/${cardId}`, {
+                headers: { 'Authorization': `Bearer ${authToken}` }
+            });
+            if (response.ok) {
+                card = await response.json();
+            }
+        } catch (error) {
+            console.error('读取卡券详情失败:', error);
+        }
+    }
+    if (!card) {
+        showToast('读取卡券失败', 'danger');
+        return;
+    }
+
+    if (!redeemCodeBatchesCache.length) {
+        await loadRedeemCodeBatches();
+    }
+
+    const inventory = getRedeemInventory(card);
+    const primaryBatch = inventory.primary_batch || (inventory.batches || [])[0];
+    document.getElementById('cardRedeemBindCardId').value = card.id;
+    document.getElementById('cardRedeemBindCardName').textContent = card.name || `卡券 ${card.id}`;
+    const specLabel = card.is_multi_spec && card.spec_name && card.spec_value
+        ? `${card.spec_name}: ${card.spec_value}${card.spec_name_2 && card.spec_value_2 ? ` / ${card.spec_name_2}: ${card.spec_value_2}` : ''}`
+        : '普通规格';
+    document.getElementById('cardRedeemBindCardSpec').textContent = specLabel;
+    document.getElementById('cardRedeemBindCurrent').innerHTML = primaryBatch
+        ? `当前池：<strong>${escapeHtml(formatRedeemPoolLabel(primaryBatch))}</strong>`
+        : '<span class="text-danger fw-semibold">当前未绑定兑换码池，自动发货已禁止。</span>';
+    updateCardRedeemBatchSelectOptions(primaryBatch?.id || '');
+    new bootstrap.Modal(document.getElementById('cardRedeemBatchModal')).show();
+}
+
+async function saveCardRedeemBatchBinding() {
+    const cardId = document.getElementById('cardRedeemBindCardId').value;
+    const batchId = document.getElementById('cardRedeemBatchSelect').value;
+    if (!cardId || !batchId) {
+        showToast('请选择一个已创建的兑换码池', 'warning');
+        return;
+    }
+    try {
+        const response = await fetch(`${apiBase}/cards/${cardId}/redeem-code-batch`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ batch_id: parseInt(batchId, 10), exclusive: true })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(result.detail || '关联失败');
+        }
+        bootstrap.Modal.getInstance(document.getElementById('cardRedeemBatchModal')).hide();
+        showToast('兑换码池已关联到卡券规格', 'success');
+        await Promise.all([loadCards(), loadRedeemCodes(), loadDeliveryRules()]);
+    } catch (error) {
+        console.error('关联兑换码池失败:', error);
+        showToast(`关联失败: ${error.message}`, 'danger');
+    }
+}
+
+async function unbindCardRedeemBatch() {
+    const cardId = document.getElementById('cardRedeemBindCardId').value;
+    if (!cardId) return;
+    if (!confirm('解除后，这张卡券会标红并禁止自动发货。确定解除关联吗？')) {
+        return;
+    }
+    try {
+        const response = await fetch(`${apiBase}/cards/${cardId}/redeem-code-batch`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(result.detail || '解除失败');
+        }
+        bootstrap.Modal.getInstance(document.getElementById('cardRedeemBatchModal')).hide();
+        showToast('兑换码池关联已解除', 'success');
+        await Promise.all([loadCards(), loadRedeemCodes(), loadDeliveryRules()]);
+    } catch (error) {
+        console.error('解除兑换码池关联失败:', error);
+        showToast(`解除失败: ${error.message}`, 'danger');
     }
 }
 
@@ -8345,6 +8537,7 @@ async function loadCards() {
 
     if (response.ok) {
         const cards = await response.json();
+        cardsCache = cards;
         renderCardsList(cards);
         updateCardsStats(cards);
     } else {
@@ -8377,6 +8570,11 @@ function renderCardsList(cards) {
 
     cards.forEach(card => {
     const tr = document.createElement('tr');
+    const redeemInventory = getRedeemInventory(card);
+    const redeemPrimaryBatch = redeemInventory.primary_batch || (redeemInventory.batches || [])[0];
+    if (card.type === 'data' && !redeemPrimaryBatch) {
+        tr.classList.add('table-danger');
+    }
 
     // 类型标签
     let typeBadge = '';
@@ -8405,9 +8603,14 @@ function renderCardsList(cards) {
 
     // 数据量显示
     let dataCount = '-';
-    if (card.type === 'data' && card.data_content) {
+    if (card.type === 'data' && redeemPrimaryBatch) {
+        const stockClass = redeemPrimaryBatch.low_stock ? 'text-warning fw-semibold' : 'text-success fw-semibold';
+        dataCount = `<div class="${stockClass}">可用 ${redeemPrimaryBatch.available_count || 0}</div><small class="text-muted">总 ${redeemPrimaryBatch.total_count || 0}</small>`;
+    } else if (card.type === 'data' && card.data_content) {
         const lines = card.data_content.split('\n').filter(line => line.trim());
-        dataCount = lines.length;
+        dataCount = `<span class="text-danger">未绑定池</span><div class="small text-muted">旧数据 ${lines.length} 行</div>`;
+    } else if (card.type === 'data') {
+        dataCount = '<span class="text-danger">未绑定池</span>';
     } else if (card.type === 'api') {
         dataCount = '∞';
     } else if (card.type === 'text') {
@@ -8433,8 +8636,9 @@ function renderCardsList(cards) {
 
     tr.innerHTML = `
         <td>
-        <div class="fw-bold">${card.name}</div>
-        ${card.description ? `<small class="text-muted">${card.description}</small>` : ''}
+        <div class="fw-bold">${escapeHtml(card.name || '')}</div>
+        ${card.description ? `<small class="text-muted">${escapeHtml(card.description)}</small>` : ''}
+        ${card.type === 'data' ? formatRedeemInventoryBadge(card) : ''}
         </td>
         <td>${typeBadge}</td>
         <td>${specDisplay}</td>
@@ -8452,6 +8656,11 @@ function renderCardsList(cards) {
             <button class="btn btn-sm btn-outline-info" onclick="testCard(${card.id})" title="测试">
             <i class="bi bi-play"></i>
             </button>
+            ${card.type === 'data' ? `
+            <button class="btn btn-sm ${redeemPrimaryBatch ? 'btn-outline-success' : 'btn-danger'}" onclick="showBindCardRedeemBatchModal(${card.id})" title="关联兑换码池">
+            <i class="bi bi-diagram-3"></i>
+            </button>
+            ` : ''}
             <button class="btn btn-sm btn-outline-danger" onclick="deleteCard(${card.id})" title="删除">
             <i class="bi bi-trash"></i>
             </button>
@@ -9162,6 +9371,7 @@ function renderDeliveryRulesList(rules) {
             ${rule.is_multi_spec && rule.spec_name && rule.spec_value ?
             `<br><small class="text-muted mt-1 d-block"><i class="bi bi-tags"></i> ${rule.spec_name}: ${rule.spec_value}${rule.spec_name_2 && rule.spec_value_2 ? `<br><i class="bi bi-tags"></i> ${rule.spec_name_2}: ${rule.spec_value_2}` : ''}</small>` :
             ''}
+            ${rule.card_type === 'data' ? formatRedeemInventoryBadge(rule) : ''}
         </div>
         </td>
         <td>${cardTypeBadge}</td>
@@ -9253,39 +9463,7 @@ async function loadCardsForSelect() {
             const option = document.createElement('option');
             option.value = card.id;
 
-            // 构建显示文本
-            let displayText = card.name;
-
-            // 添加类型信息
-            let typeText;
-            switch(card.type) {
-                case 'api':
-                    typeText = 'API';
-                    break;
-                case 'text':
-                    typeText = '固定文字';
-                    break;
-                case 'data':
-                    typeText = '批量数据';
-                    break;
-                case 'image':
-                    typeText = '图片';
-                    break;
-                default:
-                    typeText = '未知类型';
-            }
-            displayText += ` (${typeText})`;
-
-            // 添加规格信息
-            if (card.is_multi_spec && card.spec_name && card.spec_value) {
-            let specInfo = `${card.spec_name}:${card.spec_value}`;
-            if (card.spec_name_2 && card.spec_value_2) {
-                specInfo += `, ${card.spec_name_2}:${card.spec_value_2}`;
-            }
-            displayText += ` [${specInfo}]`;
-            }
-
-            option.textContent = displayText;
+            option.textContent = formatCardOptionLabel(card);
             select.appendChild(option);
         }
         });
@@ -9758,39 +9936,7 @@ async function loadCardsForEditSelect() {
             const option = document.createElement('option');
             option.value = card.id;
 
-            // 构建显示文本
-            let displayText = card.name;
-
-            // 添加类型信息
-            let typeText;
-            switch(card.type) {
-                case 'api':
-                    typeText = 'API';
-                    break;
-                case 'text':
-                    typeText = '固定文字';
-                    break;
-                case 'data':
-                    typeText = '批量数据';
-                    break;
-                case 'image':
-                    typeText = '图片';
-                    break;
-                default:
-                    typeText = '未知类型';
-            }
-            displayText += ` (${typeText})`;
-
-            // 添加规格信息
-            if (card.is_multi_spec && card.spec_name && card.spec_value) {
-            let specInfo = `${card.spec_name}:${card.spec_value}`;
-            if (card.spec_name_2 && card.spec_value_2) {
-                specInfo += `, ${card.spec_name_2}:${card.spec_value_2}`;
-            }
-            displayText += ` [${specInfo}]`;
-            }
-
-            option.textContent = displayText;
+            option.textContent = formatCardOptionLabel(card);
             select.appendChild(option);
         }
         });
