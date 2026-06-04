@@ -318,16 +318,21 @@ class XianyuLive:
             cls._auth_prewarmed_tokens.pop(cookie_id, None)
 
     @classmethod
-    def cache_auth_prewarmed_token(cls, cookie_id: str, token: str, source: str = 'generic_auth'):
+    def cache_auth_prewarmed_token(cls, cookie_id: str, token: str, source: str = 'generic_auth',
+                                   device_id: str = None):
         """缓存预检成功后的 token，供新实例首轮初始化复用。"""
         if not cookie_id or not token:
             return
         cls._cleanup_auth_prewarmed_tokens()
-        cls._auth_prewarmed_tokens[cookie_id] = {
+        token_info = {
             'token': token,
             'timestamp': time.time(),
             'source': source,
         }
+        cleaned_device_id = cls._normalize_device_id_value(device_id)
+        if cleaned_device_id:
+            token_info['device_id'] = cleaned_device_id
+        cls._auth_prewarmed_tokens[cookie_id] = token_info
 
     @classmethod
     def pop_auth_prewarmed_token(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
@@ -351,6 +356,10 @@ class XianyuLive:
     @classmethod
     def _persisted_token_setting_key(cls, cookie_id: str) -> str:
         return f"{PERSISTED_TOKEN_SETTING_PREFIX}{str(cookie_id or '').strip()}"
+
+    @staticmethod
+    def _normalize_device_id_value(device_id: Any) -> str:
+        return str(device_id or '').strip()
 
     @classmethod
     def load_persisted_access_token(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
@@ -388,6 +397,7 @@ class XianyuLive:
             'token': token,
             'timestamp': cached_at,
             'source': payload.get('source') or 'persisted_cache',
+            'device_id': cls._normalize_device_id_value(payload.get('device_id')),
         }
 
     @classmethod
@@ -397,6 +407,7 @@ class XianyuLive:
         token: str,
         source: str = 'token_refresh',
         cached_at: Optional[float] = None,
+        device_id: str = None,
     ) -> bool:
         """加密保存最近一次成功的 accessToken，供同机重启短期复用。"""
         cleaned_cookie_id = str(cookie_id or '').strip()
@@ -409,6 +420,9 @@ class XianyuLive:
             'cached_at': float(cached_at or time.time()),
             'source': source,
         }
+        cleaned_device_id = cls._normalize_device_id_value(device_id)
+        if cleaned_device_id:
+            payload['device_id'] = cleaned_device_id
         encrypted_payload = db_manager._encrypt_secret(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
         return db_manager.set_system_setting(
             cls._persisted_token_setting_key(cleaned_cookie_id),
@@ -1863,6 +1877,23 @@ class XianyuLive:
             return None
         return text
 
+    def _format_goofish_user(self, user_id: Any) -> str:
+        text = self._normalize_buyer_id_value(user_id)
+        return f"{text}@goofish" if text else ""
+
+    def _build_single_chat_pairs(self, peer_user_id: Any) -> Tuple[str, str]:
+        """闲鱼 IM 创建单聊要求 pairFirst/pairSecond 按用户 ID 数字升序排列。"""
+        peer_id = self._normalize_buyer_id_value(peer_user_id)
+        self_id = self._normalize_buyer_id_value(self.myid)
+        if not peer_id or not self_id:
+            return self._format_goofish_user(peer_id), self._format_goofish_user(self_id)
+
+        try:
+            ordered = sorted([peer_id, self_id], key=lambda value: int(value))
+        except (TypeError, ValueError):
+            ordered = sorted([peer_id, self_id])
+        return self._format_goofish_user(ordered[0]), self._format_goofish_user(ordered[1])
+
     def _create_chat_response_mentions_context(self, payload: Any, buyer_id: str, item_id: str) -> bool:
         """Return whether a create-chat response appears to belong to the requested buyer/item."""
         buyer_id = self._normalize_buyer_id_value(buyer_id)
@@ -1967,6 +1998,248 @@ class XianyuLive:
 
         return self._lookup_recent_chat_id_for_history_order(order)
 
+    def _extract_single_chat_conversation(self, conversation_item: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(conversation_item, dict):
+            return None
+        user_conversation = conversation_item.get('singleChatUserConversation')
+        if isinstance(user_conversation, dict):
+            return user_conversation
+        if isinstance(conversation_item.get('singleChatConversation'), dict):
+            return conversation_item
+        return None
+
+    def _parse_jsonish_dict(self, value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _extract_conversation_candidate(self, conversation_item: Any) -> Optional[Dict[str, Any]]:
+        user_conversation = self._extract_single_chat_conversation(conversation_item)
+        if not user_conversation:
+            return None
+
+        single_conversation = user_conversation.get('singleChatConversation')
+        if not isinstance(single_conversation, dict):
+            return None
+
+        chat_id = self._normalize_history_chat_id(single_conversation.get('cid'))
+        if not chat_id:
+            return None
+
+        pair_first = self._normalize_buyer_id_value(single_conversation.get('pairFirst'))
+        pair_second = self._normalize_buyer_id_value(single_conversation.get('pairSecond'))
+        self_id = self._normalize_buyer_id_value(self.myid)
+        other_user_id = None
+        for candidate in (pair_first, pair_second):
+            if candidate and candidate != self_id:
+                other_user_id = candidate
+                break
+
+        extension = self._parse_jsonish_dict(single_conversation.get('extension'))
+        item_id = str(extension.get('itemId') or '').strip()
+        item_title = str(extension.get('itemTitle') or '').strip()
+
+        last_message = user_conversation.get('lastMessage')
+        if isinstance(last_message, dict):
+            last_message_body = last_message.get('message')
+        else:
+            last_message_body = None
+        last_extension = {}
+        if isinstance(last_message_body, dict):
+            last_extension = self._parse_jsonish_dict(last_message_body.get('extension'))
+            if not other_user_id:
+                sender_id = self._normalize_buyer_id_value(last_extension.get('senderUserId'))
+                receiver_id = self._normalize_buyer_id_value(last_extension.get('receiver'))
+                for candidate in (sender_id, receiver_id):
+                    if candidate and candidate != self_id:
+                        other_user_id = candidate
+                        break
+
+        return {
+            'chat_id': chat_id,
+            'other_user_id': other_user_id,
+            'item_id': item_id,
+            'item_title': item_title,
+            'raw': user_conversation,
+            'single_conversation': single_conversation,
+            'last_message': last_message,
+            'last_extension': last_extension,
+            'modify_time': user_conversation.get('modifyTime'),
+        }
+
+    def _conversation_candidate_mentions_item(self, candidate: Dict[str, Any], item_id: str) -> bool:
+        item_id = str(item_id or '').strip()
+        if not item_id:
+            return False
+        if str(candidate.get('item_id') or '').strip() == item_id:
+            return True
+        raw_payloads = [
+            candidate.get('raw'),
+            candidate.get('single_conversation'),
+            candidate.get('last_message'),
+            candidate.get('last_extension'),
+        ]
+        return any(item_id in text for payload in raw_payloads for text in self._extract_history_order_text_values(payload, max_values=200))
+
+    def _history_messages_mention_context(self, history_messages: list, buyer_id: str, item_id: str) -> bool:
+        buyer_id = self._normalize_buyer_id_value(buyer_id)
+        item_id = str(item_id or '').strip()
+        mentions_buyer = False
+        mentions_item = False
+        for message in history_messages or []:
+            extension = message.get('message_extension') if isinstance(message, dict) else None
+            if isinstance(extension, dict):
+                sender_id = self._normalize_buyer_id_value(extension.get('senderUserId'))
+                receiver_id = self._normalize_buyer_id_value(extension.get('receiver'))
+                if buyer_id and buyer_id in {sender_id, receiver_id}:
+                    mentions_buyer = True
+            for text in self._extract_history_order_text_values(message, max_values=120):
+                if buyer_id and buyer_id in text:
+                    mentions_buyer = True
+                if item_id and item_id in text:
+                    mentions_item = True
+            if mentions_buyer and mentions_item:
+                return True
+        return mentions_buyer and mentions_item
+
+    async def _list_recent_conversation_candidates(self, limit: int = 50, timeout: float = 15.0) -> list:
+        """拉取最近 IM 会话列表，用于订单缺 sid 时反查真实 cid。"""
+        normalized_limit = max(1, min(int(limit or 50), 100))
+        candidates = []
+
+        main_response = await self._send_ws_request_on_main(
+            "/r/Conversation/listNewestPagination",
+            body=[9007199254740991, normalized_limit],
+            timeout=timeout,
+        )
+        if isinstance(main_response, dict):
+            body = main_response.get('body') or {}
+            if isinstance(body, dict) and body.get('code') == '400600001':
+                logger.warning(f"【{self.cookie_id}】最近会话列表被平台限流，暂不用于订单反查")
+                return []
+            if isinstance(body, dict):
+                for item in body.get('userConvs') or []:
+                    candidate = self._extract_conversation_candidate(item)
+                    if candidate:
+                        candidates.append(candidate)
+                logger.info(f"【{self.cookie_id}】最近会话列表通过主连接拉取完成: candidates={len(candidates)}")
+                return candidates
+
+        headers = self._build_websocket_headers()
+        try:
+            async with await self._create_websocket_connection(headers) as websocket:
+                await self.init(websocket)
+                send_mid = generate_mid()
+                request_msg = {
+                    "lwp": "/r/Conversation/listNewestPagination",
+                    "headers": {"mid": send_mid},
+                    "body": [9007199254740991, normalized_limit],
+                }
+                await websocket.send(json.dumps(request_msg))
+
+                deadline = time.time() + max(3.0, float(timeout or 0))
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+                    try:
+                        message = json.loads(raw_message)
+                    except Exception:
+                        continue
+
+                    await self._ack_websocket_protocol_message(websocket, message)
+
+                    recv_mid = str((message.get('headers') or {}).get('mid') or '')
+                    if recv_mid != str(send_mid):
+                        continue
+
+                    body = message.get('body') or {}
+                    if isinstance(body, dict) and body.get('code') == '400600001':
+                        logger.warning(f"【{self.cookie_id}】最近会话列表被平台限流，暂不用于订单反查")
+                        return []
+                    if not isinstance(body, dict):
+                        return []
+                    for item in body.get('userConvs') or []:
+                        candidate = self._extract_conversation_candidate(item)
+                        if candidate:
+                            candidates.append(candidate)
+                    logger.info(f"【{self.cookie_id}】最近会话列表拉取完成: candidates={len(candidates)}")
+                    return candidates
+        except Exception as exc:
+            logger.warning(f"【{self.cookie_id}】最近会话列表拉取失败: {self._safe_str(exc)}")
+        return candidates
+
+    async def _discover_chat_id_from_recent_conversations(self, order: Dict[str, Any],
+                                                          detail: Dict[str, Any] = None) -> Optional[str]:
+        buyer_id = self._normalize_buyer_id_value((detail or {}).get('buyer_id') or order.get('buyer_id'))
+        item_id = str((detail or {}).get('item_id') or order.get('item_id') or '').strip()
+        if not self._is_trustworthy_buyer_id(buyer_id) or not item_id:
+            return None
+
+        candidates = await self._list_recent_conversation_candidates(limit=80)
+        buyer_candidates = [
+            candidate for candidate in candidates
+            if self._normalize_buyer_id_value(candidate.get('other_user_id')) == buyer_id
+        ]
+        if not buyer_candidates:
+            logger.info(f"【{self.cookie_id}】最近会话列表未找到买家会话: buyer_id={buyer_id}, item_id={item_id}")
+            return None
+
+        matched = []
+        for candidate in buyer_candidates:
+            if self._conversation_candidate_mentions_item(candidate, item_id):
+                matched.append(candidate)
+                continue
+
+            chat_id = candidate.get('chat_id')
+            if not chat_id:
+                continue
+            try:
+                history_messages = await self.fetch_conversation_history_with_fallback(
+                    chat_id,
+                    page_size=12,
+                    isolated_timeout=8,
+                    fallback_timeout=6,
+                )
+                if self._history_messages_mention_context(history_messages, buyer_id, item_id):
+                    matched.append(candidate)
+            except Exception as exc:
+                logger.debug(
+                    f"【{self.cookie_id}】最近会话历史校验失败: buyer_id={buyer_id}, "
+                    f"item_id={item_id}, chat_id={chat_id}, error={self._safe_str(exc)}"
+                )
+
+        if len(matched) == 1:
+            chat_id = self._normalize_history_chat_id(matched[0].get('chat_id'))
+            logger.warning(
+                f"【{self.cookie_id}】已通过最近会话列表反查到订单会话ID: "
+                f"buyer_id={buyer_id}, item_id={item_id}, chat_id={chat_id}"
+            )
+            return chat_id
+
+        if len(matched) > 1:
+            chat_ids = [candidate.get('chat_id') for candidate in matched]
+            logger.warning(
+                f"【{self.cookie_id}】最近会话列表命中多个候选，拒绝自动选择: "
+                f"buyer_id={buyer_id}, item_id={item_id}, chat_ids={chat_ids}"
+            )
+        else:
+            logger.info(
+                f"【{self.cookie_id}】最近会话列表找到买家但未通过商品校验: "
+                f"buyer_id={buyer_id}, item_id={item_id}, candidates={len(buyer_candidates)}"
+            )
+        return None
+
     def _extract_chat_id_from_create_chat_response(self, message_data: Any) -> Optional[str]:
         """Extract a goofish conversation id from a create-chat response."""
         try:
@@ -2012,23 +2285,60 @@ class XianyuLive:
             return f"summary_failed:{self._safe_str(exc)}"
 
     async def _create_chat_for_history_order(self, buyer_id: str, item_id: str,
+                                             order_id: str = None,
                                              timeout: float = 20.0) -> Optional[str]:
-        """Create/open a buyer conversation on an isolated WebSocket and return its cid."""
+        """Create/open a buyer conversation and return its cid."""
         buyer_id = self._normalize_buyer_id_value(buyer_id)
         item_id = str(item_id or '').strip()
+        order_id = str(order_id or '').strip()
         if not item_id or not self._is_trustworthy_buyer_id(buyer_id):
             return None
 
         logger.warning(
             f"【{self.cookie_id}】待发货补偿缺少会话ID，尝试通过买家ID+商品ID创建/打开会话: "
-            f"buyer_id={buyer_id}, item_id={item_id}"
+            f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}"
         )
+
+        pair_first, pair_second = self._build_single_chat_pairs(buyer_id)
+        main_response = await self._send_ws_request_on_main(
+            "/r/SingleChatConversation/create",
+            body=[
+                {
+                    "pairFirst": pair_first,
+                    "pairSecond": pair_second,
+                    "bizType": "1",
+                    "extension": {
+                        "itemId": item_id,
+                        "orderId": order_id,
+                        "source": "pending_order_reconcile",
+                    },
+                    "ctx": {
+                        "appVersion": "1.0",
+                        "platform": "web",
+                    },
+                }
+            ],
+            timeout=timeout,
+        )
+        if isinstance(main_response, dict):
+            chat_id = self._extract_chat_id_from_create_chat_response(main_response)
+            if chat_id and chat_id not in {buyer_id, str(self.myid or '').strip()}:
+                logger.warning(
+                    f"【{self.cookie_id}】待发货补偿已通过主连接创建/打开会话解析到chat_id: "
+                    f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}, chat_id={chat_id}"
+                )
+                return chat_id
+            logger.warning(
+                f"【{self.cookie_id}】主连接创建/打开会话未解析到可用chat_id: "
+                f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}, "
+                f"summary={self._summarize_create_chat_response_for_log(main_response)}"
+            )
 
         headers = self._build_websocket_headers()
         try:
             async with await self._create_websocket_connection(headers) as websocket:
                 await self.init(websocket)
-                create_mid = await self.create_chat(websocket, buyer_id, item_id)
+                create_mid = await self.create_chat(websocket, buyer_id, item_id, order_id=order_id)
 
                 deadline = time.time() + max(3.0, float(timeout or 0))
                 seen_relevant_response = False
@@ -2045,6 +2355,7 @@ class XianyuLive:
                         message_data = json.loads(raw_message)
                     except Exception:
                         continue
+                    await self._ack_websocket_protocol_message(websocket, message_data)
                     last_response_summary = self._summarize_create_chat_response_for_log(message_data)
                     response_mid = str((message_data.get('headers') or {}).get('mid') or '')
                     lwp = str(message_data.get('lwp') or '')
@@ -2062,34 +2373,38 @@ class XianyuLive:
                         if chat_id in {buyer_id, str(self.myid or '').strip()}:
                             logger.warning(
                                 f"【{self.cookie_id}】待发货补偿创建/打开会话解析到疑似用户ID，拒绝作为chat_id: "
-                                f"buyer_id={buyer_id}, item_id={item_id}, candidate={chat_id}"
+                                f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}, candidate={chat_id}"
                             )
                             continue
                         logger.warning(
                             f"【{self.cookie_id}】待发货补偿已通过创建/打开会话解析到chat_id: "
-                            f"buyer_id={buyer_id}, item_id={item_id}, chat_id={chat_id}"
+                            f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}, chat_id={chat_id}"
                         )
                         return chat_id
                     logger.warning(
                         f"【{self.cookie_id}】待发货补偿创建/打开会话收到响应但未解析到chat_id: "
-                        f"buyer_id={buyer_id}, item_id={item_id}, summary={last_response_summary}"
+                        f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}, "
+                        f"summary={last_response_summary}"
                     )
 
                 if seen_relevant_response:
                     logger.warning(
                         f"【{self.cookie_id}】待发货补偿创建/打开会话响应中没有可用chat_id: "
-                        f"buyer_id={buyer_id}, item_id={item_id}, last_response={last_response_summary}"
+                        f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}, "
+                        f"last_response={last_response_summary}"
                     )
                 else:
                     logger.warning(
                         f"【{self.cookie_id}】待发货补偿创建/打开会话等待响应超时: "
-                        f"buyer_id={buyer_id}, item_id={item_id}, mid={create_mid}, timeout={timeout}s, "
+                        f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}, "
+                        f"mid={create_mid}, timeout={timeout}s, "
                         f"last_response={last_response_summary}"
                     )
         except Exception as exc:
             logger.warning(
                 f"【{self.cookie_id}】待发货补偿创建/打开会话解析chat_id失败: "
-                f"buyer_id={buyer_id}, item_id={item_id}, error={self._safe_str(exc) or type(exc).__name__}"
+                f"buyer_id={buyer_id}, item_id={item_id}, order_id={order_id or 'unknown'}, "
+                f"error={self._safe_str(exc) or type(exc).__name__}"
             )
 
         return None
@@ -2102,7 +2417,11 @@ class XianyuLive:
 
         buyer_id = self._normalize_buyer_id_value(order.get('buyer_id'))
         item_id = str(order.get('item_id') or '').strip()
-        return await self._create_chat_for_history_order(buyer_id, item_id)
+        order_id = str(order.get('order_id') or '').strip()
+        chat_id = await self._discover_chat_id_from_recent_conversations(order, detail)
+        if chat_id:
+            return chat_id
+        return await self._create_chat_for_history_order(buyer_id, item_id, order_id=order_id)
 
     def _persist_history_order_candidate(self, order: Dict[str, Any], detail: Dict[str, Any] = None,
                                          chat_id: str = None) -> bool:
@@ -2915,6 +3234,9 @@ class XianyuLive:
         self.last_sent_heartbeat_mid = None
         self.pending_heartbeat_mids = deque(maxlen=32)
         self.pending_send_ack_waiters = {}
+        self.pending_ws_response_waiters = {}
+        self.deferred_init_messages = deque(maxlen=64)
+        self.ws_request_lock = asyncio.Lock()
         self.send_ack_timeout_seconds = 5
         self.heartbeat_task = None
         self.ws = None
@@ -3006,21 +3328,32 @@ class XianyuLive:
 
         prewarmed_token_info = self.pop_auth_prewarmed_token(self.cookie_id)
         if prewarmed_token_info:
-            self.current_token = prewarmed_token_info.get('token')
-            self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
-            self.last_token_refresh_status = "success"
-            logger.info(
-                f"【{cookie_id}】已复用认证预热token，来源: {prewarmed_token_info.get('source') or 'unknown'}"
-            )
+            prewarmed_device_id = self._normalize_device_id_value(prewarmed_token_info.get('device_id'))
+            if prewarmed_device_id:
+                self.device_id = prewarmed_device_id
+                self.current_token = prewarmed_token_info.get('token')
+                self.last_token_refresh_time = prewarmed_token_info.get('timestamp', time.time())
+                self.last_token_refresh_status = "success"
+                logger.info(
+                    f"【{cookie_id}】已复用认证预热token，来源: {prewarmed_token_info.get('source') or 'unknown'}"
+                )
+            else:
+                logger.info(f"【{cookie_id}】认证预热token缺少device_id，跳过复用以避免IM注册401")
         else:
             persisted_token_info = self.load_persisted_access_token(self.cookie_id)
             if persisted_token_info:
-                self.current_token = persisted_token_info.get('token')
-                self.last_token_refresh_time = persisted_token_info.get('timestamp', time.time())
-                self.last_token_refresh_status = "success"
-                logger.info(
-                    f"【{cookie_id}】已复用本地Token缓存，来源: {persisted_token_info.get('source') or 'persisted_cache'}"
-                )
+                persisted_device_id = self._normalize_device_id_value(persisted_token_info.get('device_id'))
+                if persisted_device_id:
+                    self.device_id = persisted_device_id
+                    self.current_token = persisted_token_info.get('token')
+                    self.last_token_refresh_time = persisted_token_info.get('timestamp', time.time())
+                    self.last_token_refresh_status = "success"
+                    logger.info(
+                        f"【{cookie_id}】已复用本地Token缓存，来源: {persisted_token_info.get('source') or 'persisted_cache'}"
+                    )
+                else:
+                    self.clear_persisted_access_token(self.cookie_id)
+                    logger.info(f"【{cookie_id}】本地Token缓存缺少device_id，已清理并改为重新获取")
 
         # 通知防重复机制
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
@@ -7537,10 +7870,12 @@ class XianyuLive:
             data_payload = (probe_result.get('payload') or {}).get('data') or {}
             access_token = str(data_payload.get('accessToken') or '').strip()
             if access_token:
+                probe_device_id = self._normalize_device_id_value(probe_result.get('device_id'))
                 self.cache_auth_prewarmed_token(
                     self.cookie_id,
                     access_token,
                     source=f'soft_preflight:{normalized_source}',
+                    device_id=probe_device_id,
                 )
                 token_cached = True
             logger.info(
@@ -7577,7 +7912,12 @@ class XianyuLive:
         for attempt in range(1, max_preflight_retries + 1):
             token = await self.refresh_token(allow_password_login_recovery=False)
             if token:
-                self.cache_auth_prewarmed_token(self.cookie_id, token, source='manual_refresh_handoff')
+                self.cache_auth_prewarmed_token(
+                    self.cookie_id,
+                    token,
+                    source='manual_refresh_handoff',
+                    device_id=self.device_id,
+                )
                 logger.info(f"【{self.cookie_id}】手动刷新后的Token预检成功（第{attempt}次），已缓存预热token供新实例复用")
                 return token
 
@@ -7879,7 +8219,11 @@ class XianyuLive:
                                 new_token = res_json['data']['accessToken']
                                 self.current_token = new_token
                                 self.last_token_refresh_time = time.time()
-                                self.save_persisted_access_token(self.cookie_id, new_token)
+                                self.save_persisted_access_token(
+                                    self.cookie_id,
+                                    new_token,
+                                    device_id=self.device_id,
+                                )
 
                                 # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
                                 self.last_message_received_time = 0
@@ -13159,6 +13503,33 @@ class XianyuLive:
                 raise RuntimeError(f"IM发送被平台拒绝或返回异常(mid={mid}, ack={self._summarize_send_ack(message_data)})")
             return message_data
 
+    def _build_websocket_protocol_ack(self, message_data: dict) -> Optional[Dict[str, Any]]:
+        if not isinstance(message_data, dict):
+            return None
+        headers = message_data.get("headers")
+        if not isinstance(headers, dict):
+            return None
+        ack = {
+            "code": 200,
+            "headers": {
+                "mid": headers.get("mid", generate_mid()),
+                "sid": headers.get("sid", ""),
+            }
+        }
+        for header_key in ("app-key", "ua", "dt"):
+            if header_key in headers:
+                ack["headers"][header_key] = headers[header_key]
+        return ack
+
+    async def _ack_websocket_protocol_message(self, ws, message_data: dict):
+        ack = self._build_websocket_protocol_ack(message_data)
+        if not ack:
+            return
+        try:
+            await ws.send(json.dumps(ack))
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】发送WebSocket协议ACK失败: {self._safe_str(exc)}")
+
     def _consume_pending_send_ack(self, message_data: dict) -> bool:
         try:
             if not isinstance(message_data, dict):
@@ -13176,6 +13547,99 @@ class XianyuLive:
         except Exception as exc:
             logger.debug(f"【{self.cookie_id}】处理IM发送确认回包失败: {self._safe_str(exc)}")
             return False
+
+    def _consume_pending_ws_response(self, message_data: dict) -> bool:
+        try:
+            if not isinstance(message_data, dict):
+                return False
+            mid = str((message_data.get('headers') or {}).get('mid') or '')
+            if not mid:
+                return False
+            future = self.pending_ws_response_waiters.get(mid)
+            if not future:
+                return False
+            if not future.done():
+                future.set_result(message_data)
+            return True
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】处理WebSocket请求响应失败: {self._safe_str(exc)}")
+            return False
+
+    async def _dispatch_websocket_message(self, message_data: dict, websocket, msg_id: str = "unknown") -> bool:
+        try:
+            if await self.handle_heartbeat_response(message_data):
+                return True
+
+            if self._consume_pending_send_ack(message_data):
+                logger.info(f"【{self.cookie_id}】IM发送确认回包已匹配 [ID:{msg_id}]")
+                return True
+
+            if self._consume_pending_ws_response(message_data):
+                logger.info(f"【{self.cookie_id}】WebSocket请求响应已匹配 [ID:{msg_id}]")
+                return True
+
+            is_sync_package = self.is_sync_package(message_data)
+            self._mark_non_heartbeat_message(time.time(), is_sync_package=is_sync_package)
+
+            if self.message_queue_enabled and self.message_queue_running:
+                await self._enqueue_message(message_data, websocket, msg_id)
+            else:
+                self._create_tracked_task(self._handle_message_with_semaphore(message_data, websocket, msg_id))
+            return True
+        except Exception as exc:
+            logger.error(f"处理消息出错: {self._safe_str(exc)}")
+            return False
+
+    async def _replay_deferred_init_messages(self, websocket):
+        if not self.deferred_init_messages:
+            return
+        deferred_count = len(self.deferred_init_messages)
+        logger.info(f"【{self.cookie_id}】回放初始化阶段暂存消息: {deferred_count} 条")
+        while self.deferred_init_messages:
+            message_data = self.deferred_init_messages.popleft()
+            msg_id = str((message_data.get('headers') or {}).get('mid') or 'deferred')
+            await self._dispatch_websocket_message(message_data, websocket, msg_id)
+
+    async def _send_ws_request_on_main(self, lwp: str, body: Any = None, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
+        ws = getattr(self, 'ws', None)
+        if not ws or getattr(ws, 'closed', False):
+            return None
+
+        async with self.ws_request_lock:
+            send_mid = generate_mid()
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self.pending_ws_response_waiters[send_mid] = future
+            request_msg = {
+                "lwp": lwp,
+                "headers": {"mid": send_mid},
+            }
+            if body is not None:
+                request_msg["body"] = body
+            try:
+                await ws.send(json.dumps(request_msg))
+                return await asyncio.wait_for(future, timeout=max(3.0, float(timeout or 0)))
+            except asyncio.TimeoutError:
+                logger.warning(f"【{self.cookie_id}】主WebSocket请求等待响应超时: lwp={lwp}, mid={send_mid}")
+            except Exception as exc:
+                logger.warning(f"【{self.cookie_id}】主WebSocket请求失败: lwp={lwp}, error={self._safe_str(exc)}")
+            finally:
+                if self.pending_ws_response_waiters.get(send_mid) is future:
+                    self.pending_ws_response_waiters.pop(send_mid, None)
+        return None
+
+    def _fail_pending_websocket_waiters(self, reason: str):
+        waiters = []
+        waiters.extend(list(self.pending_ws_response_waiters.items()))
+        waiters.extend(list(self.pending_send_ack_waiters.items()))
+        if not waiters:
+            return
+        exc = ConnectionError(reason or "WebSocket connection closed")
+        for _mid, future in waiters:
+            if future and not future.done():
+                future.set_exception(exc)
+        self.pending_ws_response_waiters.clear()
+        self.pending_send_ack_waiters.clear()
 
     def _record_outgoing_chat_message(self, chat_id: str, user_id: str, content: str, *,
                                       content_type: int = 1, image_url: str = None, item_id: str = None,
@@ -14232,8 +14696,9 @@ class XianyuLive:
             # 确保任务能正常结束
             logger.info(f"【{self.cookie_id}】Token刷新循环已退出")
 
-    async def create_chat(self, ws, toid, item_id='891198795482'):
+    async def create_chat(self, ws, toid, item_id='891198795482', order_id: str = None, source: str = ''):
         create_mid = generate_mid()
+        pair_first, pair_second = self._build_single_chat_pairs(toid)
         msg = {
             "lwp": "/r/SingleChatConversation/create",
             "headers": {
@@ -14241,11 +14706,13 @@ class XianyuLive:
             },
             "body": [
                 {
-                    "pairFirst": f"{toid}@goofish",
-                    "pairSecond": f"{self.myid}@goofish",
+                    "pairFirst": pair_first,
+                    "pairSecond": pair_second,
                     "bizType": "1",
                     "extension": {
-                        "itemId": item_id
+                        "itemId": str(item_id or ''),
+                        "orderId": str(order_id or ''),
+                        "source": str(source or '')
                     },
                     "ctx": {
                         "appVersion": "1.0",
@@ -14328,36 +14795,8 @@ class XianyuLive:
             self.pending_send_ack_waiters.pop(send_mid, None)
             raise
 
-    async def init(self, ws):
-        # 如果没有token或者token过期，获取新token
-        token_refresh_attempted = False
-        if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
-            if self._is_in_qr_login_grace_period():
-                remaining = self._get_qr_login_grace_remaining_seconds()
-                logger.info(f"【{self.cookie_id}】扫码登录保护窗口中，仍执行首轮Token初始化；若命中风控再退避，剩余窗口 {remaining} 秒")
-
-            logger.info(f"【{self.cookie_id}】获取初始token...")
-            token_refresh_attempted = True
-
-            await self.refresh_token()
-
-        if not self.current_token:
-            self.last_init_failure_type = 'init_auth_failed'
-            self.last_init_failure_reason = self.last_token_refresh_status or 'token_missing_after_refresh'
-            logger.error(f"【{self.cookie_id}】无法获取有效token，初始化鉴权失败")
-            # 只有在没有尝试刷新token的情况下才发送通知，避免与refresh_token中的通知重复
-            if not token_refresh_attempted:
-                await self.send_token_refresh_notification("初始化时无法获取有效Token", "token_init_failed")
-            else:
-                logger.info(f"【{self.cookie_id}】由于刚刚尝试过token刷新，跳过重复的初始化失败通知")
-            raise InitAuthError(f"Token获取失败(status={self.last_init_failure_reason})")
-
-        self.last_init_failure_type = None
-        self.last_init_failure_reason = None
-        self.clear_init_auth_failure_state(self.cookie_id)
-        self.init_auth_failures = 0
-
-        msg = {
+    def _build_register_message(self) -> Dict[str, Any]:
+        return {
             "lwp": "/reg",
             "headers": {
                 "cache-header": "app-key token ua wv",
@@ -14371,10 +14810,10 @@ class XianyuLive:
                 "mid": generate_mid()
             }
         }
-        await ws.send(json.dumps(msg))
-        await asyncio.sleep(1)
+
+    def _build_ack_diff_message(self) -> Dict[str, Any]:
         current_time = int(time.time() * 1000)
-        msg = {
+        return {
             "lwp": "/r/SyncStatus/ackDiff",
             "headers": {"mid": generate_mid()},
             "body": [
@@ -14390,8 +14829,131 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
-        logger.info(f'【{self.cookie_id}】连接注册完成')
+
+    def _summarize_reg_response(self, message_data: Any) -> str:
+        if not isinstance(message_data, dict):
+            return self._safe_str(message_data)[:300]
+        headers = message_data.get('headers') if isinstance(message_data.get('headers'), dict) else {}
+        body = message_data.get('body')
+        summary = {
+            'code': message_data.get('code'),
+            'lwp': message_data.get('lwp'),
+            'mid': headers.get('mid'),
+            'body_type': type(body).__name__,
+        }
+        if isinstance(body, dict):
+            for key in ('code', 'msg', 'message', 'error', 'errorCode', 'ret'):
+                if key in body:
+                    summary[key] = body.get(key)
+        return self._safe_str(summary)[:500]
+
+    def _is_reg_auth_failure(self, message_data: Dict[str, Any]) -> bool:
+        if not isinstance(message_data, dict):
+            return False
+        code = message_data.get('code')
+        body = message_data.get('body') if isinstance(message_data.get('body'), dict) else {}
+        body_code = body.get('code')
+        text = self._safe_str(message_data).lower()
+        return (
+            code in (401, '401', 403, '403') or
+            body_code in (401, '401', 403, '403') or
+            any(flag in text for flag in ('token', 'unauthorized', 'auth', '鉴权', '登录'))
+        )
+
+    async def _wait_for_reg_response(self, ws, reg_mid: str, timeout: float = 8.0) -> Dict[str, Any]:
+        deadline = time.time() + max(3.0, float(timeout or 0))
+        last_response = None
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"等待IM注册响应超时(mid={reg_mid}, timeout={timeout}s, "
+                    f"last={self._summarize_reg_response(last_response) if last_response else 'none'})"
+                )
+            raw_message = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            try:
+                message_data = json.loads(raw_message)
+            except Exception:
+                continue
+            last_response = message_data
+            await self._ack_websocket_protocol_message(ws, message_data)
+
+            recv_mid = str((message_data.get('headers') or {}).get('mid') or '')
+            if recv_mid != str(reg_mid):
+                self.deferred_init_messages.append(message_data)
+                continue
+
+            code = message_data.get('code')
+            if code in (200, '200'):
+                return message_data
+
+            raise InitAuthError(f"IM注册失败: {self._summarize_reg_response(message_data)}")
+
+    async def _ensure_init_token(self, *, force_refresh: bool = False) -> bool:
+        token_refresh_attempted = False
+        token_expired = (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval
+        if force_refresh:
+            self.current_token = None
+            self.last_token_refresh_time = 0
+            self.clear_persisted_access_token(self.cookie_id)
+
+        if force_refresh or not self.current_token or token_expired:
+            if self._is_in_qr_login_grace_period():
+                remaining = self._get_qr_login_grace_remaining_seconds()
+                logger.info(f"【{self.cookie_id}】扫码登录保护窗口中，仍执行首轮Token初始化；若命中风控再退避，剩余窗口 {remaining} 秒")
+
+            logger.info(f"【{self.cookie_id}】获取初始token...")
+            token_refresh_attempted = True
+            await self.refresh_token()
+
+        if self.current_token:
+            return True
+
+        self.last_init_failure_type = 'init_auth_failed'
+        self.last_init_failure_reason = self.last_token_refresh_status or 'token_missing_after_refresh'
+        logger.error(f"【{self.cookie_id}】无法获取有效token，初始化鉴权失败")
+        if not token_refresh_attempted:
+            await self.send_token_refresh_notification("初始化时无法获取有效Token", "token_init_failed")
+        else:
+            logger.info(f"【{self.cookie_id}】由于刚刚尝试过token刷新，跳过重复的初始化失败通知")
+        raise InitAuthError(f"Token获取失败(status={self.last_init_failure_reason})")
+
+    async def _send_register_and_ack_diff(self, ws) -> Dict[str, Any]:
+        reg_msg = self._build_register_message()
+        reg_mid = str(reg_msg.get('headers', {}).get('mid') or '')
+        await ws.send(json.dumps(reg_msg))
+        reg_response = await self._wait_for_reg_response(ws, reg_mid, timeout=8.0)
+        await ws.send(json.dumps(self._build_ack_diff_message()))
+        return reg_response
+
+    async def init(self, ws):
+        self.deferred_init_messages.clear()
+        last_error = None
+        for attempt in range(1, 3):
+            await self._ensure_init_token(force_refresh=(attempt > 1))
+            try:
+                reg_response = await self._send_register_and_ack_diff(ws)
+                self.last_init_failure_type = None
+                self.last_init_failure_reason = None
+                self.clear_init_auth_failure_state(self.cookie_id)
+                self.init_auth_failures = 0
+                logger.info(
+                    f"【{self.cookie_id}】连接注册完成: device_id={self.device_id}, "
+                    f"response={self._summarize_reg_response(reg_response)}"
+                )
+                return
+            except InitAuthError as exc:
+                last_error = exc
+                error_text = self._safe_str(exc)
+                logger.warning(f"【{self.cookie_id}】IM注册失败(第{attempt}/2次): {error_text}")
+                if attempt == 1 and ('401' in error_text or '403' in error_text or 'token' in error_text.lower()):
+                    self.clear_persisted_access_token(self.cookie_id)
+                    self.current_token = None
+                    self.last_token_refresh_time = 0
+                    continue
+                raise
+
+        raise InitAuthError(self._safe_str(last_error) or "IM注册失败")
 
     async def list_all_conversations(self, cid: str, page_size: int = 20):
         """拉取指定会话的历史消息。"""
@@ -14439,23 +15001,7 @@ class XianyuLive:
                 except Exception:
                     continue
 
-                try:
-                    ack = {
-                        "code": 200,
-                        "headers": {
-                            "mid": message.get("headers", {}).get("mid", generate_mid()),
-                            "sid": message.get("headers", {}).get("sid", ""),
-                        }
-                    }
-                    if 'app-key' in message.get("headers", {}):
-                        ack["headers"]["app-key"] = message["headers"]["app-key"]
-                    if 'ua' in message.get("headers", {}):
-                        ack["headers"]["ua"] = message["headers"]["ua"]
-                    if 'dt' in message.get("headers", {}):
-                        ack["headers"]["dt"] = message["headers"]["dt"]
-                    await websocket.send(json.dumps(ack))
-                except Exception:
-                    pass
+                await self._ack_websocket_protocol_message(websocket, message)
                 
                 try:
                     if message.get('lwp') == "/s/vulcan":
@@ -14525,6 +15071,7 @@ class XianyuLive:
         )
         isolated_live.current_token = self.current_token
         isolated_live.last_token_refresh_time = self.last_token_refresh_time
+        isolated_live.device_id = self.device_id
         isolated_live.proxy_config = dict(self.proxy_config or {})
         isolated_live.base_url = self.base_url
         logger.info(f"【{self.cookie_id}】已创建独立历史拉取实例: chat_id={cid}, page_size={page_size}")
@@ -18258,6 +18805,7 @@ class XianyuLive:
                                     self.current_token,
                                     source='websocket_init_success',
                                     cached_at=token_validated_at,
+                                    device_id=self.device_id,
                                 )
 
                             # 初始化完成后才设置为已连接状态
@@ -18330,6 +18878,7 @@ class XianyuLive:
                             logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
                             logger.info(f"【{self.cookie_id}】WebSocket连接状态正常，等待服务器消息...")
                             logger.info(f"【{self.cookie_id}】准备进入消息循环...")
+                            await self._replay_deferred_init_messages(websocket)
 
                             async for message in websocket:
                                 try:
@@ -18353,27 +18902,7 @@ class XianyuLive:
                                     
                                     logger.info(f"【{self.cookie_id}】📨 收到消息 [ID:{msg_id}] {msg_preview} {len(message) if message else 0}字节")
 
-                                    # 处理心跳响应（高优先级，直接处理）
-                                    if await self.handle_heartbeat_response(message_data):
-                                        continue
-
-                                    # 处理主动发送消息的服务端确认回包。这里必须在消息队列前消费，
-                                    # 否则自动发货会把 WebSocket 写入误判成真正发送成功。
-                                    if self._consume_pending_send_ack(message_data):
-                                        logger.info(f"【{self.cookie_id}】IM发送确认回包已匹配 [ID:{msg_id}]")
-                                        continue
-
-                                    is_sync_package = self.is_sync_package(message_data)
-                                    self._mark_non_heartbeat_message(time.time(), is_sync_package=is_sync_package)
-
-                                    # 处理其他消息
-                                    # 使用高性能消息队列系统处理消息，解决消息阻塞问题
-                                    if self.message_queue_enabled and self.message_queue_running:
-                                        # 消息队列模式：快速入队，由工作协程异步处理
-                                        await self._enqueue_message(message_data, websocket, msg_id)
-                                    else:
-                                        # 传统模式：使用追踪的异步任务处理消息
-                                        self._create_tracked_task(self._handle_message_with_semaphore(message_data, websocket, msg_id))
+                                    await self._dispatch_websocket_message(message_data, websocket, msg_id)
 
                                 except Exception as e:
                                     logger.error(f"处理消息出错: {self._safe_str(e)}")
@@ -18387,6 +18916,7 @@ class XianyuLive:
                             # 确保在退出 async with 块时清理 WebSocket 引用
                             # 注意：async with 会自动关闭 WebSocket，但我们需要清理引用
                             if self.ws == websocket:
+                                self._fail_pending_websocket_waiters("主WebSocket连接已退出")
                                 self.ws = None
                                 logger.info(f"【{self.cookie_id}】WebSocket连接已退出，引用已清理")
 

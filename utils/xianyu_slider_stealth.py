@@ -248,6 +248,7 @@ def probe_cookie_verification_from_cookie(
         "session_cookies": session_cookies,
         "success_ret": success_ret,
         "has_token_payload": has_token_payload,
+        "device_id": device_id,
     }
 
 
