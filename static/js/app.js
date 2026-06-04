@@ -686,9 +686,21 @@ function isRuntimeStatusHealthy(runtimeStatus) {
         runtimeStatus?.running
         && runtimeStatus.ws_ready
         && runtimeStatus.session_ready
-        && runtimeStatus.has_current_token
+        && (runtimeStatus.has_current_token || isRuntimeStatusInQrGrace(runtimeStatus))
         && runtimeStatus.message_stream_ready
     );
+}
+
+function isRuntimeStatusInQrGrace(runtimeStatus) {
+    return Boolean(
+        runtimeStatus?.running
+        && runtimeStatus.token_refresh_status === 'qr_login_grace_wait'
+        && Number(runtimeStatus.qr_login_grace_remaining_seconds || 0) > 0
+    );
+}
+
+function getRuntimeTokenReady(runtimeStatus) {
+    return Boolean(runtimeStatus?.has_current_token || isRuntimeStatusInQrGrace(runtimeStatus));
 }
 
 function getRuntimeStatusRecentAnchor(runtimeStatus) {
@@ -3503,7 +3515,8 @@ function getAboutStatusVariant(type, value) {
 
     if (normalized === 'success' || normalized === 'recovered') return 'success';
     if (normalized === 'started' || normalized === 'connecting' || normalized === 'reconnecting') return 'info';
-    if (normalized === 'server_overload_rgv587' || normalized === 'qr_login_grace_wait') return 'warning';
+    if (normalized === 'qr_login_grace_wait') return 'info';
+    if (normalized === 'server_overload_rgv587') return 'warning';
     if (normalized === 'hard_risk_block' || normalized === 'manual_required' || normalized === 'unknown_risk') return 'danger';
     if (normalized.includes('failed') || normalized.includes('exception') || normalized.includes('error')) return 'danger';
     if (normalized.includes('skipped') || normalized.includes('retry') || normalized.includes('restarted')) return 'warning';
@@ -3746,6 +3759,22 @@ function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
         };
     }
 
+    if (isRuntimeStatusInQrGrace(runtimeStatus)) {
+        const stableSignals = [
+            runtimeStatus.ws_ready,
+            runtimeStatus.session_ready,
+            runtimeStatus.message_stream_ready,
+        ].filter(Boolean).length;
+        const allStable = stableSignals === 3;
+        return {
+            tone: allStable ? 'info' : 'warning',
+            title: allStable ? '扫码保护中，消息链路正常' : '扫码保护中，等待链路稳定',
+            note: allStable
+                ? '刚扫码后系统会暂缓强刷 Token，避免触发平台风控；心跳和消息链路仍在正常运行。'
+                : '刚扫码后系统正在稳定连接，先观察心跳、轻保活和消息流是否继续推进。',
+        };
+    }
+
     if (runtimeStatus?.token_refresh_status === 'server_overload_rgv587') {
         return {
             tone: 'warning',
@@ -3762,7 +3791,7 @@ function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
         };
     }
 
-    if (!runtimeStatus?.ws_ready || !runtimeStatus?.session_ready || !runtimeStatus?.has_current_token || !runtimeStatus?.message_stream_ready) {
+    if (!runtimeStatus?.ws_ready || !runtimeStatus?.session_ready || !getRuntimeTokenReady(runtimeStatus) || !runtimeStatus?.message_stream_ready) {
         return {
             tone: 'warning',
             title: `${readinessCount} / 4 关键链路已就绪`,
@@ -3813,7 +3842,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
         { label: '实例', ready: !!runtimeStatus.running },
         { label: 'WS', ready: !!runtimeStatus.ws_ready },
         { label: 'Session', ready: !!runtimeStatus.session_ready },
-        { label: 'Token', ready: !!runtimeStatus.has_current_token },
+        { label: 'Token', ready: getRuntimeTokenReady(runtimeStatus) },
         { label: '业务流', ready: !!runtimeStatus.message_stream_ready },
     ];
     const readinessSignalItems = readinessItems.slice(1);
