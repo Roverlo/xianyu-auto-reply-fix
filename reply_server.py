@@ -9085,6 +9085,23 @@ def update_redeem_code_batch(batch_id: int, batch_data: dict, current_user: Dict
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/redeem-code-batches/{batch_id}")
+def delete_redeem_code_batch(batch_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """删除空的兑换码池。"""
+    try:
+        from db_manager import db_manager
+        success = db_manager.delete_redeem_code_batch(batch_id, current_user['user_id'])
+        if not success:
+            raise HTTPException(status_code=404, detail="兑换码池不存在")
+        return {"message": "兑换码池删除成功"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/cards/{card_id}/redeem-code-batch")
 def bind_card_redeem_code_batch(card_id: int, payload: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """将已有兑换码池关联到当前卡券规格。"""

@@ -1746,7 +1746,6 @@
                   <tr>
                     <th>兑换码池</th>
                     <th>关联卡券</th>
-                    <th>规格</th>
                     <th>库存</th>
                     <th>状态</th>
                     <th>操作</th>
@@ -4689,22 +4688,23 @@
         <div class="modal-header">
           <h5 class="modal-title">
             <i class="bi bi-upc-scan me-2"></i>
-            新建兑换码池
+            <span id="redeemBatchModalTitle">新建兑换码池</span>
           </h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
           <form id="redeemBatchForm">
-            <div class="form-check form-switch mb-3">
+            <input type="hidden" id="redeemBatchId">
+            <div class="form-check form-switch mb-3" id="redeemBatchBulkSwitchGroup">
               <input class="form-check-input" type="checkbox" id="redeemBatchBulkEnabled" onchange="toggleRedeemBatchBulkFields()">
               <label class="form-check-label" for="redeemBatchBulkEnabled">
-                按规格批量创建
+                批量创建兑换码池
               </label>
             </div>
             <div class="row">
-              <div class="col-md-8 mb-3">
+              <div class="col-md-8 mb-3" id="redeemBatchSingleNameGroup">
                 <label class="form-label" id="redeemBatchNameLabel">兑换码池名称 <span class="text-danger">*</span></label>
-                <input type="text" class="form-control" id="redeemBatchName" placeholder="例如：商品A-月卡" required>
+                <input type="text" class="form-control" id="redeemBatchName" placeholder="例如：codex-5刀" required>
                 <div class="form-text" id="redeemBatchNameHelp">单独创建一个兑换码池</div>
               </div>
               <div class="col-md-4 mb-3">
@@ -4713,16 +4713,10 @@
               </div>
             </div>
             <div id="redeemBatchBulkFields" style="display: none;">
-              <div class="row">
-                <div class="col-md-6 mb-3">
-                  <label class="form-label">规格名称 <span class="text-danger">*</span></label>
-                  <input type="text" class="form-control" id="redeemBatchSpecName" placeholder="例如：套餐、时长、版本">
-                </div>
-                <div class="col-md-6 mb-3">
-                  <label class="form-label">规格值 <span class="text-danger">*</span></label>
-                  <textarea class="form-control" id="redeemBatchSpecValues" rows="3" placeholder="例如：月卡&#10;季卡&#10;年卡，也可以用逗号分隔"></textarea>
-                  <div class="form-text">每个规格值会创建一个兑换码池，池名自动生成为“前缀-规格值”</div>
-                </div>
+              <div class="mb-3">
+                <label class="form-label">兑换码池名称 <span class="text-danger">*</span></label>
+                <textarea class="form-control" id="redeemBatchBulkNames" rows="7" placeholder="codex-5刀&#10;codex-10刀&#10;codex-20刀"></textarea>
+                <div class="form-text">一行一个池名，批量创建时不会要求填写规格。</div>
               </div>
             </div>
             <div class="row">

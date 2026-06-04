@@ -7823,12 +7823,6 @@ async function loadRedeemCodeBatches() {
     }
 }
 
-function formatRedeemSpec(batch) {
-    const first = [batch.spec_name, batch.spec_value].filter(Boolean).join(':');
-    const second = [batch.spec_name_2, batch.spec_value_2].filter(Boolean).join(':');
-    return [first, second].filter(Boolean).join(' / ') || '<span class="text-muted">无规格</span>';
-}
-
 function getRedeemInventory(cardOrRule) {
     return cardOrRule?.redeem_inventory || {
         uses_redeem_codes: false,
@@ -7916,7 +7910,7 @@ function renderRedeemCodeBatches(batches) {
     if (!batches || batches.length === 0) {
         tbody.innerHTML = `
             <tr>
-                <td colspan="6" class="text-center py-4 text-muted">
+                <td colspan="5" class="text-center py-4 text-muted">
                     <i class="bi bi-upc-scan fs-1 d-block mb-3"></i>
                     <h5>暂无兑换码池</h5>
                 </td>
@@ -7941,16 +7935,23 @@ function renderRedeemCodeBatches(batches) {
                     ${batch.card_id ? `<span class="badge bg-primary">卡券 ${batch.card_id}</span>` : '<span class="text-danger small">未关联卡券</span>'}
                     ${batch.rule_id ? `<div class="small text-muted">规则 ${batch.rule_id}</div>` : ''}
                 </td>
-                <td>${formatRedeemSpec(batch)}</td>
                 <td>
                     未发 ${stockBadge}
                     <div class="small text-muted">总 ${batch.total_count || 0} / 预占 ${batch.reserved_count || 0} / 已发 ${batch.sent_count || 0} / 已消耗 ${batch.consumed_count || 0}</div>
                 </td>
                 <td>${statusBadge}</td>
                 <td>
-                    <button class="btn btn-outline-primary btn-sm" onclick="showRedeemImportModal(${batch.id})">
-                        <i class="bi bi-upload me-1"></i>导入
-                    </button>
+                    <div class="btn-group btn-group-sm">
+                        <button class="btn btn-outline-primary" onclick="showRedeemImportModal(${batch.id})" title="导入兑换码">
+                            <i class="bi bi-upload me-1"></i>导入
+                        </button>
+                        <button class="btn btn-outline-secondary" onclick="showEditRedeemBatchModal(${batch.id})" title="修改兑换码池">
+                            <i class="bi bi-pencil me-1"></i>修改
+                        </button>
+                        <button class="btn btn-outline-danger" onclick="deleteRedeemBatch(${batch.id})" title="删除兑换码池">
+                            <i class="bi bi-trash me-1"></i>删除
+                        </button>
+                    </div>
                 </td>
             </tr>
         `;
@@ -8310,65 +8311,89 @@ async function saveRedeemConfigWizard() {
     }
 }
 
-async function showRedeemBatchModal() {
+async function showRedeemBatchModal(batchId = null) {
+    const batch = batchId
+        ? (redeemCodeBatchesCache || []).find(item => String(item.id) === String(batchId))
+        : null;
+    if (batchId && !batch) {
+        showToast('未找到兑换码池', 'warning');
+        return;
+    }
     document.getElementById('redeemBatchForm')?.reset();
+    document.getElementById('redeemBatchId').value = batch ? batch.id : '';
+    document.getElementById('redeemBatchModalTitle').textContent = batch ? '修改兑换码池' : '新建兑换码池';
     document.getElementById('redeemWarningThreshold').value = '5';
     document.getElementById('redeemBatchEnabled').checked = true;
     document.getElementById('redeemBatchBulkEnabled').checked = false;
+    if (batch) {
+        document.getElementById('redeemBatchName').value = batch.name || '';
+        document.getElementById('redeemWarningThreshold').value = batch.warning_threshold ?? 5;
+        document.getElementById('redeemBatchDescription').value = batch.description || '';
+        document.getElementById('redeemBatchEnabled').checked = !!batch.enabled;
+    }
     toggleRedeemBatchBulkFields();
     new bootstrap.Modal(document.getElementById('redeemBatchModal')).show();
 }
 
+function showEditRedeemBatchModal(batchId) {
+    showRedeemBatchModal(batchId);
+}
+
 function toggleRedeemBatchBulkFields() {
     const bulkEnabled = document.getElementById('redeemBatchBulkEnabled')?.checked || false;
+    const editMode = !!document.getElementById('redeemBatchId')?.value;
     const fields = document.getElementById('redeemBatchBulkFields');
-    const nameLabel = document.getElementById('redeemBatchNameLabel');
+    const singleNameGroup = document.getElementById('redeemBatchSingleNameGroup');
+    const bulkSwitchGroup = document.getElementById('redeemBatchBulkSwitchGroup');
     const nameHelp = document.getElementById('redeemBatchNameHelp');
     const saveButton = document.getElementById('saveRedeemBatchBtn');
-    if (fields) fields.style.display = bulkEnabled ? 'block' : 'none';
-    if (nameLabel) nameLabel.innerHTML = bulkEnabled ? '池名称前缀 <span class="text-danger">*</span>' : '兑换码池名称 <span class="text-danger">*</span>';
-    if (nameHelp) nameHelp.textContent = bulkEnabled ? '例如填写“商品A”，会按规格值生成“商品A-月卡 / 商品A-季卡”' : '单独创建一个兑换码池';
-    if (saveButton) saveButton.textContent = bulkEnabled ? '批量创建池' : '创建池';
+    if (bulkSwitchGroup) bulkSwitchGroup.style.display = editMode ? 'none' : 'block';
+    if (fields) fields.style.display = bulkEnabled && !editMode ? 'block' : 'none';
+    if (singleNameGroup) singleNameGroup.style.display = bulkEnabled && !editMode ? 'none' : 'block';
+    if (nameHelp) nameHelp.textContent = editMode ? '只修改池名和基础设置，不影响已导入的兑换码。' : '单独创建一个兑换码池';
+    if (saveButton) saveButton.textContent = editMode ? '保存修改' : (bulkEnabled ? '批量创建池' : '创建池');
 }
 
 async function saveRedeemBatch() {
     const saveButton = document.getElementById('saveRedeemBatchBtn');
     const originalButtonHtml = saveButton ? saveButton.innerHTML : '';
+    const batchId = document.getElementById('redeemBatchId')?.value || '';
     const name = document.getElementById('redeemBatchName').value.trim();
-    const bulkEnabled = document.getElementById('redeemBatchBulkEnabled')?.checked || false;
-    if (!name) {
-        showToast(bulkEnabled ? '请填写池名称前缀' : '请填写兑换码池名称', 'warning');
+    const bulkEnabled = !batchId && (document.getElementById('redeemBatchBulkEnabled')?.checked || false);
+    if (!bulkEnabled && !name) {
+        showToast('请填写兑换码池名称', 'warning');
         return;
     }
-    const specName = document.getElementById('redeemBatchSpecName')?.value.trim() || '';
-    const specValues = parseSpecValueList(document.getElementById('redeemBatchSpecValues')?.value || '');
-    if (bulkEnabled && (!specName || specValues.length === 0)) {
-        showToast('批量创建需要填写规格名称和至少一个规格值', 'warning');
+    const batchNames = bulkEnabled ? parseRedeemBatchNameList(document.getElementById('redeemBatchBulkNames')?.value || '') : [];
+    if (bulkEnabled && batchNames.length === 0) {
+        showToast('请至少填写一个兑换码池名称', 'warning');
         return;
     }
     const basePayload = {
-        keyword: name,
         warning_threshold: parseInt(document.getElementById('redeemWarningThreshold').value, 10) || 0,
         enabled: document.getElementById('redeemBatchEnabled').checked,
-        description: document.getElementById('redeemBatchDescription').value.trim() || null
+        description: document.getElementById('redeemBatchDescription').value.trim() || null,
+        spec_name: null,
+        spec_value: null,
+        spec_name_2: null,
+        spec_value_2: null
     };
     const payloads = bulkEnabled
-        ? specValues.map(specValue => ({
+        ? batchNames.map(batchName => ({
             ...basePayload,
-            name: `${name}-${specValue}`,
-            spec_name: specName,
-            spec_value: specValue
+            name: batchName,
+            keyword: batchName
         }))
         : [{ ...basePayload, name, keyword: name }];
     try {
         if (saveButton) {
             saveButton.disabled = true;
-            saveButton.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>创建中';
+            saveButton.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>${batchId ? '保存中' : '创建中'}`;
         }
         const results = [];
         for (const payload of payloads) {
-            const response = await fetch(`${apiBase}/redeem-code-batches`, {
-            method: 'POST',
+            const response = await fetch(batchId ? `${apiBase}/redeem-code-batches/${batchId}` : `${apiBase}/redeem-code-batches`, {
+            method: batchId ? 'PUT' : 'POST',
             headers: {
                 'Authorization': `Bearer ${authToken}`,
                 'Content-Type': 'application/json'
@@ -8389,7 +8414,9 @@ async function saveRedeemBatch() {
             throw new Error(failedResults[0]?.error || '创建失败');
         }
         bootstrap.Modal.getInstance(document.getElementById('redeemBatchModal')).hide();
-        if (bulkEnabled) {
+        if (batchId) {
+            showToast('兑换码池已更新', 'success');
+        } else if (bulkEnabled) {
             showToast(`已创建 ${successCount} 个兑换码池${failedResults.length ? `，失败 ${failedResults.length} 个` : ''}`, failedResults.length ? 'warning' : 'success');
             if (failedResults.length) console.warn('部分兑换码池创建失败:', failedResults);
         } else {
@@ -8398,12 +8425,52 @@ async function saveRedeemBatch() {
         await loadRedeemCodeBatches();
     } catch (error) {
         console.error('创建兑换码池失败:', error);
-        showToast(`创建失败: ${error.message}`, 'danger');
+        showToast(`${batchId ? '保存' : '创建'}失败: ${error.message}`, 'danger');
     } finally {
         if (saveButton) {
             saveButton.disabled = false;
-            saveButton.innerHTML = originalButtonHtml || (bulkEnabled ? '批量创建池' : '创建池');
+            saveButton.innerHTML = originalButtonHtml || (batchId ? '保存修改' : (bulkEnabled ? '批量创建池' : '创建池'));
         }
+    }
+}
+
+function parseRedeemBatchNameList(rawValue) {
+    const seen = new Set();
+    return String(rawValue || '')
+        .split(/[\r\n,，]+/)
+        .map(item => item.trim())
+        .filter(Boolean)
+        .filter(item => {
+            const key = item.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+}
+
+async function deleteRedeemBatch(batchId) {
+    const batch = (redeemCodeBatchesCache || []).find(item => String(item.id) === String(batchId));
+    if (!batch) {
+        showToast('未找到兑换码池', 'warning');
+        return;
+    }
+    if (!confirm(`确定删除兑换码池「${batch.name || `池 ${batch.id}`}」吗？\n\n已导入兑换码的池不允许删除。`)) {
+        return;
+    }
+    try {
+        const response = await fetch(`${apiBase}/redeem-code-batches/${batch.id}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(result.detail || '删除失败');
+        }
+        showToast('兑换码池已删除', 'success');
+        await loadRedeemCodeBatches();
+    } catch (error) {
+        console.error('删除兑换码池失败:', error);
+        showToast(`删除失败: ${error.message}`, 'danger');
     }
 }
 

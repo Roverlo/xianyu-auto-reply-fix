@@ -6497,6 +6497,14 @@ Cookie数量: {cookie_count}
                 if not clean_name:
                     raise ValueError("兑换码池名称不能为空")
 
+                self._execute_sql(cursor, '''
+                SELECT id FROM redeem_code_batches
+                WHERE user_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+                LIMIT 1
+                ''', (user_id, clean_name))
+                if cursor.fetchone():
+                    raise ValueError(f"兑换码池名称已存在: {clean_name}")
+
                 if card_id is not None:
                     self._execute_sql(cursor, "SELECT 1 FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
                     if not cursor.fetchone():
@@ -6544,6 +6552,15 @@ Cookie数量: {cookie_count}
                         continue
                     if field in {'name', 'keyword'} and not str(value or '').strip():
                         raise ValueError("批次名称和商品关键字不能为空")
+                    if field == 'name':
+                        clean_name = str(value or '').strip()
+                        self._execute_sql(cursor, '''
+                        SELECT id FROM redeem_code_batches
+                        WHERE user_id = ? AND id != ? AND LOWER(TRIM(name)) = LOWER(TRIM(?))
+                        LIMIT 1
+                        ''', (user_id, batch_id, clean_name))
+                        if cursor.fetchone():
+                            raise ValueError(f"兑换码池名称已存在: {clean_name}")
                     if field == 'warning_threshold':
                         value = max(0, int(value or 0))
                     fields.append(f"{field} = ?")
@@ -6563,6 +6580,36 @@ Cookie数量: {cookie_count}
                 return cursor.rowcount > 0
             except Exception as e:
                 logger.error(f"更新兑换码批次失败: {e}")
+                self.conn.rollback()
+                raise
+
+    def delete_redeem_code_batch(self, batch_id: int, user_id: int):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "SELECT id, name FROM redeem_code_batches WHERE id = ? AND user_id = ?",
+                    (batch_id, user_id),
+                )
+                batch = cursor.fetchone()
+                if not batch:
+                    return False
+
+                self._execute_sql(cursor, "SELECT COUNT(*) FROM redeem_codes WHERE batch_id = ?", (batch_id,))
+                code_count = int(cursor.fetchone()[0] or 0)
+                if code_count > 0:
+                    raise ValueError("兑换码池已有兑换码，不能删除")
+
+                self._execute_sql(
+                    cursor,
+                    "DELETE FROM redeem_code_batches WHERE id = ? AND user_id = ?",
+                    (batch_id, user_id),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"删除兑换码批次失败: {e}")
                 self.conn.rollback()
                 raise
 
@@ -6793,46 +6840,25 @@ Cookie数量: {cookie_count}
                         target_rule_id = int(rules[0][0])
                         target_keyword = str(rules[0][1] or '').strip() or target_keyword
 
-                spec_name, spec_value, spec_name_2, spec_value_2 = self._validate_redeem_batch_specs(
-                    card[4] if card[3] else None,
-                    card[5] if card[3] else None,
-                    card[6] if card[3] else None,
-                    card[7] if card[3] else None,
-                )
-
                 if exclusive:
                     self._execute_sql(cursor, '''
                     UPDATE redeem_code_batches
                     SET card_id = NULL, rule_id = NULL, updated_at = CURRENT_TIMESTAMP
                     WHERE user_id = ? AND card_id = ? AND id != ?
-                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_name, ''))), ' ', ''), '　', '') = ?
-                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_value, ''))), ' ', ''), '　', '') = ?
-                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_name_2, ''))), ' ', ''), '　', '') = ?
-                      AND REPLACE(REPLACE(LOWER(TRIM(COALESCE(spec_value_2, ''))), ' ', ''), '　', '') = ?
                     ''', (
                         user_id,
                         card_id,
                         batch_id,
-                        self._normalize_redeem_spec_part(spec_name),
-                        self._normalize_redeem_spec_part(spec_value),
-                        self._normalize_redeem_spec_part(spec_name_2),
-                        self._normalize_redeem_spec_part(spec_value_2),
                     ))
 
                 self._execute_sql(cursor, '''
                 UPDATE redeem_code_batches
-                SET card_id = ?, rule_id = ?, keyword = ?,
-                    spec_name = ?, spec_value = ?, spec_name_2 = ?, spec_value_2 = ?,
-                    updated_at = CURRENT_TIMESTAMP
+                SET card_id = ?, rule_id = ?, keyword = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND user_id = ?
                 ''', (
                     card_id,
                     target_rule_id,
                     target_keyword,
-                    spec_name,
-                    spec_value,
-                    spec_name_2,
-                    spec_value_2,
                     batch_id,
                     user_id,
                 ))
@@ -7006,13 +7032,13 @@ Cookie数量: {cookie_count}
                     )
                     return [self._format_redeem_batch_row(row) for row in cursor.fetchall()]
 
-                card_batches = query_batches('card_id', rule.get('card_id'), with_specs=True)
+                card_batches = query_batches('card_id', rule.get('card_id'), with_specs=False)
                 if card_batches:
                     return card_batches
                 if rule.get('card_id') not in (None, '') or rule.get('card_type') == 'data':
                     return []
 
-                rule_batches = query_batches('rule_id', rule.get('id'), with_specs=True)
+                rule_batches = query_batches('rule_id', rule.get('id'), with_specs=False)
                 if rule_batches:
                     return rule_batches
                 return query_batches('keyword', rule.get('keyword'), with_specs=True)
