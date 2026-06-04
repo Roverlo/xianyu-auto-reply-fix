@@ -13708,6 +13708,61 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 return {"success": True, "delivered": True, "message": "订单所有发货单元都已完成，本次仅补完成未收尾记录"}
             return {"success": True, "delivered": True, "message": "订单当前没有可补发的未完成单元"}
 
+        if not xianyu_instance._is_websocket_ready_for_delivery():
+            fail_reason = "账号WebSocket未连接，无法安全发送手动发货消息，请先确认账号在线后重试"
+            db_manager.create_delivery_log(
+                user_id=user_id,
+                cookie_id=cookie_id,
+                order_id=order_id,
+                item_id=item_id,
+                buyer_id=buyer_id,
+                buyer_nick=order.get('buyer_nick'),
+                channel='manual',
+                status='failed',
+                reason=fail_reason
+            )
+            log_with_user('warning', f"手动发货: {fail_reason}, order_id={order_id}", current_user)
+            return {"success": False, "delivered": False, "message": fail_reason}
+
+        delivery_chat_id = await xianyu_instance._resolve_history_order_chat_id_for_delivery(order)
+        seller_id = str(getattr(xianyu_instance, 'myid', '') or '').strip()
+        if delivery_chat_id in {str(buyer_id or '').strip(), seller_id}:
+            log_with_user(
+                'warning',
+                f"手动发货: 解析到疑似用户ID而非会话ID，拒绝发送, order_id={order_id}, candidate={delivery_chat_id}",
+                current_user
+            )
+            delivery_chat_id = None
+
+        if delivery_chat_id:
+            order['sid'] = delivery_chat_id
+            try:
+                xianyu_instance._persist_history_order_candidate(order, chat_id=delivery_chat_id)
+            except Exception as persist_error:
+                log_with_user(
+                    'warning',
+                    f"手动发货: 写回订单会话ID失败但继续发送, order_id={order_id}, error={persist_error}",
+                    current_user
+                )
+        else:
+            fail_reason = (
+                "订单缺少真实会话ID，且平台未返回可用chat_id，无法安全手动发货；"
+                "请先让买家在闲鱼发送任意消息，或卖家在闲鱼打开/联系买家生成会话后再重试。"
+            )
+            db_manager.create_delivery_log(
+                user_id=user_id,
+                cookie_id=cookie_id,
+                order_id=order_id,
+                item_id=item_id,
+                buyer_id=buyer_id,
+                buyer_nick=order.get('buyer_nick'),
+                channel='manual',
+                status='failed',
+                reason=fail_reason
+            )
+            log_with_user('warning', f"手动发货: {fail_reason}, order_id={order_id}", current_user)
+            return {"success": False, "delivered": False, "message": fail_reason}
+
         unit_results = []
         prepared_units = []
         redeem_reservations_by_unit = {}
@@ -13929,16 +13984,34 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                     break
 
         ws = getattr(xianyu_instance, 'ws', None)
-        manual_chat_id = buyer_id
-        if ws:
-            sid = order.get('sid', '')
-            if sid:
-                manual_chat_id = sid.replace('@goofish', '')
-                log_with_user('info', f"手动发货: 使用现有WebSocket连接发送, cid={manual_chat_id}, buyer_id={buyer_id}", current_user)
-            else:
-                log_with_user('warning', f"手动发货: 订单无sid，尝试使用buyer_id作为cid, buyer_id={buyer_id}", current_user)
-        else:
-            log_with_user('warning', f"手动发货: 无现有WebSocket连接，使用send_delivery_steps_once, buyer_id={buyer_id}", current_user)
+        manual_chat_id = delivery_chat_id
+        if not ws or getattr(ws, 'closed', False) or not manual_chat_id:
+            fail_reason = "发送前账号WebSocket断开或会话ID丢失，已释放本次预占的发货内容，请稍后重试"
+            xianyu_instance._release_prepared_redeem_units(
+                prepared_units,
+                redeem_reservations_by_unit,
+                error=fail_reason
+            )
+            for prepared_unit in prepared_units:
+                xianyu_instance._release_data_reservation_if_needed(
+                    prepared_unit.get('rule_meta') or {},
+                    error=fail_reason
+                )
+            db_manager.create_delivery_log(
+                user_id=user_id,
+                cookie_id=cookie_id,
+                order_id=order_id,
+                item_id=item_id,
+                buyer_id=buyer_id,
+                buyer_nick=order.get('buyer_nick'),
+                channel='manual',
+                status='failed',
+                reason=fail_reason
+            )
+            log_with_user('warning', f"手动发货: {fail_reason}, order_id={order_id}", current_user)
+            return {"success": False, "delivered": False, "message": fail_reason}
+
+        log_with_user('info', f"手动发货: 使用真实会话ID发送, cid={manual_chat_id}, buyer_id={buyer_id}", current_user)
 
         send_groups = xianyu_instance._build_delivery_send_groups(prepared_units, expected_quantity)
         total_send_groups = len(send_groups)
@@ -13953,23 +14026,20 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             is_batched_text_group = send_group.get('mode') == 'batched_text'
 
             try:
-                if ws:
-                    await xianyu_instance._send_delivery_steps(
-                        ws,
-                        manual_chat_id,
-                        buyer_id,
-                        send_group.get('delivery_steps') or [],
-                        log_prefix=(
-                            f"手动发货 order_id={order_id} batch={group_index}/{total_send_groups}"
-                            if is_batched_text_group else
-                            f"手动发货 order_id={order_id} unit={first_unit_index}"
-                        ),
-                        item_id=item_id,
-                        order_id=order_id,
-                        reply_source='手动发货',
-                    )
-                else:
-                    await xianyu_instance.send_delivery_steps_once(buyer_id, item_id, send_group.get('delivery_steps') or [])
+                await xianyu_instance._send_delivery_steps(
+                    ws,
+                    manual_chat_id,
+                    buyer_id,
+                    send_group.get('delivery_steps') or [],
+                    log_prefix=(
+                        f"手动发货 order_id={order_id} batch={group_index}/{total_send_groups}"
+                        if is_batched_text_group else
+                        f"手动发货 order_id={order_id} unit={first_unit_index}"
+                    ),
+                    item_id=item_id,
+                    order_id=order_id,
+                    reply_source='手动发货',
+                )
             except Exception as send_error:
                 send_error_text = str(send_error)
                 for prepared_unit in group_units:

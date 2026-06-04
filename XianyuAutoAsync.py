@@ -1863,6 +1863,26 @@ class XianyuLive:
             return None
         return text
 
+    def _create_chat_response_mentions_context(self, payload: Any, buyer_id: str, item_id: str) -> bool:
+        """Return whether a create-chat response appears to belong to the requested buyer/item."""
+        buyer_id = self._normalize_buyer_id_value(buyer_id)
+        item_id = str(item_id or '').strip()
+        if not buyer_id and not item_id:
+            return False
+
+        mentions_buyer = False
+        mentions_item = False
+        for text in self._extract_history_order_text_values(payload, max_values=500):
+            if buyer_id and buyer_id in text:
+                mentions_buyer = True
+            if item_id and item_id in text:
+                mentions_item = True
+            if (not buyer_id or mentions_buyer) and (not item_id or mentions_item):
+                return True
+        if buyer_id:
+            return mentions_buyer
+        return mentions_item
+
     def _extract_chat_id_from_history_payload(self, payload: Any) -> Optional[str]:
         if not payload:
             return None
@@ -1872,6 +1892,7 @@ class XianyuLive:
         key_candidates = {
             'sid', 'sessionid', 'session_id', 'chatid', 'chat_id',
             'cid', 'conversationid', 'conversation_id',
+            'sessionidstr', 'session_id_str',
         }
         while stack and checked < 600:
             checked += 1
@@ -1951,20 +1972,44 @@ class XianyuLive:
         try:
             body = message_data.get('body') if isinstance(message_data, dict) else None
             if isinstance(body, dict):
-                for key in ('singleChatConversation', 'conversation'):
+                for key in ('singleChatConversation', 'conversation', 'sessionInfo', 'session'):
                     conversation = body.get(key)
                     if isinstance(conversation, dict):
-                        chat_id = self._normalize_history_chat_id(conversation.get('cid'))
-                        if chat_id:
-                            return chat_id
+                        for id_key in ('cid', 'sessionId', 'session_id', 'chatId', 'chat_id'):
+                            chat_id = self._normalize_history_chat_id(conversation.get(id_key))
+                            if chat_id:
+                                return chat_id
 
-                chat_id = self._normalize_history_chat_id(body.get('cid'))
-                if chat_id:
-                    return chat_id
+                for id_key in ('cid', 'sessionId', 'session_id', 'chatId', 'chat_id'):
+                    chat_id = self._normalize_history_chat_id(body.get(id_key))
+                    if chat_id:
+                        return chat_id
 
             return self._extract_chat_id_from_history_payload(message_data)
         except Exception:
             return None
+
+    def _summarize_create_chat_response_for_log(self, message_data: Any) -> str:
+        """Build a compact, non-sensitive summary for create-chat diagnostics."""
+        if not isinstance(message_data, dict):
+            return type(message_data).__name__
+        try:
+            headers = message_data.get('headers') if isinstance(message_data.get('headers'), dict) else {}
+            body = message_data.get('body')
+            body_keys = list(body.keys())[:12] if isinstance(body, dict) else []
+            summary = {
+                'lwp': message_data.get('lwp'),
+                'code': message_data.get('code'),
+                'mid': headers.get('mid'),
+                'body_type': type(body).__name__,
+                'body_keys': body_keys,
+            }
+            chat_id = self._extract_chat_id_from_create_chat_response(message_data)
+            if chat_id:
+                summary['chat_id'] = chat_id
+            return json.dumps(summary, ensure_ascii=False, default=str)[:500]
+        except Exception as exc:
+            return f"summary_failed:{self._safe_str(exc)}"
 
     async def _create_chat_for_history_order(self, buyer_id: str, item_id: str,
                                              timeout: float = 20.0) -> Optional[str]:
@@ -1986,29 +2031,65 @@ class XianyuLive:
                 create_mid = await self.create_chat(websocket, buyer_id, item_id)
 
                 deadline = time.time() + max(3.0, float(timeout or 0))
+                seen_relevant_response = False
+                last_response_summary = None
                 while True:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         break
-                    raw_message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                    try:
+                        raw_message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
                     try:
                         message_data = json.loads(raw_message)
                     except Exception:
                         continue
+                    last_response_summary = self._summarize_create_chat_response_for_log(message_data)
                     response_mid = str((message_data.get('headers') or {}).get('mid') or '')
-                    if response_mid != str(create_mid):
+                    lwp = str(message_data.get('lwp') or '')
+                    is_mid_match = response_mid == str(create_mid)
+                    is_create_response = (
+                        '/SingleChatConversation/create' in lwp
+                        or 'singleChatConversation' in str(message_data)[:2000]
+                    )
+                    mentions_context = self._create_chat_response_mentions_context(message_data, buyer_id, item_id)
+                    if not (is_mid_match or is_create_response or mentions_context):
                         continue
+                    seen_relevant_response = True
                     chat_id = self._extract_chat_id_from_create_chat_response(message_data)
                     if chat_id:
+                        if chat_id in {buyer_id, str(self.myid or '').strip()}:
+                            logger.warning(
+                                f"【{self.cookie_id}】待发货补偿创建/打开会话解析到疑似用户ID，拒绝作为chat_id: "
+                                f"buyer_id={buyer_id}, item_id={item_id}, candidate={chat_id}"
+                            )
+                            continue
                         logger.warning(
                             f"【{self.cookie_id}】待发货补偿已通过创建/打开会话解析到chat_id: "
                             f"buyer_id={buyer_id}, item_id={item_id}, chat_id={chat_id}"
                         )
                         return chat_id
+                    logger.warning(
+                        f"【{self.cookie_id}】待发货补偿创建/打开会话收到响应但未解析到chat_id: "
+                        f"buyer_id={buyer_id}, item_id={item_id}, summary={last_response_summary}"
+                    )
+
+                if seen_relevant_response:
+                    logger.warning(
+                        f"【{self.cookie_id}】待发货补偿创建/打开会话响应中没有可用chat_id: "
+                        f"buyer_id={buyer_id}, item_id={item_id}, last_response={last_response_summary}"
+                    )
+                else:
+                    logger.warning(
+                        f"【{self.cookie_id}】待发货补偿创建/打开会话等待响应超时: "
+                        f"buyer_id={buyer_id}, item_id={item_id}, mid={create_mid}, timeout={timeout}s, "
+                        f"last_response={last_response_summary}"
+                    )
         except Exception as exc:
             logger.warning(
                 f"【{self.cookie_id}】待发货补偿创建/打开会话解析chat_id失败: "
-                f"buyer_id={buyer_id}, item_id={item_id}, error={self._safe_str(exc)}"
+                f"buyer_id={buyer_id}, item_id={item_id}, error={self._safe_str(exc) or type(exc).__name__}"
             )
 
         return None
@@ -2268,7 +2349,11 @@ class XianyuLive:
 
                 if not chat_id:
                     stats['skipped'] += 1
-                    reason = '待发货补偿发现平台待发货订单，但缺少会话ID，无法安全自动发货'
+                    reason = (
+                        '待发货补偿发现平台待发货订单，但平台未下发真实会话ID，'
+                        '主动创建/打开会话也未返回可用chat_id，无法安全自动发货；'
+                        '请先让买家在闲鱼发送任意消息，或卖家在闲鱼打开/联系买家生成会话后再重试。'
+                    )
                     self._record_delivery_log(
                         order_id=order_id,
                         item_id=item_id,
