@@ -10899,7 +10899,9 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"调试消息结构时发生错误: {self._safe_str(e)}")
 
-    async def get_item_specific_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None) -> str:
+    async def get_item_specific_reply(self, send_user_name: str, send_user_id: str,
+                                      send_message: str, item_id: str = None,
+                                      chat_id: str = None) -> str:
         """获取指定商品回复内容"""
         if not item_id:
             return None
@@ -10911,6 +10913,20 @@ class XianyuLive:
             if not item_reply or not item_reply.get('reply_content'):
                 return None
 
+            suppress_info = db_manager.should_suppress_item_specific_reply(
+                self.cookie_id,
+                chat_id,
+                item_id,
+                send_user_id
+            ) if chat_id else None
+            if suppress_info:
+                logger.info(
+                    f"【{self.cookie_id}】跳过指定商品回复: 商品ID={item_id}, chat_id={chat_id}, "
+                    f"原因={suppress_info.get('reason')}, 订单={suppress_info.get('order_id')}, "
+                    f"状态={suppress_info.get('order_status')}, 已回复消息={suppress_info.get('message_id')}"
+                )
+                return "SKIP_REPLY"
+
             reply_content = item_reply['reply_content']
             logger.info(f"【{self.cookie_id}】使用指定商品回复: 商品ID={item_id}")
 
@@ -10919,7 +10935,8 @@ class XianyuLive:
                     send_user_name=send_user_name,
                     send_user_id=send_user_id,
                     send_message=send_message,
-                    item_id=item_id
+                    item_id=item_id,
+                    chat_id=chat_id
                 )
                 logger.info(f"【{self.cookie_id}】指定商品回复内容: {formatted_reply}")
                 return formatted_reply
@@ -17557,8 +17574,11 @@ class XianyuLive:
 
             # 按 README 定义的优先级处理：
             # 指定商品回复 > 商品专用关键词 > 通用关键词 > 默认回复 > AI回复
-            reply = await self.get_item_specific_reply(send_user_name, send_user_id, send_message, item_id)
-            if reply:
+            reply = await self.get_item_specific_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
+            if reply == "SKIP_REPLY":
+                logger.info(f"[{msg_time}] 【{self.cookie_id}】指定商品回复已在当前会话停用，跳过自动回复")
+                return
+            elif reply:
                 reply_source = '指定商品'
             else:
                 # 1. 尝试关键词匹配（内部已区分商品专用关键词和通用关键词）

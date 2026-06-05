@@ -8467,9 +8467,10 @@ Cookie数量: {cookie_count}
                         return False
 
                 # 检查订单是否已存在
-                cursor.execute("SELECT order_id, buyer_nick FROM orders WHERE order_id = ?", (order_id,))
+                cursor.execute("SELECT order_id, buyer_nick, order_status FROM orders WHERE order_id = ?", (order_id,))
                 existing = cursor.fetchone()
                 existing_buyer_nick = existing[1] if existing else None
+                existing_order_status = existing[2] if existing else None
                 resolved_buyer_nick = self._resolve_order_buyer_nick_for_write(order_id, buyer_nick, existing_buyer_nick)
 
                 if existing:
@@ -8520,8 +8521,19 @@ Cookie数量: {cookie_count}
                         update_fields.append("bargain_success_detected = ?")
                         update_values.append(1 if bargain_success_detected else 0)
                     if order_status is not None:
-                        update_fields.append("order_status = ?")
-                        update_values.append(normalized_order_status or 'unknown')
+                        status_to_write = self.resolve_external_order_status(
+                            existing_order_status,
+                            normalized_order_status,
+                            source='insert_or_update_order'
+                        )
+                        if status_to_write and status_to_write != self._normalize_order_status(existing_order_status):
+                            update_fields.append("order_status = ?")
+                            update_values.append(status_to_write)
+                        elif normalized_order_status != self._normalize_order_status(existing_order_status):
+                            logger.info(
+                                f"保留订单现有状态: order_id={order_id}, "
+                                f"current={existing_order_status}, incoming={order_status}"
+                            )
                     if clear_pre_refund_status:
                         update_fields.append("pre_refund_status = NULL")
                     elif has_pre_refund_status:
@@ -9892,6 +9904,88 @@ Cookie数量: {cookie_count}
         except Exception as e:
             logger.error(f"获取指定商品回复失败: {e}")
             return None
+
+    def should_suppress_item_specific_reply(self, cookie_id: str, chat_id: str,
+                                            item_id: str = None,
+                                            buyer_id: str = None) -> Optional[Dict[str, Any]]:
+        """判断指定商品回复是否应在当前会话中停止自动发送。"""
+        if not cookie_id or not chat_id or not item_id:
+            return None
+
+        chat_id_text = str(chat_id).strip()
+        chat_base = chat_id_text.split('@')[0].strip() if chat_id_text else ''
+        if not chat_base:
+            return None
+
+        chat_variants = []
+        for value in (chat_id_text, chat_base, f"{chat_base}@goofish"):
+            if value and value not in chat_variants:
+                chat_variants.append(value)
+
+        normalized_buyer_id = str(buyer_id or '').strip()
+        if normalized_buyer_id.endswith('@goofish'):
+            normalized_buyer_id = normalized_buyer_id.split('@')[0].strip()
+        if not self._is_valid_buyer_id(normalized_buyer_id):
+            normalized_buyer_id = ''
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+
+                chat_placeholders = ','.join(['?'] * len(chat_variants))
+                self._execute_sql(cursor, f"""
+                    SELECT id, created_at
+                    FROM chat_messages
+                    WHERE cookie_id = ?
+                      AND chat_id IN ({chat_placeholders})
+                      AND item_id = ?
+                      AND direction = 1
+                      AND reply_source = '指定商品'
+                    ORDER BY id DESC
+                    LIMIT 1
+                """, [cookie_id, *chat_variants, item_id])
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        'reason': 'already_replied',
+                        'message_id': row[0],
+                        'created_at': row[1],
+                    }
+
+                match_clauses = [f"sid IN ({chat_placeholders})"]
+                params = [cookie_id, item_id, *chat_variants]
+                if normalized_buyer_id:
+                    match_clauses.append("buyer_id = ?")
+                    params.append(normalized_buyer_id)
+
+                self._execute_sql(cursor, f"""
+                    SELECT order_id, order_status, sid, buyer_id, updated_at, created_at
+                    FROM orders
+                    WHERE cookie_id = ?
+                      AND item_id = ?
+                      AND ({' OR '.join(match_clauses)})
+                    ORDER BY datetime(COALESCE(updated_at, created_at)) DESC
+                    LIMIT 1
+                """, params)
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        'reason': 'order_exists',
+                        'order_id': row[0],
+                        'order_status': self._normalize_order_status(row[1]) or row[1],
+                        'sid': row[2],
+                        'buyer_id': row[3],
+                        'updated_at': row[4],
+                        'created_at': row[5],
+                    }
+
+                return None
+            except Exception as e:
+                logger.error(
+                    "检查指定商品回复抑制状态失败: "
+                    f"cookie_id={cookie_id}, chat_id={chat_id}, item_id={item_id}, buyer_id={buyer_id}, error={e}"
+                )
+                return None
 
     def update_item_reply(self, cookie_id: str, item_id: str, reply_content: str) -> bool:
         """
