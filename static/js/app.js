@@ -16504,6 +16504,9 @@ function createOrderRow(order) {
     const specValue2 = escapeHtml(order.spec_value_2 || '');
     const quantity = escapeHtml(order.quantity || '-');
     const amountDisplay = escapeHtml(formatOrderAmountDisplay(order.amount));
+    const isPendingConfirm = normalizedStatus === 'partial_pending_finalize' || order.pending_platform_confirm === true;
+    const pendingConfirmError = escapeHtml(order.pending_confirm_error || '');
+    const pendingConfirmTitle = pendingConfirmError || (isPendingConfirm ? '卡券已发出，平台确认发货失败，等待补确认' : '');
 
     // 判断是否可以手动发货（允许多次发货，除了交易关闭的订单）
     const canDeliver = !['cancelled', 'refunding'].includes(normalizedStatus);
@@ -16549,7 +16552,8 @@ function createOrderRow(order) {
                 <span class="text-success fw-bold">${amountDisplay}</span>
             </td>
             <td>
-                <span class="badge ${statusClass}">${escapeHtml(statusText)}</span>
+                <span class="badge ${statusClass}" title="${pendingConfirmTitle}">${escapeHtml(statusText)}</span>
+                ${pendingConfirmError ? `<div class="small text-warning text-truncate mt-1" style="max-width: 140px;" title="${pendingConfirmError}">${pendingConfirmError}</div>` : ''}
             </td>
             <td>
                 <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${cookieId === '-' ? '' : cookieId}">
@@ -16558,6 +16562,10 @@ function createOrderRow(order) {
             </td>
             <td>
                 <div class="btn-group btn-group-sm" role="group">
+                    ${isPendingConfirm ? `
+                    <button class="btn btn-outline-warning btn-sm order-action-btn" data-order-action="confirm-retry" data-order-id="${orderId}" title="补确认发货（只调用平台确认，不重复发卡券）">
+                        <i class="bi bi-check2-circle"></i>
+                    </button>` : ''}
                     <button class="btn btn-outline-success btn-sm order-action-btn" data-order-action="deliver" data-order-id="${orderId}" title="手动发货" ${canDeliver ? '' : 'disabled'}>
                         <i class="bi bi-truck"></i>
                     </button>
@@ -17257,6 +17265,8 @@ async function showOrderDetail(orderId) {
         const safeCreatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.created_at));
         const safeUpdatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.updated_at));
         const safeStatusText = escapeHtml(getOrderStatusText(order.order_status));
+        const safePendingConfirmError = escapeHtml(order.pending_confirm_error || '');
+        const pendingConfirmUnits = Number(order.pending_confirm_units || 0);
 
         const modalContent = `
             <div class="modal fade" id="orderDetailModal" tabindex="-1">
@@ -17280,6 +17290,7 @@ async function showOrderDetail(orderId) {
                                         <tr><td>买家昵称</td><td>${safeBuyerNick}</td></tr>
                                         <tr><td>Cookie账号</td><td>${safeCookieId}</td></tr>
                                         <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${safeStatusText}</span></td></tr>
+                                        ${safePendingConfirmError ? `<tr><td>补确认状态</td><td><span class="badge bg-warning-subtle text-warning-emphasis">待补确认${pendingConfirmUnits ? ` × ${pendingConfirmUnits}` : ''}</span><div class="small text-warning mt-1">${safePendingConfirmError}</div></td></tr>` : ''}
                                     </table>
                                 </div>
                                 <div class="col-md-6">
@@ -17540,6 +17551,45 @@ async function manualDeliverOrder(orderId) {
     }
 }
 
+// 手动补确认发货（只调用平台确认，不重复发送卡券）
+async function retryOrderPlatformConfirm(orderId) {
+    try {
+        const confirmed = confirm(`确定要补确认此订单吗？\n\n订单ID: ${orderId}\n\n只会调用闲鱼平台确认发货接口，不会重复发送卡券/发货内容。`);
+        if (!confirmed) {
+            return;
+        }
+
+        showToast('正在补确认发货...', 'info');
+
+        const response = await fetch(`${apiBase}/api/orders/${orderId}/confirm-retry`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+            if (result.confirmed) {
+                showToast(result.message || '补确认成功', 'success');
+                refreshTodayDeliveryCount();
+            } else if (result.success) {
+                showToast(result.message || '没有待补确认记录', 'info');
+            } else {
+                showToast(`补确认失败: ${result.message || '未知错误'}`, 'warning');
+            }
+            await refreshOrdersData();
+        } else {
+            showToast(`补确认失败: ${result.detail || '未知错误'}`, 'danger');
+        }
+    } catch (error) {
+        console.error('补确认发货失败:', error);
+        showToast('补确认发货失败: ' + error.message, 'danger');
+    }
+}
+
 // 刷新订单状态
 async function refreshOrderStatus(orderId) {
     try {
@@ -17678,6 +17728,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
             if (action === 'deliver') {
                 manualDeliverOrder(orderId);
+            } else if (action === 'confirm-retry') {
+                retryOrderPlatformConfirm(orderId);
             } else if (action === 'refresh') {
                 refreshOrderStatus(orderId);
             } else if (action === 'detail') {
