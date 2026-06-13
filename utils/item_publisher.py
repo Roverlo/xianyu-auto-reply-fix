@@ -24,7 +24,7 @@ class ItemPublisher:
     )
     ALLOWED_DELIVERY_CHOICES = {"包邮", "按距离计费", "一口价", "无需邮寄"}
 
-    def __init__(self, cookies_str: str, cookie_id: str = ""):
+    def __init__(self, cookies_str: str, cookie_id: str = "", proxy_config: Optional[Dict[str, Any]] = None):
         cleaned_cookies = str(cookies_str or "").strip()
         if not cleaned_cookies:
             raise ValueError("Cookie 为空，无法发布商品")
@@ -32,6 +32,9 @@ class ItemPublisher:
         self.cookie_id = str(cookie_id or "unknown").strip() or "unknown"
         self.cookies = trans_cookies(cleaned_cookies)
         self.cookies_str = self._serialize_cookies(self.cookies)
+        self.proxy_config = self._normalize_proxy_config(proxy_config)
+        self._http_proxy_url: Optional[str] = None
+        self._http_proxy_auth: Optional[aiohttp.BasicAuth] = None
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
@@ -45,18 +48,99 @@ class ItemPublisher:
         if self.session:
             return
 
+        connector: Optional[aiohttp.BaseConnector] = None
+        proxy_url = self._get_proxy_url()
+        proxy_type = self.proxy_config.get("proxy_type", "none")
+        if proxy_url:
+            proxy_host = self.proxy_config.get("proxy_host", "")
+            proxy_port = self.proxy_config.get("proxy_port", 0)
+            logger.info(f"【{self.cookie_id}】商品发布使用账号代理: {proxy_type}://{proxy_host}:{proxy_port}")
+
+            if proxy_type == "socks5":
+                try:
+                    from aiohttp_socks import ProxyConnector, ProxyType
+                except ImportError as exc:
+                    raise RuntimeError("SOCKS5 代理需要安装 aiohttp-socks，请先执行 pip install aiohttp-socks") from exc
+
+                connector = ProxyConnector(
+                    proxy_type=ProxyType.SOCKS5,
+                    host=proxy_host,
+                    port=proxy_port,
+                    username=self.proxy_config.get("proxy_user") or None,
+                    password=self.proxy_config.get("proxy_pass") or None,
+                    rdns=True,
+                )
+            elif proxy_type in {"http", "https"}:
+                self._http_proxy_url = proxy_url
+                proxy_user = self.proxy_config.get("proxy_user") or ""
+                if proxy_user:
+                    self._http_proxy_auth = aiohttp.BasicAuth(
+                        proxy_user,
+                        self.proxy_config.get("proxy_pass") or "",
+                        encoding="utf-8",
+                    )
+        elif proxy_type != "none":
+            raise RuntimeError(f"账号代理配置不完整，商品发布不会直连: type={proxy_type}")
+
+        session_kwargs: Dict[str, Any] = {}
+        if connector is not None:
+            session_kwargs["connector"] = connector
+
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=40),
             headers={
                 "User-Agent": self.USER_AGENT,
                 "Accept-Language": "en,zh-CN;q=0.9,zh;q=0.8,zh-TW;q=0.7,ja;q=0.6",
             },
+            **session_kwargs,
         )
 
     async def close_session(self):
         if self.session:
             await self.session.close()
             self.session = None
+        self._http_proxy_url = None
+        self._http_proxy_auth = None
+
+    @staticmethod
+    def _normalize_proxy_config(proxy_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(proxy_config, dict):
+            proxy_config = {}
+
+        proxy_type = str(proxy_config.get("proxy_type") or "none").strip().lower()
+        if proxy_type in {"", "none"}:
+            proxy_type = "none"
+        elif proxy_type not in {"http", "https", "socks5"}:
+            raise ValueError(f"不支持的代理类型: {proxy_type}")
+
+        try:
+            proxy_port = int(proxy_config.get("proxy_port") or 0)
+        except (TypeError, ValueError):
+            proxy_port = 0
+
+        return {
+            "proxy_type": proxy_type,
+            "proxy_host": str(proxy_config.get("proxy_host") or "").strip(),
+            "proxy_port": proxy_port if proxy_port > 0 else 0,
+            "proxy_user": str(proxy_config.get("proxy_user") or "").strip(),
+            "proxy_pass": str(proxy_config.get("proxy_pass") or ""),
+        }
+
+    def _get_proxy_url(self) -> Optional[str]:
+        proxy_type = self.proxy_config.get("proxy_type", "none")
+        if proxy_type == "none":
+            return None
+
+        proxy_host = self.proxy_config.get("proxy_host", "")
+        proxy_port = self.proxy_config.get("proxy_port", 0)
+        if not proxy_host or not proxy_port:
+            return None
+
+        host_for_url = proxy_host
+        if ":" in host_for_url and not host_for_url.startswith("["):
+            host_for_url = f"[{host_for_url}]"
+
+        return f"{proxy_type}://{host_for_url}:{proxy_port}"
 
     @staticmethod
     def is_success_response(payload: Dict[str, Any]) -> bool:
@@ -233,6 +317,7 @@ class ItemPublisher:
             params=params,
             data=form_data,
             headers=headers,
+            **self._build_request_kwargs(),
         ) as response:
             self._update_cookies_from_response(response)
             response_text = await response.text()
@@ -541,6 +626,7 @@ class ItemPublisher:
             params=params,
             data={"data": data_val},
             headers=headers,
+            **self._build_request_kwargs(),
         ) as response:
             self._update_cookies_from_response(response)
             response_text = await response.text()
@@ -549,6 +635,15 @@ class ItemPublisher:
             return json.loads(response_text)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"{api_name} 返回非 JSON 响应: {response_text[:200]}") from exc
+
+    def _build_request_kwargs(self) -> Dict[str, Any]:
+        if not self._http_proxy_url:
+            return {}
+
+        request_kwargs: Dict[str, Any] = {"proxy": self._http_proxy_url}
+        if self._http_proxy_auth:
+            request_kwargs["proxy_auth"] = self._http_proxy_auth
+        return request_kwargs
 
     def _build_headers(self, *, extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         headers = {

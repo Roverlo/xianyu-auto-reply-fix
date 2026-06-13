@@ -468,8 +468,11 @@ docker-deploy.bat
 - **[syunnrai123](https://github.com/syunnrai123)** - 为当前项目的滑块处理方案提供思路与参考
 - **[1205747671](https://github.com/1205747671)** - 为当前项目的滑块处理方案提供思路与参考
 - **[Mangor2021](https://github.com/Mangor2021)** - 为项目开发与改进提供了实际贡献
+- **[3281341052](https://github.com/3281341052)** - 为项目开发与改进提供了实际贡献
+- **[GDWhisper](https://github.com/GDWhisper)** - 为项目开发与改进提供了实际贡献
 - **[82762294](https://github.com/82762294)** - 为项目开发与改进提供了实际贡献
 - **[iidamie](https://github.com/iidamie)** - 为项目开发与改进提供了实际贡献
+- **[Roverlo](https://github.com/Roverlo)** - 为项目开发与改进提供了实际贡献
 
 ## ⚖️ 版权声明与使用条款
 

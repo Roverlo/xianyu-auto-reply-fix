@@ -63,6 +63,12 @@ let orderHistorySyncPollingTimer = null;
 let activeOrderHistorySyncJobId = '';
 let orderHistorySyncNotifiedJobId = '';
 let orderHistorySyncAccounts = [];
+let blacklistState = {
+    page: 1,
+    pageSize: 20,
+    total: 0,
+    accountsLoaded: false
+};
 let loadingRequestCount = 0;
 let loadingShowTimer = null;
 const LOADING_SHOW_DELAY = 120;
@@ -179,6 +185,9 @@ function showSection(sectionName) {
         break;
     case 'online-im':        // 【在线客服菜单】
         loadOnlineIm();
+        break;
+    case 'blacklist':        // 【黑名单管理菜单】
+        loadBlacklistPage();
         break;
     case 'data-management':  // 【数据管理菜单】
         loadDataManagement();
@@ -3405,8 +3414,397 @@ async function fetchJSON(url, opts = {}) {
 }
 
 // ================================
-// 账号保活诊断
+// 【黑名单管理菜单】相关功能
 // ================================
+
+async function loadBlacklistPage() {
+    await loadBlacklistAccountOptions();
+    await loadPersonalBlacklist(blacklistState.page || 1);
+}
+
+async function loadBlacklistAccountOptions(force = false) {
+    const accountSelect = document.getElementById('blacklistCookieId');
+    if (!accountSelect) return;
+    if (blacklistState.accountsLoaded && !force) return;
+
+    try {
+        const currentValue = accountSelect.value;
+        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        const safeAccounts = Array.isArray(accounts) ? accounts : [];
+        accountSelect.innerHTML = '<option value="">全部账号</option>' + safeAccounts.map(account => {
+            const accountId = String(account.id || '').trim();
+            const remark = String(account.remark || '').trim();
+            const label = remark ? `${accountId}（${remark}）` : accountId;
+            return `<option value="${escapeHtml(accountId)}">${escapeHtml(label)}</option>`;
+        }).join('');
+        if (currentValue && safeAccounts.some(account => String(account.id || '') === currentValue)) {
+            accountSelect.value = currentValue;
+        }
+        blacklistState.accountsLoaded = true;
+    } catch (error) {
+        console.error('加载黑名单账号选项失败:', error);
+    }
+}
+
+function handleBlacklistFilterKeydown(event) {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        loadPersonalBlacklist(1);
+    }
+}
+
+async function loadPersonalBlacklist(page = 1) {
+    const tableBody = document.getElementById('blacklistTableBody');
+    if (!tableBody) return;
+
+    const pageSizeSelect = document.getElementById('blacklistPageSize');
+    const pageSize = Math.max(1, parseInt(pageSizeSelect?.value || '20', 10) || 20);
+    const safePage = Math.max(1, parseInt(page, 10) || 1);
+    const params = new URLSearchParams({
+        page: String(safePage),
+        page_size: String(pageSize)
+    });
+
+    const buyerId = document.getElementById('blacklistFilterBuyerId')?.value?.trim();
+    const buyerNick = document.getElementById('blacklistFilterBuyerNick')?.value?.trim();
+    if (buyerId) params.set('buyer_id', buyerId);
+    if (buyerNick) params.set('buyer_nick', buyerNick);
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal?${params.toString()}`);
+        const records = Array.isArray(result?.data) ? result.data : [];
+        blacklistState.page = Number(result?.page || safePage);
+        blacklistState.pageSize = Number(result?.page_size || pageSize);
+        blacklistState.total = Number(result?.total || 0);
+        renderPersonalBlacklist(records);
+        renderBlacklistPagination();
+    } catch (error) {
+        console.error('加载个人黑名单失败:', error);
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="8" class="text-center py-4 text-danger">
+                    <i class="bi bi-exclamation-triangle fs-1 d-block mb-3"></i>
+                    加载黑名单失败
+                </td>
+            </tr>
+        `;
+    }
+}
+
+function getBlacklistScopeBadge(scope) {
+    const normalizedScope = String(scope || 'user');
+    const config = {
+        item: { text: '商品级', cls: 'bg-warning text-dark' },
+        account: { text: '账号级', cls: 'bg-info text-dark' },
+        user: { text: '用户级', cls: 'bg-secondary' }
+    }[normalizedScope] || { text: normalizedScope || '未知', cls: 'bg-secondary' };
+    return `<span class="badge ${config.cls}">${escapeHtml(config.text)}</span>`;
+}
+
+function getBlacklistTargetHtml(record) {
+    const cookieId = String(record?.cookie_id || '').trim();
+    const itemId = String(record?.item_id || '').trim();
+    const parts = [];
+    parts.push(cookieId ? `账号 ${cookieId}` : '全部账号');
+    if (itemId) parts.push(`商品 ${itemId}`);
+    return parts.map(part => `<div class="small text-muted text-nowrap" title="${escapeHtml(part)}">${escapeHtml(part)}</div>`).join('');
+}
+
+function renderPersonalBlacklist(records) {
+    const tableBody = document.getElementById('blacklistTableBody');
+    const totalText = document.getElementById('blacklistTotalText');
+    const selectAll = document.getElementById('blacklistSelectAll');
+    if (!tableBody) return;
+
+    if (totalText) {
+        totalText.textContent = `共 ${blacklistState.total || 0} 条`;
+    }
+    if (selectAll) {
+        selectAll.checked = false;
+        selectAll.indeterminate = false;
+    }
+
+    if (!Array.isArray(records) || records.length === 0) {
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="8" class="text-center py-4 text-muted">
+                    <i class="bi bi-person-x fs-1 d-block mb-3"></i>
+                    暂无黑名单记录
+                </td>
+            </tr>
+        `;
+        updateBlacklistBatchDeleteState();
+        return;
+    }
+
+    tableBody.innerHTML = records.map(record => {
+        const recordId = Number(record.id || 0);
+        const buyerId = String(record.buyer_id || '').trim();
+        const buyerNick = String(record.buyer_nick || '').trim();
+        const reason = String(record.reason || '').trim();
+        const enabled = Boolean(record.is_enabled);
+        const createdAt = formatDateTime(record.created_at || record.updated_at || '');
+        return `
+            <tr>
+                <td>
+                    <input class="form-check-input blacklist-row-check" type="checkbox" data-id="${recordId}" onchange="updateBlacklistBatchDeleteState()">
+                </td>
+                <td>${getBlacklistScopeBadge(record.scope)}</td>
+                <td>
+                    <div class="fw-semibold" title="${escapeHtml(buyerId)}">${escapeHtml(buyerId)}</div>
+                    ${buyerNick ? `<div class="small text-muted" title="${escapeHtml(buyerNick)}">${escapeHtml(buyerNick)}</div>` : ''}
+                </td>
+                <td>${getBlacklistTargetHtml(record)}</td>
+                <td style="max-width: 220px;">
+                    <span class="d-inline-block text-truncate" style="max-width: 100%;" title="${escapeHtml(reason)}">${escapeHtml(reason || '-')}</span>
+                </td>
+                <td>
+                    <div class="form-check form-switch m-0" title="${enabled ? '点击禁用' : '点击启用'}">
+                        <input class="form-check-input" type="checkbox" ${enabled ? 'checked' : ''} onchange="togglePersonalBlacklist(${recordId}, this.checked)">
+                    </div>
+                </td>
+                <td><small class="text-muted text-nowrap">${escapeHtml(createdAt)}</small></td>
+                <td>
+                    <button type="button" class="btn btn-outline-danger btn-sm" onclick="deletePersonalBlacklist(${recordId})" title="删除">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+    updateBlacklistBatchDeleteState();
+}
+
+function renderBlacklistPagination() {
+    const pagination = document.getElementById('blacklistPagination');
+    const pageText = document.getElementById('blacklistPageText');
+    if (!pagination) return;
+
+    const pageSize = Math.max(1, Number(blacklistState.pageSize || 20));
+    const total = Math.max(0, Number(blacklistState.total || 0));
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const currentPage = Math.min(Math.max(1, Number(blacklistState.page || 1)), totalPages);
+
+    if (currentPage !== blacklistState.page && total > 0) {
+        loadPersonalBlacklist(currentPage);
+        return;
+    }
+
+    if (pageText) {
+        pageText.textContent = `第 ${currentPage} / ${totalPages} 页`;
+    }
+
+    const startPage = Math.max(1, currentPage - 2);
+    const endPage = Math.min(totalPages, startPage + 4);
+    const buttons = [];
+    const addButton = (label, targetPage, disabled = false, active = false, title = '') => {
+        buttons.push(`
+            <button type="button" class="btn btn-sm ${active ? 'btn-primary' : 'btn-outline-secondary'}" ${disabled ? 'disabled' : ''} onclick="loadPersonalBlacklist(${targetPage})" title="${escapeHtml(title || label)}">
+                ${label}
+            </button>
+        `);
+    };
+
+    addButton('<i class="bi bi-chevron-left"></i>', currentPage - 1, currentPage <= 1, false, '上一页');
+    for (let page = startPage; page <= endPage; page += 1) {
+        addButton(String(page), page, false, page === currentPage);
+    }
+    addButton('<i class="bi bi-chevron-right"></i>', currentPage + 1, currentPage >= totalPages, false, '下一页');
+    pagination.innerHTML = buttons.join('');
+}
+
+async function createPersonalBlacklist() {
+    const buyerIds = document.getElementById('blacklistBuyerIds')?.value?.trim() || '';
+    if (!buyerIds) {
+        showToast('请填写买家ID', 'warning');
+        return;
+    }
+
+    const payload = {
+        buyer_ids: buyerIds,
+        cookie_id: document.getElementById('blacklistCookieId')?.value?.trim() || null,
+        item_id: document.getElementById('blacklistItemId')?.value?.trim() || null,
+        buyer_nick: document.getElementById('blacklistBuyerNick')?.value?.trim() || '',
+        reason: document.getElementById('blacklistReason')?.value?.trim() || '',
+        is_enabled: Boolean(document.getElementById('blacklistEnabled')?.checked)
+    };
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        showToast(result?.message || '黑名单已保存', 'success');
+        resetPersonalBlacklistForm();
+        await loadPersonalBlacklist(1);
+    } catch (error) {
+        console.error('新增个人黑名单失败:', error);
+    }
+}
+
+function resetPersonalBlacklistForm() {
+    const form = document.getElementById('personalBlacklistForm');
+    if (form) form.reset();
+    const enabled = document.getElementById('blacklistEnabled');
+    if (enabled) enabled.checked = true;
+}
+
+async function togglePersonalBlacklist(recordId, isEnabled) {
+    try {
+        await fetchJSON(`${apiBase}/api/blacklist/personal/${recordId}/toggle`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ is_enabled: Boolean(isEnabled) })
+        });
+        showToast(isEnabled ? '黑名单已启用' : '黑名单已禁用', 'success');
+    } catch (error) {
+        console.error('更新黑名单状态失败:', error);
+        await loadPersonalBlacklist(blacklistState.page || 1);
+    }
+}
+
+async function deletePersonalBlacklist(recordId) {
+    if (!confirm('确定删除这条黑名单记录吗？')) return;
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal/${recordId}`, {
+            method: 'DELETE'
+        });
+        showToast(result?.message || '黑名单已删除', 'success');
+        await loadPersonalBlacklist(blacklistState.page || 1);
+    } catch (error) {
+        console.error('删除个人黑名单失败:', error);
+    }
+}
+
+function getSelectedBlacklistIds() {
+    return Array.from(document.querySelectorAll('.blacklist-row-check:checked'))
+        .map(checkbox => parseInt(checkbox.dataset.id || '0', 10))
+        .filter(id => id > 0);
+}
+
+function toggleBlacklistSelectAll(checked) {
+    document.querySelectorAll('.blacklist-row-check').forEach(checkbox => {
+        checkbox.checked = Boolean(checked);
+    });
+    updateBlacklistBatchDeleteState();
+}
+
+function updateBlacklistBatchDeleteState() {
+    const selectedIds = getSelectedBlacklistIds();
+    const batchButton = document.getElementById('blacklistBatchDeleteBtn');
+    const selectAll = document.getElementById('blacklistSelectAll');
+    const rowChecks = Array.from(document.querySelectorAll('.blacklist-row-check'));
+
+    if (batchButton) {
+        batchButton.disabled = selectedIds.length === 0;
+        batchButton.innerHTML = selectedIds.length > 0
+            ? `<i class="bi bi-trash me-1"></i>批量删除 (${selectedIds.length})`
+            : '<i class="bi bi-trash me-1"></i>批量删除';
+    }
+
+    if (selectAll) {
+        selectAll.checked = rowChecks.length > 0 && selectedIds.length === rowChecks.length;
+        selectAll.indeterminate = selectedIds.length > 0 && selectedIds.length < rowChecks.length;
+    }
+}
+
+async function batchDeletePersonalBlacklist() {
+    const selectedIds = getSelectedBlacklistIds();
+    if (selectedIds.length === 0) {
+        showToast('请先选择要删除的黑名单', 'warning');
+        return;
+    }
+    if (!confirm(`确定删除选中的 ${selectedIds.length} 条黑名单记录吗？`)) return;
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal/batch-delete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: selectedIds })
+        });
+        showToast(result?.message || '批量删除完成', 'success');
+        await loadPersonalBlacklist(blacklistState.page || 1);
+    } catch (error) {
+        console.error('批量删除个人黑名单失败:', error);
+    }
+}
+
+function resetBlacklistFilters() {
+    const buyerId = document.getElementById('blacklistFilterBuyerId');
+    const buyerNick = document.getElementById('blacklistFilterBuyerNick');
+    if (buyerId) buyerId.value = '';
+    if (buyerNick) buyerNick.value = '';
+    loadPersonalBlacklist(1);
+}
+
+async function exportPersonalBlacklist() {
+    toggleLoading(true);
+    try {
+        const response = await fetch(`${apiBase}/api/blacklist/personal/export`, {
+            headers: { 'Authorization': `Bearer ${getAuthToken()}` }
+        });
+        if (response.status === 401) {
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+        if (!response.ok) {
+            let message = `导出失败: HTTP ${response.status}`;
+            try {
+                const errorText = await response.text();
+                if (errorText) message = errorText;
+            } catch {}
+            throw new Error(message);
+        }
+        const blob = await response.blob();
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
+        const filename = filenameMatch ? filenameMatch[1] : `personal_blacklist_${Date.now()}.xlsx`;
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        showToast('黑名单已导出', 'success');
+    } catch (error) {
+        console.error('导出个人黑名单失败:', error);
+        showToast(error.message || '导出个人黑名单失败', 'danger');
+    } finally {
+        toggleLoading(false);
+    }
+}
+
+async function importPersonalBlacklistFile() {
+    const input = document.getElementById('blacklistImportFile');
+    const file = input?.files?.[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.xlsx')) {
+        showToast('仅支持 .xlsx 文件', 'warning');
+        input.value = '';
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+        const result = await fetchJSON(`${apiBase}/api/blacklist/personal/import`, {
+            method: 'POST',
+            body: formData
+        });
+        showToast(result?.message || '黑名单导入完成', 'success');
+        await loadPersonalBlacklist(1);
+    } catch (error) {
+        console.error('导入个人黑名单失败:', error);
+    } finally {
+        input.value = '';
+    }
+}
+
+
 
 function getAboutDiagnosticsElements() {
     return {
@@ -10329,6 +10727,7 @@ const DEFAULT_MENU_ITEMS = [
     { id: 'notification-channels', name: '通知渠道', icon: 'bi-bell', required: false },
     { id: 'message-notifications', name: '消息通知', icon: 'bi-chat-dots', required: false },
     { id: 'online-im', name: '在线客服', icon: 'bi-headset', required: false },
+    { id: 'blacklist', name: '黑名单管理', icon: 'bi-person-x', required: false },
     { id: 'system-settings', name: '系统设置', icon: 'bi-gear', required: true },
     { id: 'about', name: '关于', icon: 'bi-info-circle', required: true }
 ];
@@ -20526,7 +20925,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v2.0.1';
+const DEFAULT_VERSION = 'v2.0.2';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -20637,9 +21036,20 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v2.0.1',
+    version: 'v2.0.2',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v2.0.2',
+            date: '2026-06-03',
+            updates: [
+                '【新功能】新增黑名单管理能力，支持按买家、账号和商品维护拦截规则，自动回复、客服手动发送和发货流程会统一识别黑名单',
+                '【新功能】重写在线客服为直连闲鱼 IM 会话体验，支持账号连接状态、远程会话列表、历史消息分页和实时消息合并展示',
+                '【优化】在线客服三栏界面新增账号连接/断开、IM 来源标识、未读数、加载更多会话和更早消息入口，客服处理更集中',
+                '【修复】修复在线客服拉取会话时新建临时 WebSocket 导致主监听连接被挤下线的问题，改为复用主连接按 mid 分发 IM 响应',
+                '【修复】补强在线客服远程消息解析，文本、图片、卡片等消息可正常展示，并在 IM 异常时回退本地缓存和订单会话入口',
+            ]
+        },
         {
             version: 'v2.0.1',
             date: '2026-05-28',
@@ -22638,6 +23048,13 @@ let chatCurrentToUserId = '';
 let chatCurrentSenderName = '';
 let chatCurrentItemId = '';
 let chatSessionsCache = [];
+let chatAccountsCache = [];
+let chatCurrentAccount = null;
+let chatSessionsNextCursor = null;
+let chatSessionsHasMore = false;
+let chatMessagesNextCursor = null;
+let chatMessagesHasMore = false;
+let chatMessagesSource = 'remote_im';
 let chatOldestMsgId = null;
 let chatSseAbortController = null;
 let chatSseRetryCount = 0;
@@ -22737,6 +23154,15 @@ function mergeChatSessionLists(primarySessions, secondarySessions) {
     return sortChatSessions(merged);
 }
 
+function getChatAccountStatus(account) {
+    const state = account?.connection_state || 'not_running';
+    if (!account?.enabled) return { label: '已断开', className: 'offline' };
+    if (account?.connected) return { label: '已连接', className: 'online' };
+    if (state === 'connecting' || state === 'reconnecting') return { label: '连接中', className: 'pending' };
+    if (account?.running) return { label: '运行中', className: 'pending' };
+    return { label: '未连接', className: 'offline' };
+}
+
 async function refreshChatAccounts() {
     const body = document.getElementById('chatAccountsBody');
     if (!body) return;
@@ -22748,16 +23174,34 @@ async function refreshChatAccounts() {
             return;
         }
         const accounts = result.accounts || [];
+        chatAccountsCache = accounts;
+        chatCurrentAccount = accounts.find(account => account.id === chatCurrentCookieId) || null;
         if (!accounts.length) {
             body.innerHTML = '<div class="text-center text-muted py-4 small">暂无可用账号</div>';
             return;
         }
         body.innerHTML = '';
         accounts.forEach(account => {
+            const status = getChatAccountStatus(account);
+            const actionLabel = account.enabled && (account.running || account.connected) ? '断开' : '连接';
+            const actionIcon = actionLabel === '断开' ? 'bi-plug' : 'bi-play-circle';
             const div = document.createElement('div');
             div.className = 'chat-account-item' + (account.id === chatCurrentCookieId ? ' active' : '');
-            div.innerHTML = `<div class="chat-account-dot ${account.connected ? 'online' : 'offline'}"></div><div class="chat-account-name" title="${escapeHtml(account.id)}">${escapeHtml(account.name || account.id)}</div>`;
+            div.innerHTML = `
+                <div class="chat-account-dot ${status.className}"></div>
+                <div class="chat-account-main">
+                    <div class="chat-account-name" title="${escapeHtml(account.id)}">${escapeHtml(account.name || account.id)}</div>
+                    <div class="chat-account-status ${status.className}" title="${escapeHtml(account.message_stream_note || '')}">${escapeHtml(status.label)}</div>
+                </div>
+                <button class="chat-account-action" title="${escapeHtml(actionLabel)}">
+                    <i class="bi ${actionIcon}"></i>
+                </button>
+            `;
             div.onclick = () => selectChatAccount(account.id);
+            div.querySelector('.chat-account-action')?.addEventListener('click', event => {
+                event.stopPropagation();
+                toggleChatAccountConnection(account.id, actionLabel === '断开');
+            });
             body.appendChild(div);
         });
     } catch (error) {
@@ -22766,12 +23210,36 @@ async function refreshChatAccounts() {
     }
 }
 
+async function toggleChatAccountConnection(cookieId, disconnect = false) {
+    try {
+        const endpoint = disconnect ? 'disconnect' : 'connect';
+        const result = await fetchJSON(`${apiBase}/api/chat/${endpoint}/${encodeURIComponent(cookieId)}`, { method: 'POST' });
+        if (result.success) {
+            showToast(result.message || (disconnect ? '已断开连接' : '连接已启动'), 'success');
+        } else {
+            showToast(result.detail || result.message || '操作失败', 'danger');
+        }
+    } catch (error) {
+        console.error('切换客服连接失败:', error);
+        showToast(disconnect ? '断开失败' : '连接失败', 'danger');
+    }
+    await refreshChatAccounts();
+    if (cookieId === chatCurrentCookieId) {
+        await refreshChatSessions();
+    }
+}
+
 async function selectChatAccount(cookieId) {
     chatCurrentCookieId = cookieId;
+    chatCurrentAccount = chatAccountsCache.find(account => account.id === cookieId) || null;
     chatCurrentChatId = '';
     chatCurrentToUserId = '';
     chatCurrentSenderName = '';
     chatCurrentItemId = '';
+    chatSessionsNextCursor = null;
+    chatSessionsHasMore = false;
+    chatMessagesNextCursor = null;
+    chatMessagesHasMore = false;
     chatOldestMsgId = null;
     const placeholder = document.getElementById('chatMainPlaceholder');
     const active = document.getElementById('chatActiveArea');
@@ -22782,7 +23250,7 @@ async function selectChatAccount(cookieId) {
     await refreshChatSessions();
 }
 
-async function refreshChatSessions() {
+async function refreshChatSessions(append = false) {
     const body = document.getElementById('chatSessionsBody');
     if (!body) return;
     if (!chatCurrentCookieId) {
@@ -22790,25 +23258,43 @@ async function refreshChatSessions() {
         chatSessionsCache = [];
         return;
     }
-    body.innerHTML = '<div class="text-center text-muted py-4 small"><div class="spinner-border spinner-border-sm"></div></div>';
+    if (!append) {
+        chatSessionsNextCursor = null;
+        chatSessionsHasMore = false;
+        body.innerHTML = '<div class="text-center text-muted py-4 small"><div class="spinner-border spinner-border-sm"></div></div>';
+    }
     try {
-        const result = await fetchJSON(`${apiBase}/api/chat/sessions?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&include_order_fallback=true&limit=120`);
+        let url = `${apiBase}/api/chat/sessions?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&include_order_fallback=true&remote=true&limit=60`;
+        if (append && chatSessionsNextCursor) {
+            url += `&cursor=${encodeURIComponent(chatSessionsNextCursor)}`;
+        }
+        const result = await fetchJSON(url);
         if (!result.success) {
             body.innerHTML = '<div class="text-center text-muted py-4 small">加载失败</div>';
             return;
         }
-        chatSessionsCache = sortChatSessions(result.sessions || []);
-        chatSessionsCache = await enrichSessionsWithOrdersFallback(chatSessionsCache);
+        chatSessionsNextCursor = result.next_cursor || null;
+        chatSessionsHasMore = Boolean(result.has_more && chatSessionsNextCursor);
+        const incomingSessions = sortChatSessions(result.sessions || []);
+        chatSessionsCache = append ? mergeChatSessionLists(chatSessionsCache, incomingSessions) : incomingSessions;
+        if (!append && result.remote_error) {
+            console.debug('直连IM会话提示:', result.remote_error);
+        }
         if (!chatSessionsCache.length) {
-            body.innerHTML = '<div class="text-center text-muted py-4 small">暂无会话记录；若该账号已有订单，会自动显示可补拉历史的会话入口</div>';
+            const hint = result.remote_error || '暂无会话记录';
+            body.innerHTML = `<div class="text-center text-muted py-4 small">${escapeHtml(hint)}</div>`;
             return;
         }
         renderChatSessions(chatSessionsCache);
-        mergeHydrationFallbackSessions();
     } catch (error) {
         console.error('获取会话列表失败:', error);
         body.innerHTML = '<div class="text-center text-muted py-4 small">加载失败</div>';
     }
+}
+
+function loadMoreChatSessions() {
+    if (!chatSessionsHasMore || !chatSessionsNextCursor) return;
+    refreshChatSessions(true);
 }
 
 function buildChatSessionsFromOrdersData(orders, cookieId) {
@@ -22869,21 +23355,35 @@ function renderChatSessions(sessions) {
         const displayName = resolveSessionDisplayName(session);
         const avatar = resolveSessionAvatar(session);
         const sessionState = getChatSessionState(session);
-        const preview = String(sessionState.preview || resolveSessionPreview(session)).substring(0, 30);
-        const baseSubMeta = String(sessionState.submeta || '').trim();
+        const preview = String(sessionState.preview || resolveSessionPreview(session)).substring(0, 42);
+        const baseSubMeta = String(sessionState.submeta || session.item_title || '').trim();
         const priceMeta = session.item_price ? `<span class="chat-session-price">￥${escapeHtml(String(session.item_price))}</span>` : '';
+        const unread = Number(session.unread_count || 0);
+        const sourceTag = session.source === 'remote_im' ? '<span class="chat-session-source">IM</span>' : '';
         div.innerHTML = `
             <div class="chat-session-avatar">${avatar.type === 'image' ? `<img src="${escapeHtml(avatar.value)}" alt="avatar" class="chat-session-avatar-image">` : escapeHtml(avatar.value)}</div>
             <div class="chat-session-info">
-                <div class="chat-session-name">${escapeHtml(displayName)}</div>
+                <div class="chat-session-title-row">
+                    <div class="chat-session-name">${escapeHtml(displayName)}</div>
+                    ${sourceTag}
+                    ${unread > 0 ? `<span class="chat-session-unread">${unread > 99 ? '99+' : unread}</span>` : ''}
+                </div>
                 <div class="chat-session-preview">${escapeHtml(preview)}</div>
                 <div class="chat-session-submeta">${escapeHtml(baseSubMeta)}${priceMeta}</div>
             </div>
-            <div class="chat-session-time">${escapeHtml(formatChatTime(session.created_at))}</div>
+            <div class="chat-session-time">${escapeHtml(formatChatTime(session.created_at || session.lastMessageTime))}</div>
         `;
         div.onclick = () => selectChatSession(session);
         body.appendChild(div);
     });
+    if (chatSessionsHasMore) {
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'chat-load-more-btn';
+        more.innerHTML = '<i class="bi bi-chevron-down"></i><span>加载更多会话</span>';
+        more.onclick = loadMoreChatSessions;
+        body.appendChild(more);
+    }
 }
 
 function mergeHydrationFallbackSessions() {
@@ -22921,20 +23421,27 @@ function filterChatSessions() {
         renderChatSessions(sortChatSessions(chatSessionsCache));
         return;
     }
+    const hasMoreBeforeFilter = chatSessionsHasMore;
+    chatSessionsHasMore = false;
     renderChatSessions(sortChatSessions(chatSessionsCache.filter(session =>
         String(session.sender_name || '').toLowerCase().includes(keyword)
         || String(session.buyer_name || '').toLowerCase().includes(keyword)
+        || String(session.item_title || '').toLowerCase().includes(keyword)
         || String(session.chat_id || '').includes(keyword)
         || String(normalizeChatSessionPreview(session.content, session.content_type) || '').toLowerCase().includes(keyword)
     )));
+    chatSessionsHasMore = hasMoreBeforeFilter;
 }
 
 async function selectChatSession(session) {
     session = { ...session, content: normalizeChatSessionPreview(session?.content, session?.content_type) };
     chatCurrentChatId = session.chat_id;
-    chatCurrentToUserId = session.buyer_id || (session.direction === 2 ? (session.sender_id || '') : '');
+    chatCurrentToUserId = session.buyer_id || session.sender_id || '';
     chatCurrentSenderName = resolveSessionDisplayName(session);
     chatCurrentItemId = session.item_id || '';
+    chatMessagesNextCursor = null;
+    chatMessagesHasMore = false;
+    chatMessagesSource = 'remote_im';
     chatOldestMsgId = null;
 
     const placeholder = document.getElementById('chatMainPlaceholder');
@@ -22948,30 +23455,6 @@ async function selectChatSession(session) {
 
     renderChatSessions(chatSessionsCache);
     await loadChatMessages(false);
-
-    try {
-        const result = await fetchJSON(`${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`);
-        if (result.success && Array.isArray(result.messages)) {
-            const buyerMessage = result.messages.find(message => message.direction === 2);
-            if (buyerMessage) {
-                if (!chatCurrentToUserId) chatCurrentToUserId = buyerMessage.sender_id;
-                if (!chatCurrentSenderName || chatCurrentSenderName === chatCurrentChatId) {
-                    chatCurrentSenderName = buyerMessage.sender_name || buyerMessage.sender_id || chatCurrentChatId;
-                    if (headerName) headerName.textContent = chatCurrentSenderName;
-                }
-            }
-            const messageWithItem = [...result.messages].reverse().find(message => {
-                const itemId = String(message.item_id || '');
-                return itemId && itemId !== 'None' && !itemId.startsWith('auto_');
-            });
-            if (messageWithItem) {
-                chatCurrentItemId = messageWithItem.item_id;
-                updateChatHeaderMeta({ ...session, item_id: chatCurrentItemId });
-            }
-        }
-    } catch (error) {
-        console.debug('补充会话信息失败:', error);
-    }
 
     if (!document.getElementById('chatReplyPanel')?.classList.contains('d-none') && chatCurrentItemId) {
         await loadItemKeywords();
@@ -22988,8 +23471,19 @@ function shouldRebuildEmptySession(messages) {
     return false;
 }
 
-function renderChatEmptyState(session) {
-    return `<div class="text-center text-muted py-4"><div class="small">暂无消息记录</div></div>`;
+function renderChatEmptyState(session, hint = '暂无消息记录') {
+    const title = session?.source === 'remote_im' ? hint : (hint || '暂无消息记录');
+    return `<div class="text-center text-muted py-4"><div class="small">${escapeHtml(title)}</div></div>`;
+}
+
+function updateChatMessagePaging(result, messages) {
+    chatMessagesSource = result.source || 'local_cache';
+    chatMessagesNextCursor = result.next_cursor || null;
+    chatMessagesHasMore = Boolean(result.has_more && chatMessagesNextCursor);
+    if (chatMessagesSource === 'local_cache' && messages.length > 0) {
+        chatOldestMsgId = messages[0].id;
+        chatMessagesHasMore = Boolean(result.has_more && chatOldestMsgId);
+    }
 }
 
 async function loadChatMessages(append = false) {
@@ -22997,13 +23491,28 @@ async function loadChatMessages(append = false) {
     const area = document.getElementById('chatMessagesArea');
     if (!area) return;
     if (!append) {
+        chatMessagesNextCursor = null;
+        chatMessagesHasMore = false;
+        chatOldestMsgId = null;
         area.innerHTML = '<div class="text-center text-muted py-4"><div class="spinner-border spinner-border-sm"></div></div>';
     }
 
     try {
-        let url = `${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=50`;
-        if (append && chatOldestMsgId) {
-            url += `&before_id=${chatOldestMsgId}`;
+        let url = `${apiBase}/api/chat/messages?cookie_id=${encodeURIComponent(chatCurrentCookieId)}&chat_id=${encodeURIComponent(chatCurrentChatId)}&limit=40`;
+        if (chatCurrentItemId) {
+            url += `&item_id=${encodeURIComponent(chatCurrentItemId)}`;
+        }
+        if (append) {
+            if (chatMessagesSource === 'remote_im' && chatMessagesNextCursor) {
+                url += `&remote=true&cursor=${encodeURIComponent(chatMessagesNextCursor)}`;
+            } else if (chatMessagesSource === 'local_cache' && chatOldestMsgId) {
+                url += `&remote=false&before_id=${encodeURIComponent(chatOldestMsgId)}`;
+            } else {
+                showToast('没有更多消息了', 'info');
+                return;
+            }
+        } else {
+            url += '&remote=true';
         }
         const result = await fetchJSON(url);
         if (!result.success) {
@@ -23011,19 +23520,39 @@ async function loadChatMessages(append = false) {
             return;
         }
         const messages = result.messages || [];
-        if (messages.length > 0) {
-            chatOldestMsgId = messages[0].id;
+        updateChatMessagePaging(result, messages);
+
+        const buyerMessage = messages.find(message => message.direction === 2);
+        if (buyerMessage && !chatCurrentToUserId) {
+            chatCurrentToUserId = buyerMessage.sender_id;
         }
+        const messageWithItem = [...messages].reverse().find(message => {
+            const itemId = String(message.item_id || '');
+            return itemId && itemId !== 'None' && !itemId.startsWith('auto_');
+        });
+        if (messageWithItem && !chatCurrentItemId) {
+            chatCurrentItemId = messageWithItem.item_id;
+            const currentSession = chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {};
+            updateChatHeaderMeta({ ...currentSession, item_id: chatCurrentItemId });
+        }
+
         if (append) {
+            if (!messages.length) {
+                showToast('没有更多消息了', 'info');
+                return;
+            }
             const previousHeight = area.scrollHeight;
-            area.insertAdjacentHTML('afterbegin', renderChatMessages(messages));
+            area.querySelector('.chat-history-more')?.remove();
+            const moreButton = chatMessagesHasMore ? '<button type="button" class="chat-history-more" onclick="loadMoreChatMessages()"><i class="bi bi-clock-history"></i><span>加载更早消息</span></button>' : '';
+            area.insertAdjacentHTML('afterbegin', `${moreButton}${renderChatMessages(messages)}`);
             area.scrollTop = area.scrollHeight - previousHeight;
         } else {
             if (messages.length) {
-                area.innerHTML = renderChatMessages(messages);
+                const moreButton = chatMessagesHasMore ? '<button type="button" class="chat-history-more" onclick="loadMoreChatMessages()"><i class="bi bi-clock-history"></i><span>加载更早消息</span></button>' : '';
+                area.innerHTML = `${moreButton}${renderChatMessages(messages)}`;
             } else {
                 const currentSession = chatSessionsCache.find(item => item.chat_id === chatCurrentChatId) || {};
-                area.innerHTML = renderChatEmptyState(currentSession);
+                area.innerHTML = renderChatEmptyState(currentSession, result.remote_error || '暂无消息记录');
             }
             area.scrollTop = area.scrollHeight;
         }
