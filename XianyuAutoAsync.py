@@ -929,6 +929,10 @@ class XianyuLive:
     def _build_server_overload_manual_recovery_state(cls, state: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(state, dict) or str(state.get('reason') or '') != 'server_overload':
             return state
+        if state.get('manual_cookie_recovery_completed_at'):
+            state['requires_manual_cookie_refresh'] = False
+            state['manual_recovery_hint'] = ''
+            return state
         threshold = max(1, int(RISK_CONTROL.get('server_overload_circuit_breaker_threshold', 3) or 3))
         consecutive_count = int(state.get('consecutive_count', 0) or 0)
         if not state.get('requires_manual_cookie_refresh') and consecutive_count >= threshold:
@@ -936,6 +940,39 @@ class XianyuLive:
         if state.get('requires_manual_cookie_refresh') and not state.get('manual_recovery_hint'):
             state['manual_recovery_hint'] = '平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检'
         return state
+
+    @classmethod
+    def mark_server_overload_manual_recovery_completed(
+        cls,
+        cookie_id: str,
+        source: str = 'manual_recovery',
+        grace_until: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """标记当前 server_overload 退避已完成人工恢复，只保留等待自动重试的退避。"""
+        if not cookie_id:
+            return {'updated': False, 'reason': 'empty_cookie_id'}
+
+        state = cls.get_password_login_failure_backoff(cookie_id)
+        if not isinstance(state, dict):
+            return {'updated': False, 'reason': 'no_active_backoff'}
+        if str(state.get('reason') or '').strip() != 'server_overload':
+            return {'updated': False, 'reason': 'not_server_overload'}
+
+        updated_state = dict(state)
+        updated_state['requires_manual_cookie_refresh'] = False
+        updated_state['manual_recovery_hint'] = ''
+        updated_state['manual_cookie_recovery_completed_at'] = time.time()
+        updated_state['manual_cookie_recovery_completed_source'] = str(source or 'manual_recovery')
+        if grace_until:
+            updated_state['manual_cookie_recovery_grace_until'] = int(grace_until)
+
+        cls._password_login_failure_backoff[cookie_id] = updated_state
+        cls._persist_login_backoff(cookie_id, updated_state)
+        return {
+            'updated': True,
+            'state': dict(updated_state),
+            'remaining_seconds': max(0, int(float(updated_state.get('until') or 0) - time.time())),
+        }
 
     @staticmethod
     def _is_counted_password_login_failure_reason(reason: str) -> bool:
@@ -1131,8 +1168,24 @@ class XianyuLive:
         current_time = current_time or time.time()
         backoff = self._get_active_password_login_failure_backoff(current_time, consume_bypass=False)
         if backoff:
+            qr_remaining = self._get_qr_login_grace_remaining_seconds(current_time)
             state = dict(backoff)
             state = XianyuLive._build_server_overload_manual_recovery_state(state)
+            if (
+                str(state.get('reason') or '').strip() == 'server_overload'
+                and state.get('requires_manual_cookie_refresh')
+                and qr_remaining > 0
+            ):
+                completed = XianyuLive.mark_server_overload_manual_recovery_completed(
+                    self.cookie_id,
+                    source='qr_login_grace_active',
+                    grace_until=int(current_time + qr_remaining),
+                )
+                if completed.get('updated') and isinstance(completed.get('state'), dict):
+                    state = dict(completed['state'])
+                else:
+                    state['requires_manual_cookie_refresh'] = False
+                    state['manual_recovery_hint'] = ''
             state['type'] = 'login_backoff'
             state['until'] = float(state.get('until') or 0)
             state['remaining_seconds'] = max(0, int(state.get('until', 0) - current_time))

@@ -6885,6 +6885,11 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                             task_deferred_for_server_overload = True
                             db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
                             XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready_deferred_for_server_overload', grace_until=qr_login_grace_until)
+                            XianyuLive.mark_server_overload_manual_recovery_completed(
+                                account_id,
+                                source='qr_login_real_cookie_ready',
+                                grace_until=qr_login_grace_until,
+                            )
                             if cookie_manager.manager:
                                 cookie_manager.manager.cookies[account_id] = final_cookies
                             warning_message = (

@@ -267,6 +267,48 @@ class RiskControlLogicTest(unittest.TestCase):
         self.assertTrue(wait_state["requires_manual_cookie_refresh"])
         self.assertIn("RGV587", wait_state["manual_recovery_hint"])
 
+    def test_completed_qr_recovery_keeps_backoff_but_clears_manual_hint(self):
+        with patch.object(XianyuLive, "_persist_login_backoff", lambda *_args, **_kwargs: None):
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            result = XianyuLive.mark_server_overload_manual_recovery_completed(
+                "test-cookie",
+                source="qr_login_real_cookie_ready",
+                grace_until=1234567890,
+            )
+
+        self.assertTrue(result["updated"])
+        wait_state = self.live._get_auth_recovery_wait_state(__import__("time").time())
+
+        self.assertEqual(wait_state["reason"], "server_overload")
+        self.assertGreater(wait_state["remaining_seconds"], 0)
+        self.assertFalse(wait_state["requires_manual_cookie_refresh"])
+        self.assertEqual(wait_state["manual_recovery_hint"], "")
+        self.assertEqual(wait_state["manual_cookie_recovery_completed_source"], "qr_login_real_cookie_ready")
+
+    def test_active_qr_grace_auto_clears_stale_manual_hint(self):
+        now = __import__("time").time()
+        XianyuLive._password_login_failure_backoff["test-cookie"] = {
+            "until": now + 900,
+            "reason": "server_overload",
+            "seconds": 1800,
+            "base_seconds": 600,
+            "consecutive_count": 6,
+            "created_at": now - 120,
+            "requires_manual_cookie_refresh": True,
+            "manual_recovery_hint": "平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检",
+        }
+
+        with patch.object(self.live, "_get_qr_login_grace_remaining_seconds", lambda _now=None: 600), \
+                patch.object(XianyuLive, "_persist_login_backoff", lambda *_args, **_kwargs: None):
+            wait_state = self.live._get_auth_recovery_wait_state(now)
+
+        self.assertEqual(wait_state["reason"], "server_overload")
+        self.assertFalse(wait_state["requires_manual_cookie_refresh"])
+        self.assertEqual(wait_state["manual_recovery_hint"], "")
+        self.assertEqual(wait_state["manual_cookie_recovery_completed_source"], "qr_login_grace_active")
+
     def test_external_auth_recovery_owner_detection(self):
         self.assertTrue(XianyuLive.is_external_auth_recovery_owner("manual_cookie_import:abc"))
         self.assertTrue(XianyuLive.is_external_auth_recovery_owner("password_login:abc"))
