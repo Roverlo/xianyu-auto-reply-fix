@@ -286,6 +286,9 @@ class MessageStreamWatchdogTest(unittest.IsolatedAsyncioTestCase):
         self.live.last_sync_package_time = 0
         self.live.last_user_chat_time = 0
         self.live.last_stream_watchdog_reconnect_time = 0
+        self.live.last_stream_watchdog_probe_time = 0
+        self.live.message_stream_watchdog_probe_cooldown = 60
+        self.live.message_stream_watchdog_reconnect_on_keepalive_success = False
         self.live.last_heartbeat_response = 1000
         self.live._safe_str = str
 
@@ -327,20 +330,50 @@ class MessageStreamWatchdogTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reconnect_reasons, [])
         self.assertEqual(self.live.last_stream_watchdog_reconnect_time, 0)
 
-    async def test_initial_silence_over_threshold_reconnects(self):
+    async def test_initial_silence_over_threshold_keeps_connection_when_keepalive_succeeds(self):
         reconnect_reasons = []
 
         async def force_reconnect(reason):
             reconnect_reasons.append(reason)
             return True
 
+        async def keepalive_success():
+            self.live.last_session_keepalive_status = "success"
+            return True
+
         self.live.last_successful_connection = 700
         self.live.message_stream_initial_silence_reconnect_timeout = 200
         self.live._force_websocket_reconnect = force_reconnect
+        self.live.keep_session_alive = keepalive_success
 
         await self._run_one_watchdog_pass()
 
-        self.assertEqual(reconnect_reasons, ["业务消息流长时间只有心跳，疑似假在线"])
+        self.assertEqual(reconnect_reasons, [])
+        self.assertEqual(self.live.last_stream_watchdog_probe_time, 1000)
+        self.assertEqual(self.live.last_stream_watchdog_reconnect_time, 0)
+
+    async def test_initial_silence_over_threshold_reconnects_when_keepalive_fails(self):
+        reconnect_reasons = []
+
+        async def force_reconnect(reason):
+            reconnect_reasons.append(reason)
+            return True
+
+        async def keepalive_failed():
+            self.live.last_session_keepalive_status = "network_failed"
+            return False
+
+        self.live.last_successful_connection = 700
+        self.live.message_stream_initial_silence_reconnect_timeout = 200
+        self.live._force_websocket_reconnect = force_reconnect
+        self.live.keep_session_alive = keepalive_failed
+
+        await self._run_one_watchdog_pass()
+
+        self.assertEqual(
+            reconnect_reasons,
+            ["业务消息流长时间只有心跳且轻量保活未确认安全(status=network_failed)"],
+        )
         self.assertEqual(self.live.last_stream_watchdog_reconnect_time, 1000)
 
 

@@ -733,6 +733,7 @@ utils/*.dist/**
 *.test.yml
 config.local.*
 config.dev.*
+管理员.txt
 
 # 密钥和证书完整覆盖
 *.key

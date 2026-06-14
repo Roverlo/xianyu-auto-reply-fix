@@ -95,8 +95,12 @@ RISK_CONTROL:
   pending_order_reconcile_notice_cooldown_seconds: 1800
   pending_order_reconcile_session_expired_backoff_seconds: 1800
   pending_order_reconcile_error_backoff_seconds: 300
-  message_stream_watchdog_timeout_seconds: 1800
-  message_stream_initial_silence_reconnect_seconds: 900
+  # 业务流看门狗只用于识别“只有心跳、没有业务包”的疑似假在线。
+  # 心跳和轻量会话保活都正常时不主动断开 WebSocket，避免频繁重连触发平台 token 风控。
+  message_stream_watchdog_timeout_seconds: 14400
+  message_stream_initial_silence_reconnect_seconds: 14400
+  message_stream_watchdog_probe_cooldown_seconds: 1800
+  message_stream_watchdog_reconnect_on_keepalive_success: false
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
 TOKEN_RETRY_INTERVAL: 600
 SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟

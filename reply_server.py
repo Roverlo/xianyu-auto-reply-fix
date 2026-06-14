@@ -67,8 +67,12 @@ except ImportError:
 KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 
 # 简单的用户认证配置
-ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # 系统初始化时的默认密码
+DEFAULT_LOGIN_INFO_USERNAME = os.getenv("DEFAULT_LOGIN_INFO_USERNAME", ADMIN_USERNAME)
+DEFAULT_LOGIN_INFO_PASSWORD = os.getenv("DEFAULT_LOGIN_INFO_PASSWORD")
+if DEFAULT_LOGIN_INFO_PASSWORD is None:
+    DEFAULT_LOGIN_INFO_PASSWORD = "admin123" if DEFAULT_ADMIN_PASSWORD == "admin123" else ""
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
 
@@ -8061,11 +8065,19 @@ def get_login_info_status():
         else:
             enabled_bool = enabled_str == 'true'
 
-        return {"enabled": enabled_bool}
+        return {
+            "enabled": enabled_bool,
+            "username": DEFAULT_LOGIN_INFO_USERNAME if enabled_bool else "",
+            "password": DEFAULT_LOGIN_INFO_PASSWORD if enabled_bool else "",
+        }
     except Exception as e:
         logger.error(f"获取登录信息显示状态失败: {e}")
         # 出错时默认为开启
-        return {"enabled": True}
+        return {
+            "enabled": True,
+            "username": DEFAULT_LOGIN_INFO_USERNAME,
+            "password": DEFAULT_LOGIN_INFO_PASSWORD,
+        }
 
 
 class RegistrationSettingUpdate(BaseModel):

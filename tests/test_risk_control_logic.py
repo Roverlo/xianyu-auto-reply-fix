@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+import asyncio
 from unittest.mock import patch
 
 
@@ -54,8 +55,10 @@ def _install_import_stubs():
         "slider_consecutive_failure_threshold": 2,
         "slider_consecutive_pause_seconds": 7200,
         "hard_risk_backoff_seconds": 7200,
-        "message_stream_watchdog_timeout_seconds": 1800,
-        "message_stream_initial_silence_reconnect_seconds": 900,
+        "message_stream_watchdog_timeout_seconds": 14400,
+        "message_stream_initial_silence_reconnect_seconds": 14400,
+        "message_stream_watchdog_probe_cooldown_seconds": 1800,
+        "message_stream_watchdog_reconnect_on_keepalive_success": False,
     }
     sys.modules["config"] = config
 
@@ -216,17 +219,86 @@ class RiskControlLogicTest(unittest.TestCase):
             "62216320925",
         )
 
-    def test_stream_initial_silence_threshold_can_be_shorter_than_idle_timeout(self):
+    def test_stream_initial_silence_threshold_defaults_to_idle_timeout_or_longer(self):
         self.live.heartbeat_interval = 15
         self.live.session_keepalive_interval = 600
         self.live.stream_watchdog_grace_period = 120
-        self.live.message_stream_watchdog_timeout = 1800
-        self.live.message_stream_initial_silence_reconnect_timeout = 900
+        self.live.message_stream_watchdog_timeout = 14400
+        self.live.message_stream_initial_silence_reconnect_timeout = 14400
 
-        self.assertLess(
+        self.assertGreaterEqual(
             self.live.message_stream_initial_silence_reconnect_timeout,
             self.live.message_stream_watchdog_timeout,
         )
+
+    def test_stream_watchdog_keepalive_success_does_not_force_reconnect(self):
+        class _OpenWebSocket:
+            closed = False
+
+        async def _run():
+            now = 10_000.0
+            self.live.cookie_id = "test-cookie"
+            self.live.ws = _OpenWebSocket()
+            self.live.heartbeat_timeout = 30
+            self.live.heartbeat_interval = 15
+            self.live.stream_watchdog_check_interval = 15
+            self.live.stream_watchdog_grace_period = 120
+            self.live.message_stream_watchdog_timeout = 300
+            self.live.message_stream_initial_silence_reconnect_timeout = 300
+            self.live.message_stream_watchdog_probe_cooldown = 60
+            self.live.message_stream_watchdog_reconnect_on_keepalive_success = False
+            self.live.last_successful_connection = now - 400
+            self.live.last_non_heartbeat_message_time = now - 400
+            self.live.last_sync_package_time = now - 400
+            self.live.last_user_chat_time = 0
+            self.live.last_heartbeat_response = now - 5
+            self.live.last_stream_watchdog_reconnect_time = 0
+            self.live.last_stream_watchdog_probe_time = 0
+            self.live.stream_watchdog_trigger_times = []
+            self.live.message_stream_notification_window = 3600
+            self.live.last_token_refresh_status = None
+
+            sleeps = 0
+            reconnects = 0
+
+            async def fake_sleep(_seconds):
+                nonlocal sleeps
+                sleeps += 1
+                if sleeps > 1:
+                    raise asyncio.CancelledError()
+
+            async def fake_keepalive():
+                self.live.last_session_keepalive_status = "success"
+                return True
+
+            async def fake_reconnect(_reason):
+                nonlocal reconnects
+                reconnects += 1
+                return True
+
+            async def fake_notify(*_args, **_kwargs):
+                return None
+
+            self.live._interruptible_sleep = fake_sleep
+            self.live.keep_session_alive = fake_keepalive
+            self.live._force_websocket_reconnect = fake_reconnect
+            self.live._maybe_notify_message_stream_stale = fake_notify
+            self.live._safe_str = str
+
+            cookie_manager_module = types.ModuleType("cookie_manager")
+            cookie_manager_module.manager = types.SimpleNamespace(
+                get_cookie_status=lambda _cookie_id: True,
+            )
+            time_module = XianyuLive.message_stream_watchdog_loop.__globals__["time"]
+            with patch.dict(sys.modules, {"cookie_manager": cookie_manager_module}):
+                with patch.object(time_module, "time", return_value=now):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.live.message_stream_watchdog_loop()
+
+            self.assertEqual(reconnects, 0)
+            self.assertEqual(self.live.last_stream_watchdog_probe_time, now)
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

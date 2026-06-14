@@ -283,11 +283,11 @@
         <div class="mt-2">
           <div class="d-flex justify-content-between align-items-center mb-1">
             <small class="text-muted">用户名：</small>
-            <code class="bg-white px-2 py-1 rounded">admin</code>
+            <code class="bg-white px-2 py-1 rounded" id="defaultUsernameDisplay">加载中...</code>
           </div>
           <div class="d-flex justify-content-between align-items-center">
             <small class="text-muted">密码：</small>
-            <code class="bg-white px-2 py-1 rounded">admin123</code>
+            <code class="bg-white px-2 py-1 rounded" id="defaultPasswordDisplay">加载中...</code>
           </div>
         </div>
         <div class="text-center mt-2">
@@ -314,6 +314,8 @@
     let emailSecurityCaptchaId = null;
     let securityCaptchaRequired = true;  // 默认需要验证码，会通过API检查
     let loginCaptchaEnabled = true;  // 登录验证码是否启用
+    let defaultLoginUsername = '';
+    let defaultLoginPassword = '';
 
     // 检查登录验证码是否启用
     async function checkLoginCaptchaEnabled() {
@@ -473,8 +475,13 @@
 
     // 填充默认登录凭据
     function fillDefaultCredentials() {
-      document.getElementById('username').value = 'admin';
-      document.getElementById('password').value = 'admin123';
+      if (!defaultLoginUsername || !defaultLoginPassword) {
+        showError('默认登录信息未加载，请手动输入账号密码');
+        return;
+      }
+
+      document.getElementById('username').value = defaultLoginUsername;
+      document.getElementById('password').value = defaultLoginPassword;
       hideError();
 
       // 添加一个小动画效果
@@ -903,15 +910,19 @@
         const result = await response.json();
 
         const defaultLoginInfo = document.getElementById('defaultLoginInfo');
-        if (result.enabled) {
+        defaultLoginUsername = result.username || '';
+        defaultLoginPassword = result.password || '';
+        document.getElementById('defaultUsernameDisplay').textContent = defaultLoginUsername || '未配置';
+        document.getElementById('defaultPasswordDisplay').textContent = defaultLoginPassword || '未配置';
+
+        if (result.enabled && defaultLoginUsername && defaultLoginPassword) {
           defaultLoginInfo.style.display = 'block';
         } else {
           defaultLoginInfo.style.display = 'none';
         }
       } catch (error) {
         console.error('检查登录信息显示状态失败:', error);
-        // 出错时默认显示
-        document.getElementById('defaultLoginInfo').style.display = 'block';
+        document.getElementById('defaultLoginInfo').style.display = 'none';
       }
     }
 

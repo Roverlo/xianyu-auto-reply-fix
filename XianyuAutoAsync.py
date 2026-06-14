@@ -1673,6 +1673,7 @@ class XianyuLive:
         self.last_sent_heartbeat_mid = None
         self.pending_heartbeat_mids.clear()
         self.last_stream_watchdog_reconnect_time = 0
+        self.last_stream_watchdog_probe_time = 0
 
     def _mark_non_heartbeat_message(self, received_at: Optional[float] = None, *, is_sync_package: bool = False):
         """记录最近一次非心跳业务包时间。"""
@@ -1788,7 +1789,12 @@ class XianyuLive:
                     ):
                         continue
 
-                    self.last_stream_watchdog_reconnect_time = now
+                    if (
+                        self.last_stream_watchdog_probe_time
+                        and now - self.last_stream_watchdog_probe_time < self.message_stream_watchdog_probe_cooldown
+                    ):
+                        continue
+
                     if self.last_sync_package_time:
                         sync_status = f"最近同步包距今{(now - self.last_sync_package_time):.0f}秒"
                     else:
@@ -1809,7 +1815,22 @@ class XianyuLive:
                             f"【{self.cookie_id}】检测到业务流疑似假在线: "
                             f"已连接{connected_for:.0f}秒，最近非心跳业务包距今{business_idle:.0f}秒，{sync_status}{user_chat_status}"
                         )
-                    await self._force_websocket_reconnect("业务消息流长时间只有心跳，疑似假在线")
+
+                    self.last_stream_watchdog_probe_time = now
+                    keepalive_ok = await self.keep_session_alive()
+                    if keepalive_ok and not self.message_stream_watchdog_reconnect_on_keepalive_success:
+                        logger.warning(
+                            f"【{self.cookie_id}】业务流疑似假在线，但心跳和轻量会话保活均正常，"
+                            f"保留当前WebSocket连接以降低重连触发token风控的概率"
+                        )
+                        await self._maybe_notify_message_stream_stale(now, connected_for, business_idle)
+                        continue
+
+                    keepalive_status = getattr(self, 'last_session_keepalive_status', None) or 'unknown'
+                    self.last_stream_watchdog_reconnect_time = now
+                    await self._force_websocket_reconnect(
+                        f"业务消息流长时间只有心跳且轻量保活未确认安全(status={keepalive_status})"
+                    )
                     await self._maybe_notify_message_stream_stale(now, connected_for, business_idle)
                 except asyncio.CancelledError:
                     logger.info(f"【{self.cookie_id}】业务流看门狗收到取消信号，准备退出")
@@ -3245,6 +3266,7 @@ class XianyuLive:
         self.last_sync_package_time = 0
         self.last_user_chat_time = 0
         self.last_stream_watchdog_reconnect_time = 0
+        self.last_stream_watchdog_probe_time = 0
 
         # Token刷新相关配置
         self.token_refresh_interval = TOKEN_REFRESH_INTERVAL
@@ -3284,10 +3306,24 @@ class XianyuLive:
             int(
                 RISK_CONTROL.get(
                     'message_stream_initial_silence_reconnect_seconds',
-                    900,
-                ) or 900
+                    14400,
+                ) or 14400
             ),
             self.stream_watchdog_grace_period,
+        )
+        self.message_stream_watchdog_probe_cooldown = max(
+            int(RISK_CONTROL.get('message_stream_watchdog_probe_cooldown_seconds', 1800) or 1800),
+            self.stream_watchdog_check_interval,
+            300,
+        )
+        reconnect_on_keepalive_success = RISK_CONTROL.get(
+            'message_stream_watchdog_reconnect_on_keepalive_success',
+            False,
+        )
+        self.message_stream_watchdog_reconnect_on_keepalive_success = (
+            reconnect_on_keepalive_success
+            if isinstance(reconnect_on_keepalive_success, bool)
+            else str(reconnect_on_keepalive_success).strip().lower() in {'1', 'true', 'yes', 'on'}
         )
         self.stream_watchdog_trigger_times = deque(maxlen=8)
         self.message_stream_notification_window = max(self.message_stream_watchdog_timeout * 2, 3600)
