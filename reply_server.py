@@ -3830,6 +3830,16 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'cookie_refresh_enabled': None,
         'manual_refresh_active': False,
         'auth_recovery_owner': None,
+        'auth_recovery_wait_reason': None,
+        'auth_recovery_next_attempt_at': None,
+        'auth_recovery_next_attempt_at_display': None,
+        'auth_recovery_remaining_seconds': 0,
+        'manual_cookie_recovery_recommended': False,
+        'manual_recovery_hint': None,
+        'can_receive_messages': False,
+        'can_auto_deliver': False,
+        'operational_status': 'not_running',
+        'operational_message': '账号任务未运行',
     }
     if not cleaned_cid:
         return runtime_status
@@ -3852,6 +3862,20 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
             live_instance = XianyuLive.get_instance(cleaned_cid)
         auth_recovery_state = XianyuLive.get_auth_recovery_lock_state(cleaned_cid)
         runtime_status['auth_recovery_owner'] = (auth_recovery_state or {}).get('owner')
+        try:
+            auth_wait_state = live_instance._get_auth_recovery_wait_state(status_built_at) if live_instance else None
+        except Exception:
+            auth_wait_state = None
+        if auth_wait_state:
+            wait_until = _normalize_runtime_timestamp(auth_wait_state.get('until'))
+            runtime_status.update({
+                'auth_recovery_wait_reason': auth_wait_state.get('reason'),
+                'auth_recovery_next_attempt_at': wait_until,
+                'auth_recovery_next_attempt_at_display': _format_runtime_timestamp(wait_until),
+                'auth_recovery_remaining_seconds': int(auth_wait_state.get('remaining_seconds') or 0),
+                'manual_cookie_recovery_recommended': bool(auth_wait_state.get('requires_manual_cookie_refresh')),
+                'manual_recovery_hint': auth_wait_state.get('manual_recovery_hint') or None,
+            })
 
     if not live_instance:
         return runtime_status
@@ -4117,6 +4141,37 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
         'state_last_changed_at_display': _format_runtime_timestamp(last_state_changed_at),
         'cookie_refresh_enabled': getattr(live_instance, 'cookie_refresh_enabled', None),
         'manual_refresh_active': bool(XianyuLive.is_manual_refresh_active(cleaned_cid, allow_handoff_recovery=True)),
+    })
+    can_receive_messages = bool(ws_ready and session_ready and token_ready and message_stream_ready)
+    can_auto_deliver = bool(can_receive_messages and getattr(live_instance, 'auto_delivery_enabled', True))
+    manual_cookie_recovery_recommended = bool(runtime_status.get('manual_cookie_recovery_recommended'))
+    auth_wait_reason = runtime_status.get('auth_recovery_wait_reason')
+    if manual_cookie_recovery_recommended:
+        operational_status = 'manual_cookie_recovery_recommended'
+        operational_message = runtime_status.get('manual_recovery_hint') or '平台Token接口持续限流，建议手动完成验证后导入最新Cookie'
+    elif auth_wait_reason:
+        operational_status = 'auth_backoff'
+        operational_message = (
+            f"账号认证退避中，下一次自动尝试：{runtime_status.get('auth_recovery_next_attempt_at_display') or '未知'}"
+        )
+    elif can_auto_deliver:
+        operational_status = 'ready'
+        operational_message = '账号可收消息，可自动发货'
+    elif can_receive_messages:
+        operational_status = 'receive_only'
+        operational_message = '账号可收消息，但自动发货未确认可用'
+    elif connection_state_value in {'connecting', 'reconnecting'}:
+        operational_status = 'recovering'
+        operational_message = '账号连接恢复中'
+    else:
+        operational_status = 'not_ready'
+        operational_message = '账号链路未就绪，不能保证自动收消息/自动发货'
+
+    runtime_status.update({
+        'can_receive_messages': can_receive_messages,
+        'can_auto_deliver': can_auto_deliver,
+        'operational_status': operational_status,
+        'operational_message': operational_message,
     })
     return runtime_status
 
@@ -11515,6 +11570,53 @@ async def get_slider_verification_stats(
             'success': False,
             'message': f'获取滑块验证统计失败: {str(e)}',
             'data': _empty_slider_session_stats(),
+        }
+
+
+@app.get("/admin/risk-control-summary")
+async def get_risk_control_summary(
+    cookie_id: str = None,
+    processing_status: str = None,
+    event_type: str = None,
+    trigger_scene: str = None,
+    session_id: str = None,
+    result_code: str = None,
+    date_from: str = None,
+    date_to: str = None,
+    admin_user: Dict[str, Any] = Depends(require_admin)
+):
+    """获取风控日志汇总和趋势（管理员专用）。"""
+    try:
+        summary = db_manager.get_risk_control_summary(
+            cookie_id=cookie_id,
+            processing_status=processing_status,
+            event_type=event_type,
+            trigger_scene=trigger_scene,
+            session_id=session_id,
+            result_code=result_code,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        log_with_user(
+            'info',
+            (
+                "获取风控汇总成功: "
+                f"cookie_id={cookie_id}, status={processing_status}, event_type={event_type}, "
+                f"trigger_scene={trigger_scene}, session_id={session_id}, result_code={result_code}, "
+                f"date_from={date_from}, date_to={date_to}, total={summary.get('total', 0)}"
+            ),
+            admin_user,
+        )
+        return {
+            'success': True,
+            'data': summary,
+        }
+    except Exception as e:
+        log_with_user('error', f"获取风控汇总失败: {str(e)}", admin_user)
+        return {
+            'success': False,
+            'message': f"获取风控汇总失败: {str(e)}",
+            'data': db_manager.get_risk_control_summary(cookie_id='__empty__'),
         }
 
 

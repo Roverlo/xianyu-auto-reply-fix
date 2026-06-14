@@ -3854,6 +3854,7 @@ function getAboutStatusText(type, value) {
             started: '执行中',
             success: '成功',
             skipped_cooldown: '冷却跳过',
+            auth_recovery_in_progress: '认证恢复中',
             manual_refresh_active: '手动刷新进行中',
             manual_refresh_browser_stabilizing: '浏览器稳定中',
             post_slider_session_settling: '滑块后稳定中',
@@ -3884,6 +3885,15 @@ function getAboutStatusText(type, value) {
             connection_unready: '连接未就绪',
             not_running: '未运行',
         },
+        operational: {
+            ready: '可收消息/可发货',
+            receive_only: '仅收消息',
+            auth_backoff: '认证退避中',
+            manual_cookie_recovery_recommended: '建议手动恢复',
+            recovering: '恢复中',
+            not_ready: '未就绪',
+            not_running: '未运行',
+        },
     };
 
     return maps[type]?.[normalized] || normalized;
@@ -3908,6 +3918,14 @@ function getAboutStatusVariant(type, value) {
         if (normalized === 'warming_up' || normalized === 'watching' || normalized === 'recovering') return 'info';
         if (normalized === 'suspected_stale') return 'warning';
         if (normalized === 'connection_unready' || normalized === 'not_running') return 'secondary';
+        return 'secondary';
+    }
+
+    if (type === 'operational') {
+        if (normalized === 'ready') return 'success';
+        if (normalized === 'receive_only' || normalized === 'recovering') return 'info';
+        if (normalized === 'auth_backoff' || normalized === 'manual_cookie_recovery_recommended') return 'warning';
+        if (normalized === 'not_ready') return 'danger';
         return 'secondary';
     }
 
@@ -4157,6 +4175,15 @@ function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
         };
     }
 
+    if (runtimeStatus?.operational_status) {
+        const tone = getAboutStatusVariant('operational', runtimeStatus.operational_status);
+        return {
+            tone,
+            title: getAboutStatusText('operational', runtimeStatus.operational_status),
+            note: runtimeStatus.operational_message || '根据当前账号运行态判断。',
+        };
+    }
+
     if (isRuntimeStatusInQrGrace(runtimeStatus)) {
         const stableSignals = [
             runtimeStatus.ws_ready,
@@ -4257,6 +4284,17 @@ function renderAboutRuntimeStatus(runtimeStatus) {
             ? 'warning'
             : 'danger';
     const tokenRefreshNote = buildAboutTokenRefreshNote(runtimeStatus, tokenRefreshDisplay);
+    const nextAttemptDisplay = formatAboutRuntimeTime(
+        runtimeStatus.auth_recovery_next_attempt_at_display,
+        runtimeStatus.auth_recovery_next_attempt_at
+    );
+    const operationalNoteParts = [
+        runtimeStatus.operational_message || '',
+        runtimeStatus.auth_recovery_remaining_seconds
+            ? `剩余 ${formatAboutDuration(runtimeStatus.auth_recovery_remaining_seconds)} 后自动尝试`
+            : '',
+        runtimeStatus.manual_recovery_hint || '',
+    ].filter(Boolean);
 
     statusContainer.innerHTML = `
         <div class="account-diagnostics-status-shell">
@@ -4267,6 +4305,15 @@ function renderAboutRuntimeStatus(runtimeStatus) {
             <div class="account-diagnostics-status-body">
                 <div class="account-diagnostics-status-primary">
                     <div class="account-diagnostics-status-grid">
+                        ${buildAboutRuntimeStatusItem({
+                            label: '运营状态',
+                            value: buildAboutStatusBadge('operational', runtimeStatus.operational_status || 'not_ready'),
+                            note: operationalNoteParts.join(' · '),
+                            tone: getAboutStatusVariant('operational', runtimeStatus.operational_status || 'not_ready'),
+                            richValue: true,
+                            accent: 'readiness',
+                            icon: 'clipboard2-pulse',
+                        })}
                         ${buildAboutRuntimeStatusItem({
                             label: '连接状态',
                             value: buildAboutStatusBadge('connection', runtimeStatus.connection_state),
@@ -4320,6 +4367,9 @@ function renderAboutRuntimeStatus(runtimeStatus) {
                 </div>
             </div>
             <div class="account-diagnostics-status-meta">
+                ${buildAboutRuntimeMetaItem('能否收消息', runtimeStatus.can_receive_messages ? '可以' : '不保证')}
+                ${buildAboutRuntimeMetaItem('能否自动发货', runtimeStatus.can_auto_deliver ? '可以' : '不保证')}
+                ${buildAboutRuntimeMetaItem('下次自动尝试', nextAttemptDisplay)}
                 ${buildAboutRuntimeMetaItem('最近收到消息', lastMessageDisplay)}
                 ${buildAboutRuntimeMetaItem('状态变化时间', stateChangedDisplay)}
             </div>
@@ -19764,6 +19814,7 @@ let currentRiskLogStatus = '';
 let currentRiskLogOffset = 0;
 const riskLogLimit = 100;
 let currentRiskSliderStatsRequestId = 0;
+let currentRiskSummaryRequestId = 0;
 
 function getRiskSliderStatsRange() {
     const activeButton = document.querySelector('#riskSliderRangeFilter .risk-slider-range-btn.is-active');
@@ -19932,6 +19983,26 @@ function getRiskLogFilters() {
     };
 }
 
+function buildRiskControlFilterParams(filters = {}, includePaging = false, offset = 0) {
+    const params = new URLSearchParams();
+
+    if (includePaging) {
+        params.set('limit', String(filters.limit || 100));
+        params.set('offset', String(offset || 0));
+    }
+
+    if (filters.cookieId) params.set('cookie_id', filters.cookieId);
+    if (filters.processingStatus) params.set('processing_status', filters.processingStatus);
+    if (filters.eventType) params.set('event_type', filters.eventType);
+    if (filters.triggerScene) params.set('trigger_scene', filters.triggerScene);
+    if (filters.dateFrom) params.set('date_from', filters.dateFrom);
+    if (filters.dateTo) params.set('date_to', filters.dateTo);
+    if (filters.sessionId) params.set('session_id', filters.sessionId);
+    if (filters.resultCode) params.set('result_code', filters.resultCode);
+
+    return params;
+}
+
 function hasActiveRiskLogFilters(filters = {}) {
     return Boolean(
         filters.cookieId ||
@@ -19956,19 +20027,17 @@ async function fetchRiskControlLogsPage(token, {
     limit = 100,
     offset = 0,
 } = {}) {
-    const params = new URLSearchParams({
-        limit: String(limit),
-        offset: String(offset),
-    });
-
-    if (cookieId) params.set('cookie_id', cookieId);
-    if (processingStatus) params.set('processing_status', processingStatus);
-    if (eventType) params.set('event_type', eventType);
-    if (triggerScene) params.set('trigger_scene', triggerScene);
-    if (dateFrom) params.set('date_from', dateFrom);
-    if (dateTo) params.set('date_to', dateTo);
-    if (sessionId) params.set('session_id', sessionId);
-    if (resultCode) params.set('result_code', resultCode);
+    const params = buildRiskControlFilterParams({
+        cookieId,
+        processingStatus,
+        eventType,
+        triggerScene,
+        dateFrom,
+        dateTo,
+        sessionId,
+        resultCode,
+        limit,
+    }, true, offset);
 
     const response = await fetch(`/admin/risk-control-logs?${params.toString()}`, {
         headers: {
@@ -19977,6 +20046,111 @@ async function fetchRiskControlLogsPage(token, {
     });
 
     return response.json();
+}
+
+function renderRiskSummaryChips(elementId, items = [], labelFormatter = value => value) {
+    const element = document.getElementById(elementId);
+    if (!element) return;
+
+    const normalizedItems = Array.isArray(items) ? items.filter(item => item && Number(item.count || 0) > 0) : [];
+    if (normalizedItems.length === 0) {
+        element.innerHTML = '<span class="risk-summary-empty">暂无</span>';
+        return;
+    }
+
+    element.innerHTML = normalizedItems.slice(0, 5).map(item => {
+        const label = labelFormatter(item.value || 'unknown');
+        return `<span class="risk-summary-chip"><span>${escapeHtml(label)}</span><strong>${Number(item.count || 0)}</strong></span>`;
+    }).join('');
+}
+
+function renderRiskSummaryTrend(items = []) {
+    const trendElement = document.getElementById('riskSummaryTrend');
+    if (!trendElement) return;
+
+    const rows = Array.isArray(items) ? items : [];
+    if (rows.length === 0) {
+        trendElement.innerHTML = '<span class="risk-summary-empty">暂无趋势</span>';
+        return;
+    }
+
+    const maxTotal = Math.max(1, ...rows.map(row => Number(row.total || 0)));
+    trendElement.innerHTML = rows.slice(-14).map(row => {
+        const total = Number(row.total || 0);
+        const overload = Number(row.server_overload_count || 0);
+        const height = Math.max(8, Math.round((total / maxTotal) * 44));
+        const overloadRatio = total > 0 ? Math.min(100, Math.round((overload / total) * 100)) : 0;
+        const title = `${row.date || '-'}：总计 ${total}，限流 ${overload}`;
+        return `
+            <span class="risk-summary-trend-bar" style="height:${height}px" title="${escapeHtml(title)}">
+                <span style="height:${overloadRatio}%"></span>
+            </span>
+        `;
+    }).join('');
+}
+
+function renderRiskControlSummary(summary = {}) {
+    const totalElement = document.getElementById('riskSummaryTotal');
+    const accountsElement = document.getElementById('riskSummaryAccounts');
+    const overloadElement = document.getElementById('riskSummaryServerOverload');
+    const lastOverloadElement = document.getElementById('riskSummaryLastServerOverload');
+    const manualElement = document.getElementById('riskSummaryManualRecovery');
+    const lastEventElement = document.getElementById('riskSummaryLastEvent');
+
+    if (totalElement) totalElement.textContent = String(Number(summary.total || 0));
+    if (accountsElement) accountsElement.textContent = `账号 ${Number(summary.unique_accounts || 0)}`;
+    if (overloadElement) overloadElement.textContent = String(Number(summary.server_overload_count || 0));
+    if (lastOverloadElement) lastOverloadElement.textContent = `最近 ${formatBeijingDateTime(summary.last_server_overload_at)}`;
+    if (manualElement) manualElement.textContent = String(Number(summary.manual_recovery_count || 0));
+    if (lastEventElement) lastEventElement.textContent = `最近事件 ${formatBeijingDateTime(summary.last_event_at)}`;
+
+    renderRiskSummaryTrend(summary.daily_trend || []);
+    renderRiskSummaryChips('riskSummaryStatusBreakdown', summary.status_breakdown || [], getRiskStatusText);
+    renderRiskSummaryChips('riskSummaryResultBreakdown', summary.result_code_breakdown || [], value => value || 'unknown');
+}
+
+function setRiskControlSummaryLoading() {
+    renderRiskControlSummary({
+        total: 0,
+        unique_accounts: 0,
+        server_overload_count: 0,
+        manual_recovery_count: 0,
+        daily_trend: [],
+        status_breakdown: [],
+        result_code_breakdown: [],
+    });
+}
+
+async function loadRiskControlSummary(filters = getRiskLogFilters()) {
+    const token = localStorage.getItem('auth_token');
+    const requestId = ++currentRiskSummaryRequestId;
+    setRiskControlSummaryLoading();
+
+    try {
+        const params = buildRiskControlFilterParams(filters, false);
+        const response = await fetch(`/admin/risk-control-summary?${params.toString()}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`
+            }
+        });
+        const data = await response.json();
+        if (requestId !== currentRiskSummaryRequestId) {
+            return;
+        }
+
+        if (response.ok && data.success) {
+            renderRiskControlSummary(data.data || {});
+            return;
+        }
+
+        renderRiskControlSummary({});
+    } catch (error) {
+        console.error('加载风控汇总失败:', error);
+        if (requestId !== currentRiskSummaryRequestId) {
+            return;
+        }
+        renderRiskControlSummary({});
+    }
 }
 
 function needsClientSideRiskLogFilter(logs, processingStatus) {
@@ -20047,6 +20221,7 @@ async function loadRiskControlLogs(offset = 0) {
     currentRiskLogOffset = offset;
 
     loadRiskControlSliderStats(cookieId);
+    loadRiskControlSummary(filters);
 
     const loadingDiv = document.getElementById('loadingRiskLogs');
     const logContainer = document.getElementById('riskLogContainer');
@@ -20100,6 +20275,17 @@ async function loadRiskControlLogs(offset = 0) {
 }
 
 // 显示风控日志
+function getRiskStatusText(status) {
+    const statusLabels = {
+        processing: '处理中',
+        success: '成功',
+        failed: '失败',
+        unknown: '未知',
+    };
+    const normalizedStatus = String(status || '').trim() || 'unknown';
+    return statusLabels[normalizedStatus] || normalizedStatus;
+}
+
 function getRiskEventCategoryMeta(eventType) {
     const normalizedType = String(eventType || '').trim();
 

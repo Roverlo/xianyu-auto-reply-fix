@@ -289,6 +289,7 @@ class XianyuLive:
     _auth_recovery_locks = {}  # {cookie_id: {'owner': str, 'acquired_at': float, 'expires_at': float}}
     _auth_recovery_lock = threading.Lock()
     _auth_recovery_lock_ttl = 240
+    _auth_recovery_external_owners = ('manual_', 'password_login:', 'qr_login', 'manual_cookie_import')
 
     # 通用预热 token：用于手动刷新/恢复预检成功后的新实例首轮复用
     _auth_prewarmed_tokens = {}  # {cookie_id: {'token': str, 'timestamp': float, 'source': str}}
@@ -581,6 +582,11 @@ class XianyuLive:
             if owner and existing.get('owner') != owner:
                 return
             cls._auth_recovery_locks.pop(cookie_id, None)
+
+    @classmethod
+    def is_external_auth_recovery_owner(cls, owner: str) -> bool:
+        owner_text = str(owner or '').strip()
+        return any(owner_text.startswith(prefix) for prefix in cls._auth_recovery_external_owners)
 
     @classmethod
     def get_init_auth_failure_state(cls, cookie_id: str) -> Optional[Dict[str, Any]]:
@@ -884,11 +890,21 @@ class XianyuLive:
         consecutive_count = previous_count + 1 if previous_reason == reason else 1
         escalation_factor = float(RISK_CONTROL.get('backoff_escalation_factor', 1.5) or 1.5)
         if reason == 'server_overload':
-            max_cap = max(seconds, int(RISK_CONTROL.get('server_overload_backoff_max_seconds', 1800) or 1800))
+            max_cap = max(seconds, int(RISK_CONTROL.get('server_overload_backoff_max_seconds', 14400) or 14400))
         else:
             max_cap = max(seconds, int(RISK_CONTROL.get('backoff_max_cap_seconds', 3600) or 3600))
         actual_seconds = int(round(min(seconds * (escalation_factor ** max(0, consecutive_count - 1)), max_cap)))
         actual_seconds = max(seconds, actual_seconds)
+        if reason == 'server_overload':
+            circuit_threshold = max(
+                1,
+                int(RISK_CONTROL.get('server_overload_circuit_breaker_threshold', 3) or 3),
+            )
+            if consecutive_count >= circuit_threshold:
+                actual_seconds = max(
+                    actual_seconds,
+                    int(RISK_CONTROL.get('server_overload_circuit_breaker_seconds', 7200) or 7200),
+                )
         now = time.time()
         state = {
             'until': now + actual_seconds,
@@ -898,8 +914,28 @@ class XianyuLive:
             'consecutive_count': consecutive_count,
             'created_at': now,
         }
+        if reason == 'server_overload':
+            state['requires_manual_cookie_refresh'] = (
+                consecutive_count >= max(1, int(RISK_CONTROL.get('server_overload_circuit_breaker_threshold', 3) or 3))
+            )
+            state['manual_recovery_hint'] = (
+                '平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检'
+                if state['requires_manual_cookie_refresh'] else ''
+            )
         cls._password_login_failure_backoff[cookie_id] = state
         cls._persist_login_backoff(cookie_id, state)
+
+    @classmethod
+    def _build_server_overload_manual_recovery_state(cls, state: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(state, dict) or str(state.get('reason') or '') != 'server_overload':
+            return state
+        threshold = max(1, int(RISK_CONTROL.get('server_overload_circuit_breaker_threshold', 3) or 3))
+        consecutive_count = int(state.get('consecutive_count', 0) or 0)
+        if not state.get('requires_manual_cookie_refresh') and consecutive_count >= threshold:
+            state['requires_manual_cookie_refresh'] = True
+        if state.get('requires_manual_cookie_refresh') and not state.get('manual_recovery_hint'):
+            state['manual_recovery_hint'] = '平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检'
+        return state
 
     @staticmethod
     def _is_counted_password_login_failure_reason(reason: str) -> bool:
@@ -1015,7 +1051,12 @@ class XianyuLive:
         await self._request_stop_after_account_pause("连续风控失败触发账号保护")
         return True
 
-    def _get_active_password_login_failure_backoff(self, current_time: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    def _get_active_password_login_failure_backoff(
+        self,
+        current_time: Optional[float] = None,
+        *,
+        consume_bypass: bool = True,
+    ) -> Optional[Dict[str, Any]]:
         """获取仍在生效的密码登录失败退避状态，并处理可忽略的旧滑块退避。"""
         current_time = current_time or time.time()
         failure_backoff = XianyuLive.get_password_login_failure_backoff(self.cookie_id)
@@ -1027,7 +1068,7 @@ class XianyuLive:
             return None
 
         backoff_reason = failure_backoff.get('reason', 'unknown')
-        if backoff_reason == 'slider_failed' and (
+        if consume_bypass and backoff_reason == 'slider_failed' and (
             self._has_recent_slider_success() or self.consume_manual_refresh_slider_failed_bypass(self.cookie_id)
         ):
             logger.warning(
@@ -1036,7 +1077,7 @@ class XianyuLive:
             XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
             return None
 
-        if backoff_reason == 'server_overload' and self.consume_manual_refresh_server_overload_bypass(self.cookie_id):
+        if consume_bypass and backoff_reason == 'server_overload' and self.consume_manual_refresh_server_overload_bypass(self.cookie_id):
             logger.warning(
                 f"【{self.cookie_id}】处于手动刷新交接恢复窗口，忽略一次旧的 server_overload 退避并执行真实Token预检"
             )
@@ -1085,6 +1126,59 @@ class XianyuLive:
         self.last_token_refresh_status = display_status
         self.last_token_refresh_error_message = display_message
         return True
+
+    def _get_auth_recovery_wait_state(self, current_time: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        current_time = current_time or time.time()
+        backoff = self._get_active_password_login_failure_backoff(current_time, consume_bypass=False)
+        if backoff:
+            state = dict(backoff)
+            state = XianyuLive._build_server_overload_manual_recovery_state(state)
+            state['type'] = 'login_backoff'
+            state['until'] = float(state.get('until') or 0)
+            state['remaining_seconds'] = max(0, int(state.get('until', 0) - current_time))
+            state['requires_manual_cookie_refresh'] = bool(state.get('requires_manual_cookie_refresh'))
+            return state
+
+        qr_remaining = self._get_qr_login_grace_remaining_seconds(current_time)
+        if qr_remaining > 0:
+            return {
+                'type': 'qr_login_grace',
+                'reason': 'qr_login_grace',
+                'remaining_seconds': qr_remaining,
+                'until': current_time + qr_remaining,
+                'requires_manual_cookie_refresh': False,
+            }
+        return None
+
+    def _is_risk_control_freeze_active(self, current_time: Optional[float] = None) -> bool:
+        if not getattr(self, 'risk_control_freeze_background_tasks', True):
+            return False
+        state = self._get_auth_recovery_wait_state(current_time)
+        if not state:
+            return False
+        return str(state.get('reason') or '') in {'server_overload', 'risk_control', 'verification_required', 'slider_failed'}
+
+    def _get_risk_control_freeze_sleep_seconds(self, current_time: Optional[float] = None) -> int:
+        state = self._get_auth_recovery_wait_state(current_time)
+        if not state:
+            return 300
+        remaining = int(state.get('remaining_seconds') or 0)
+        return max(60, min(remaining or 300, 1800))
+
+    async def _maybe_send_risk_control_fallback_notice(self, reason: str = '') -> None:
+        now = time.time()
+        cooldown = max(300, int(getattr(self, 'risk_control_fallback_notice_cooldown', 1800) or 1800))
+        if now - getattr(self, 'last_risk_control_fallback_notice_time', 0.0) < cooldown:
+            return
+        self.last_risk_control_fallback_notice_time = now
+        reason_text = str(reason or '账号认证风控中').strip()
+        await self.send_token_refresh_notification(
+            (
+                f"账号 {self.cookie_id} 当前处于风控/限流保护，自动收消息和自动发货不可保证。"
+                f"原因：{reason_text}。请手动检查闲鱼订单，必要时完成网页版验证后导入最新Cookie。"
+            ),
+            "risk_control_fallback_notice",
+        )
 
     @staticmethod
     def classify_password_login_failure(error_message: str) -> Tuple[str, int]:
@@ -2745,6 +2839,18 @@ class XianyuLive:
                         await self._interruptible_sleep(300)
                         continue
 
+                    current_time = time.time()
+                    if self._is_risk_control_freeze_active(current_time):
+                        state = self._get_auth_recovery_wait_state(current_time) or {}
+                        reason = state.get('manual_recovery_hint') or state.get('reason') or '账号风控保护中'
+                        logger.warning(
+                            f"【{self.cookie_id}】账号处于风控冻结状态，暂停待发货补偿巡检，"
+                            f"reason={state.get('reason')}, remaining={state.get('remaining_seconds')}s"
+                        )
+                        await self._maybe_send_risk_control_fallback_notice(reason)
+                        await self._interruptible_sleep(self._get_risk_control_freeze_sleep_seconds(current_time))
+                        continue
+
                     stats = await self._reconcile_pending_orders_once()
                     if stats.get('pending') or stats.get('delivered') or stats.get('skipped'):
                         logger.info(f"【{self.cookie_id}】待发货补偿巡检结果: {stats}")
@@ -3362,6 +3468,15 @@ class XianyuLive:
         )
         self.pending_order_reconcile_backoff_until = 0.0
         self.pending_order_reconcile_last_error_kind = None
+        self.risk_control_freeze_background_tasks = self._coerce_config_bool(
+            RISK_CONTROL.get('risk_control_freeze_background_tasks', True),
+            True,
+        )
+        self.risk_control_fallback_notice_cooldown = max(
+            300,
+            int(RISK_CONTROL.get('risk_control_fallback_notice_cooldown_seconds', 1800) or 1800),
+        )
+        self.last_risk_control_fallback_notice_time = 0.0
 
         prewarmed_token_info = self.pop_auth_prewarmed_token(self.cookie_id)
         if prewarmed_token_info:
@@ -8090,6 +8205,19 @@ class XianyuLive:
                 return self.current_token
             if captcha_retry_count == 0 and self._should_skip_token_refresh_for_login_backoff():
                 return None
+
+            if captcha_retry_count == 0 and allow_password_login_recovery:
+                existing_lock = XianyuLive.get_auth_recovery_lock_state(self.cookie_id)
+                if existing_lock and XianyuLive.is_external_auth_recovery_owner(existing_lock.get('owner')):
+                    owner = (existing_lock or {}).get('owner') or 'unknown'
+                    remaining = max(0, int((existing_lock or {}).get('expires_at', 0) - time.time()))
+                    logger.warning(
+                        f"【{self.cookie_id}】手动认证恢复流程已有执行者(owner={owner})，跳过本次自动Token刷新，剩余锁定约{remaining}秒"
+                    )
+                    self.last_token_refresh_status = 'auth_recovery_in_progress'
+                    self.last_token_refresh_error_message = f"认证恢复流程进行中(owner={owner})"
+                    return None
+
             return await self._refresh_token_impl(
                 captcha_retry_count,
                 allow_password_login_recovery=allow_password_login_recovery,
@@ -14798,6 +14926,17 @@ class XianyuLive:
                     # 扫码后的保护窗口只限制激进恢复；会话保活仍应先跑轻量探测。
                     self._consume_qr_login_grace_period_if_expired(current_time)
 
+                    if self._is_risk_control_freeze_active(current_time):
+                        state = self._get_auth_recovery_wait_state(current_time) or {}
+                        reason = state.get('manual_recovery_hint') or state.get('reason') or '账号风控保护中'
+                        logger.warning(
+                            f"【{self.cookie_id}】账号处于风控冻结状态，暂停会话保活/重型恢复，"
+                            f"reason={state.get('reason')}, remaining={state.get('remaining_seconds')}s"
+                        )
+                        await self._maybe_send_risk_control_fallback_notice(reason)
+                        await self._interruptible_sleep(self._get_risk_control_freeze_sleep_seconds(current_time))
+                        continue
+
                     effective_keepalive_interval = self._get_effective_keepalive_interval()
                     if current_time - self.last_session_keepalive_time >= effective_keepalive_interval:
                         logger.info(f"【{self.cookie_id}】开始执行轻量会话保活...")
@@ -15720,6 +15859,15 @@ class XianyuLive:
                     if self._is_account_pause_status(getattr(self, 'last_token_refresh_status', None)):
                         logger.warning(f"【{self.cookie_id}】账号处于人工验证/风控暂停状态，跳过自动Cookie刷新")
                         await self._interruptible_sleep(300)
+                        continue
+
+                    if self._is_risk_control_freeze_active(current_time):
+                        state = self._get_auth_recovery_wait_state(current_time) or {}
+                        logger.warning(
+                            f"【{self.cookie_id}】账号处于风控冻结状态，跳过自动Cookie刷新，"
+                            f"reason={state.get('reason')}, remaining={state.get('remaining_seconds')}s"
+                        )
+                        await self._interruptible_sleep(self._get_risk_control_freeze_sleep_seconds(current_time))
                         continue
 
                     if self._should_defer_auth_recovery_for_qr_grace(current_time):
@@ -19118,7 +19266,9 @@ class XianyuLive:
                     headers = self._build_websocket_headers()
 
                     # 更新连接状态为连接中
-                    self._set_connection_state(ConnectionState.CONNECTING, "准备建立WebSocket连接")
+                    self._set_connection_state(ConnectionState.CONNECTING, "准备初始化Token")
+                    await self._ensure_init_token()
+                    self._set_connection_state(ConnectionState.CONNECTING, "Token已就绪，准备建立WebSocket连接")
                     logger.info(f"【{self.cookie_id}】WebSocket目标地址: {self.base_url}")
 
                     # 兼容不同版本的websockets库

@@ -205,6 +205,73 @@ class RiskControlLogicTest(unittest.TestCase):
             XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
             self.assertTrue(self.live._should_skip_token_refresh_for_login_backoff())
 
+    def test_server_overload_escalates_to_circuit_breaker_and_manual_hint(self):
+        with patch.object(XianyuLive, "_persist_login_backoff", lambda *_args, **_kwargs: None):
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+
+        state = XianyuLive.get_password_login_failure_backoff("test-cookie")
+
+        self.assertEqual(state["consecutive_count"], 3)
+        self.assertGreaterEqual(state["seconds"], 7200)
+        self.assertTrue(state["requires_manual_cookie_refresh"])
+        self.assertIn("Cookie", state["manual_recovery_hint"])
+
+    def test_risk_control_freeze_active_for_server_overload_backoff(self):
+        self.live.risk_control_freeze_background_tasks = True
+        now = __import__("time").time()
+        XianyuLive._password_login_failure_backoff["test-cookie"] = {
+            "until": now + 900,
+            "reason": "server_overload",
+            "seconds": 900,
+            "base_seconds": 600,
+            "consecutive_count": 1,
+            "created_at": now,
+        }
+
+        self.assertTrue(self.live._is_risk_control_freeze_active(now))
+        self.assertEqual(self.live._get_risk_control_freeze_sleep_seconds(now), 900)
+
+    def test_auth_recovery_wait_state_does_not_consume_manual_handoff_bypass(self):
+        now = __import__("time").time()
+        XianyuLive._password_login_failure_backoff["test-cookie"] = {
+            "until": now + 900,
+            "reason": "server_overload",
+            "seconds": 900,
+            "base_seconds": 600,
+            "consecutive_count": 1,
+            "created_at": now,
+        }
+        XianyuLive.mark_manual_refresh_handoff("test-cookie", ttl=120)
+
+        wait_state = self.live._get_auth_recovery_wait_state(now)
+
+        self.assertEqual(wait_state["reason"], "server_overload")
+        self.assertFalse(self.live._should_skip_token_refresh_for_login_backoff(now))
+        self.assertIsNone(XianyuLive.get_password_login_failure_backoff("test-cookie"))
+
+    def test_auth_recovery_wait_state_derives_manual_hint_for_legacy_server_overload(self):
+        now = __import__("time").time()
+        XianyuLive._password_login_failure_backoff["test-cookie"] = {
+            "until": now + 900,
+            "reason": "server_overload",
+            "seconds": 1800,
+            "base_seconds": 600,
+            "consecutive_count": 6,
+            "created_at": now - 120,
+        }
+
+        wait_state = self.live._get_auth_recovery_wait_state(now)
+
+        self.assertTrue(wait_state["requires_manual_cookie_refresh"])
+        self.assertIn("RGV587", wait_state["manual_recovery_hint"])
+
+    def test_external_auth_recovery_owner_detection(self):
+        self.assertTrue(XianyuLive.is_external_auth_recovery_owner("manual_cookie_import:abc"))
+        self.assertTrue(XianyuLive.is_external_auth_recovery_owner("password_login:abc"))
+        self.assertFalse(XianyuLive.is_external_auth_recovery_owner("auto_cookie_refresh:abc"))
+
     def test_create_chat_response_extracts_cid(self):
         response = {
             "body": {

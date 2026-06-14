@@ -2930,6 +2930,38 @@
           </div>
         </div>
 
+        <div class="risk-control-summary-panel mb-4" id="riskControlSummaryPanel">
+          <div class="risk-summary-card">
+            <span>筛选记录</span>
+            <strong id="riskSummaryTotal">--</strong>
+            <small id="riskSummaryAccounts">账号 --</small>
+          </div>
+          <div class="risk-summary-card warning">
+            <span>RGV587/限流</span>
+            <strong id="riskSummaryServerOverload">--</strong>
+            <small id="riskSummaryLastServerOverload">最近 --</small>
+          </div>
+          <div class="risk-summary-card success">
+            <span>人工恢复/导入</span>
+            <strong id="riskSummaryManualRecovery">--</strong>
+            <small id="riskSummaryLastEvent">最近事件 --</small>
+          </div>
+          <div class="risk-summary-card trend">
+            <span>近 14 日趋势</span>
+            <div class="risk-summary-trend" id="riskSummaryTrend"></div>
+          </div>
+          <div class="risk-summary-breakdown">
+            <div>
+              <span>状态分布</span>
+              <div id="riskSummaryStatusBreakdown" class="risk-summary-chip-row"></div>
+            </div>
+            <div>
+              <span>高频结果码</span>
+              <div id="riskSummaryResultBreakdown" class="risk-summary-chip-row"></div>
+            </div>
+          </div>
+        </div>
+
         <!-- 风控日志列表 -->
         <div class="card">
           <div class="card-header d-flex justify-content-between align-items-center">

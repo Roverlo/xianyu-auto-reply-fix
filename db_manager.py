@@ -10760,6 +10760,151 @@ Cookie数量: {cookie_count}
             logger.error(f"获取风控日志数量失败: {e}")
             return 0
 
+    def get_risk_control_summary(self, cookie_id: str = None, processing_status: str = None,
+                                 event_type: str = None, trigger_scene: str = None,
+                                 session_id: str = None, result_code: str = None,
+                                 date_from: str = None, date_to: str = None) -> Dict[str, Any]:
+        """获取风控日志汇总、分布和按日趋势。"""
+
+        empty_summary = {
+            'total': 0,
+            'processing_count': 0,
+            'success_count': 0,
+            'failed_count': 0,
+            'server_overload_count': 0,
+            'manual_recovery_count': 0,
+            'unique_accounts': 0,
+            'last_event_at': None,
+            'last_server_overload_at': None,
+            'status_breakdown': [],
+            'event_type_breakdown': [],
+            'result_code_breakdown': [],
+            'daily_trend': [],
+        }
+
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                conditions, params = self._build_risk_control_log_filters(
+                    cookie_id=cookie_id,
+                    processing_status=processing_status,
+                    event_type=event_type,
+                    trigger_scene=trigger_scene,
+                    session_id=session_id,
+                    result_code=result_code,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+                where_clause = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
+
+                def _server_overload_condition() -> str:
+                    return (
+                        "(lower(COALESCE(result_code, '')) LIKE '%server_overload%' "
+                        "OR lower(COALESCE(result_code, '')) LIKE '%rgv587%' "
+                        "OR lower(COALESCE(error_message, '')) LIKE '%rgv587%' "
+                        "OR event_description LIKE '%RGV587%' "
+                        "OR event_description LIKE '%挤爆%')"
+                    )
+
+                def _manual_recovery_condition() -> str:
+                    return (
+                        "(lower(COALESCE(result_code, '')) LIKE 'manual_%' "
+                        "OR lower(COALESCE(trigger_scene, '')) LIKE 'manual_%' "
+                        "OR lower(COALESCE(result_code, '')) LIKE '%cookie_refresh_success%' "
+                        "OR lower(COALESCE(result_code, '')) LIKE '%qr_cookie_refresh_success%')"
+                    )
+
+                cursor.execute(
+                    f'''
+                    SELECT
+                        COUNT(*) AS total,
+                        COALESCE(SUM(CASE WHEN processing_status = 'processing' THEN 1 ELSE 0 END), 0) AS processing_count,
+                        COALESCE(SUM(CASE WHEN processing_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+                        COALESCE(SUM(CASE WHEN processing_status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+                        COALESCE(SUM(CASE WHEN {_server_overload_condition()} THEN 1 ELSE 0 END), 0) AS server_overload_count,
+                        COALESCE(SUM(CASE WHEN {_manual_recovery_condition()} THEN 1 ELSE 0 END), 0) AS manual_recovery_count,
+                        COUNT(DISTINCT cookie_id) AS unique_accounts,
+                        MAX(COALESCE(updated_at, created_at)) AS last_event_at,
+                        MAX(CASE WHEN {_server_overload_condition()} THEN COALESCE(updated_at, created_at) END) AS last_server_overload_at
+                    FROM risk_control_logs
+                    {where_clause}
+                    ''',
+                    params,
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return empty_summary
+
+                summary = {
+                    'total': int(row[0] or 0),
+                    'processing_count': int(row[1] or 0),
+                    'success_count': int(row[2] or 0),
+                    'failed_count': int(row[3] or 0),
+                    'server_overload_count': int(row[4] or 0),
+                    'manual_recovery_count': int(row[5] or 0),
+                    'unique_accounts': int(row[6] or 0),
+                    'last_event_at': row[7],
+                    'last_server_overload_at': row[8],
+                }
+
+                def _fetch_breakdown(column_name: str, limit: int = 8) -> List[Dict[str, Any]]:
+                    cursor.execute(
+                        f'''
+                        SELECT COALESCE({column_name}, '') AS value, COUNT(*) AS count
+                        FROM risk_control_logs
+                        {where_clause}
+                        GROUP BY COALESCE({column_name}, '')
+                        ORDER BY count DESC, value ASC
+                        LIMIT ?
+                        ''',
+                        [*params, limit],
+                    )
+                    return [
+                        {
+                            'value': row[0] or 'unknown',
+                            'count': int(row[1] or 0),
+                        }
+                        for row in cursor.fetchall()
+                    ]
+
+                cursor.execute(
+                    f'''
+                    SELECT
+                        date(COALESCE(updated_at, created_at)) AS day,
+                        COUNT(*) AS total,
+                        COALESCE(SUM(CASE WHEN processing_status = 'success' THEN 1 ELSE 0 END), 0) AS success_count,
+                        COALESCE(SUM(CASE WHEN processing_status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+                        COALESCE(SUM(CASE WHEN {_server_overload_condition()} THEN 1 ELSE 0 END), 0) AS server_overload_count
+                    FROM risk_control_logs
+                    {where_clause}
+                    GROUP BY date(COALESCE(updated_at, created_at))
+                    ORDER BY day DESC
+                    LIMIT 14
+                    ''',
+                    params,
+                )
+                daily_rows = cursor.fetchall()
+
+                summary.update({
+                    'status_breakdown': _fetch_breakdown('processing_status'),
+                    'event_type_breakdown': _fetch_breakdown('event_type'),
+                    'result_code_breakdown': _fetch_breakdown('result_code'),
+                    'daily_trend': [
+                        {
+                            'date': row[0],
+                            'total': int(row[1] or 0),
+                            'success_count': int(row[2] or 0),
+                            'failed_count': int(row[3] or 0),
+                            'server_overload_count': int(row[4] or 0),
+                        }
+                        for row in reversed(daily_rows)
+                    ],
+                })
+                return summary
+        except Exception as e:
+            logger.error(f"获取风控日志汇总失败: {e}")
+            return empty_summary
+
     def get_slider_verification_session_stats(self, cookie_ids: Optional[List[str]] = None, range_key: str = 'all') -> Dict[str, Any]:
         """获取滑块验证会话级统计数据。"""
         empty_stats = {
