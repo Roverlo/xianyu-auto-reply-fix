@@ -6882,22 +6882,23 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                             )
 
                         if server_overload_backoff_remaining > 0:
-                            task_deferred_for_server_overload = True
+                            log_with_user(
+                                'warning',
+                                (
+                                    "扫码已重新获取真实Cookie，检测到旧平台Token限流退避仍剩余 "
+                                    f"{server_overload_backoff_remaining} 秒；将清除旧退避并立即切换账号任务，"
+                                    "若平台仍限流会由新任务重新记录退避"
+                                ),
+                                current_user,
+                            )
+
+                        if cookie_manager.manager:
                             db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
-                            XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready_deferred_for_server_overload', grace_until=qr_login_grace_until)
-                            XianyuLive.mark_server_overload_manual_recovery_completed(
-                                account_id,
-                                source='qr_login_real_cookie_ready',
-                                grace_until=qr_login_grace_until,
-                            )
-                            if cookie_manager.manager:
-                                cookie_manager.manager.cookies[account_id] = final_cookies
-                            warning_message = (
-                                "真实Cookie已获取并保存；当前仍处于平台Token接口限流退避，"
-                                f"保留原退避并等待约 {server_overload_backoff_remaining} 秒后自动重试，避免扫码后立即再次打到限流"
-                            )
-                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
-                        elif cookie_manager.manager:
+                            XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready', grace_until=qr_login_grace_until)
+                            # 扫码刚拿到全新可信 cookie，必须在重启账号任务前清掉旧认证退避；
+                            # 否则新任务启动时可能先读到旧退避，表现为“扫码完成但 WS 起不来”。
+                            XianyuLive.clear_password_login_failure_backoff(account_id)
+                            log_with_user('info', f"扫码成功后已清除密码登录失败退避: {account_id}", current_user)
                             if is_new_account:
                                 cookie_manager.manager.add_cookie(account_id, final_cookies, user_id=user_id)
                                 log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
@@ -6906,14 +6907,9 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                                 cookie_manager.manager.update_cookie(account_id, final_cookies, save_to_db=False)
                                 log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
                             task_restarted = True
-                            db_manager.set_cookie_qr_login_grace_until(account_id, qr_login_grace_until)
-                            XianyuLive.mark_qr_login_grace(account_id, stage='real_cookie_ready', grace_until=qr_login_grace_until)
-                            # 扫码刚拿到全新可信 cookie，立即清掉旧的密码登录失败退避，
-                            # 否则 init() 会被旧的 slider_failed/credentials 退避 skip，
-                            # 表现为"扫码完成但 WS 起不来"（详见 22:43 / 22:08 那两次链路）。
-                            XianyuLive.clear_password_login_failure_backoff(account_id)
-                            log_with_user('info', f"扫码成功后已清除密码登录失败退避: {account_id}", current_user)
                             warning_message = f"真实Cookie已获取，账号任务已切换；将立即尝试正常初始化Token，若首轮Token预检命中风控再进入 {qr_login_grace_minutes} 分钟稳定期"
+                            if server_overload_backoff_remaining > 0:
+                                warning_message += f"；本次已清除旧平台限流退避（原剩余约 {server_overload_backoff_remaining} 秒）"
                             log_with_user('warning', f"{warning_message}: {account_id}", current_user)
                         else:
                             warning_message = "真实Cookie已获取，但任务管理器未初始化，未启动账号任务"
