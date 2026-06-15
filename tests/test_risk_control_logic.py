@@ -251,6 +251,32 @@ class RiskControlLogicTest(unittest.TestCase):
         self.assertFalse(self.live._should_skip_token_refresh_for_login_backoff(now))
         self.assertIsNone(XianyuLive.get_password_login_failure_backoff("test-cookie"))
 
+    def test_login_backoff_under_one_second_does_not_skip_token_refresh(self):
+        now = __import__("time").time()
+        XianyuLive._password_login_failure_backoff["test-cookie"] = {
+            "until": now + 0.5,
+            "reason": "server_overload",
+            "seconds": 600,
+            "base_seconds": 600,
+            "consecutive_count": 1,
+            "created_at": now - 599.5,
+        }
+
+        self.assertFalse(self.live._should_skip_token_refresh_for_login_backoff(now))
+
+    def test_login_backoff_over_one_second_still_skips_token_refresh(self):
+        now = __import__("time").time()
+        XianyuLive._password_login_failure_backoff["test-cookie"] = {
+            "until": now + 2,
+            "reason": "server_overload",
+            "seconds": 600,
+            "base_seconds": 600,
+            "consecutive_count": 1,
+            "created_at": now - 598,
+        }
+
+        self.assertTrue(self.live._should_skip_token_refresh_for_login_backoff(now))
+
     def test_auth_recovery_wait_state_derives_manual_hint_for_legacy_server_overload(self):
         now = __import__("time").time()
         XianyuLive._password_login_failure_backoff["test-cookie"] = {

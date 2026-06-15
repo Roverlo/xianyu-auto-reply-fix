@@ -1129,7 +1129,7 @@ class XianyuLive:
             return None
 
         remaining_time = failure_backoff.get('until', 0) - current_time
-        if remaining_time <= 0:
+        if remaining_time < 1:
             return None
 
         backoff_reason = failure_backoff.get('reason', 'unknown')
@@ -8581,6 +8581,7 @@ class XianyuLive:
                                 self.last_message_received_time = 0
                                 logger.warning(f"【{self.cookie_id}】Token刷新成功，已重置消息接收时间标识")
                                 self._clear_qr_login_grace_period()
+                                XianyuLive.clear_password_login_failure_backoff(self.cookie_id)
                                 self.clear_init_auth_failure_state(self.cookie_id)
                                 self.last_init_failure_reason = None
                                 self.last_init_failure_type = None
