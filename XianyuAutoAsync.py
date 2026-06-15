@@ -884,7 +884,7 @@ class XianyuLive:
         """设置密码登录失败后的退避时间"""
         if not cookie_id or seconds <= 0:
             return
-        previous_state = cls._password_login_failure_backoff.get(cookie_id) or {}
+        previous_state = cls._password_login_failure_backoff.get(cookie_id) or cls._load_persisted_login_backoff(cookie_id) or {}
         previous_reason = previous_state.get('reason')
         previous_count = int(previous_state.get('consecutive_count', 0) or 0)
         consecutive_count = previous_count + 1 if previous_reason == reason else 1
@@ -915,8 +915,17 @@ class XianyuLive:
             'created_at': now,
         }
         if reason == 'server_overload':
+            recovery_completed_at = cls._get_recent_manual_recovery_completed_at(previous_state)
+            if recovery_completed_at:
+                state['manual_cookie_recovery_completed_at'] = recovery_completed_at
+                state['manual_cookie_recovery_completed_source'] = (
+                    previous_state.get('manual_cookie_recovery_completed_source') or 'manual_recovery'
+                )
+                if previous_state.get('manual_cookie_recovery_grace_until'):
+                    state['manual_cookie_recovery_grace_until'] = previous_state.get('manual_cookie_recovery_grace_until')
             state['requires_manual_cookie_refresh'] = (
                 consecutive_count >= max(1, int(RISK_CONTROL.get('server_overload_circuit_breaker_threshold', 3) or 3))
+                and not recovery_completed_at
             )
             state['manual_recovery_hint'] = (
                 '平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检'
@@ -940,6 +949,25 @@ class XianyuLive:
         if state.get('requires_manual_cookie_refresh') and not state.get('manual_recovery_hint'):
             state['manual_recovery_hint'] = '平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检'
         return state
+
+    @classmethod
+    def _get_recent_manual_recovery_completed_at(cls, state: Optional[Dict[str, Any]]) -> float:
+        if not isinstance(state, dict):
+            return 0.0
+        try:
+            completed_at = float(state.get('manual_cookie_recovery_completed_at') or 0)
+        except (TypeError, ValueError):
+            completed_at = 0.0
+        if completed_at <= 0:
+            return 0.0
+
+        ttl_seconds = max(
+            3600,
+            int(RISK_CONTROL.get('server_overload_manual_recovery_completed_ttl_seconds', 86400) or 86400),
+        )
+        if time.time() - completed_at > ttl_seconds:
+            return 0.0
+        return completed_at
 
     @classmethod
     def mark_server_overload_manual_recovery_completed(

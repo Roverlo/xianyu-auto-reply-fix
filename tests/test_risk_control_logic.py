@@ -287,6 +287,27 @@ class RiskControlLogicTest(unittest.TestCase):
         self.assertEqual(wait_state["manual_recovery_hint"], "")
         self.assertEqual(wait_state["manual_cookie_recovery_completed_source"], "qr_login_real_cookie_ready")
 
+    def test_recent_completed_recovery_survives_later_server_overload_backoff(self):
+        with patch.object(XianyuLive, "_persist_login_backoff", lambda *_args, **_kwargs: None):
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+            XianyuLive.mark_server_overload_manual_recovery_completed(
+                "test-cookie",
+                source="qr_login_real_cookie_ready",
+                grace_until=1234567890,
+            )
+            XianyuLive.set_password_login_failure_backoff("test-cookie", "server_overload", 600)
+
+        state = XianyuLive.get_password_login_failure_backoff("test-cookie")
+        wait_state = self.live._get_auth_recovery_wait_state(__import__("time").time())
+
+        self.assertEqual(state["consecutive_count"], 4)
+        self.assertFalse(state["requires_manual_cookie_refresh"])
+        self.assertEqual(state["manual_recovery_hint"], "")
+        self.assertEqual(state["manual_cookie_recovery_completed_source"], "qr_login_real_cookie_ready")
+        self.assertFalse(wait_state["requires_manual_cookie_refresh"])
+
     def test_active_qr_grace_auto_clears_stale_manual_hint(self):
         now = __import__("time").time()
         XianyuLive._password_login_failure_backoff["test-cookie"] = {
