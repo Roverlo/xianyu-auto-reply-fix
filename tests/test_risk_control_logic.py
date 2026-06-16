@@ -356,6 +356,28 @@ class RiskControlLogicTest(unittest.TestCase):
         self.assertEqual(wait_state["manual_recovery_hint"], "")
         self.assertEqual(wait_state["manual_cookie_recovery_completed_source"], "qr_login_grace_active")
 
+    def test_qr_grace_defers_server_overload_retry_until_grace_ends(self):
+        now = __import__("time").time()
+        XianyuLive._password_login_failure_backoff["test-cookie"] = {
+            "until": now + 600,
+            "reason": "server_overload",
+            "seconds": 600,
+            "base_seconds": 600,
+            "consecutive_count": 1,
+            "created_at": now - 5,
+        }
+        self.live.connection_failures = 1
+        self.live.last_token_refresh_status = "server_overload_rgv587"
+
+        time_module = XianyuLive._calculate_retry_delay.__globals__["time"]
+        with patch.object(time_module, "time", return_value=now), \
+                patch.object(self.live, "_get_qr_login_grace_until", lambda: int(now + 850)):
+            delay = self.live._calculate_retry_delay("Token获取失败(status=server_overload_rgv587)")
+
+        self.assertGreaterEqual(delay, 849)
+        self.assertLessEqual(delay, 850)
+        self.assertEqual(self.live.last_token_refresh_status, "qr_login_grace_wait")
+
     def test_external_auth_recovery_owner_detection(self):
         self.assertTrue(XianyuLive.is_external_auth_recovery_owner("manual_cookie_import:abc"))
         self.assertTrue(XianyuLive.is_external_auth_recovery_owner("password_login:abc"))

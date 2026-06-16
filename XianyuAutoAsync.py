@@ -769,6 +769,49 @@ class XianyuLive:
         logger.warning(f"【{self.cookie_id}】扫码登录稳定期中，暂缓自动认证恢复，还需等待 {remaining} 秒")
         return True
 
+    def _get_recent_server_overload_during_qr_grace(self, current_time: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        current_time = current_time or time.time()
+        grace_until = self._get_qr_login_grace_until()
+        if not grace_until or current_time >= grace_until:
+            return None
+
+        state = XianyuLive.get_password_login_failure_backoff(self.cookie_id)
+        if not isinstance(state, dict) or str(state.get('reason') or '').strip() != 'server_overload':
+            return None
+
+        try:
+            created_at = float(state.get('created_at') or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        if created_at <= 0:
+            return None
+
+        grace_started_at = grace_until - self.get_qr_login_grace_ttl_seconds()
+        if created_at + 5 < grace_started_at:
+            return None
+
+        return dict(state)
+
+    def _should_defer_token_retry_for_qr_grace(self, current_time: Optional[float] = None) -> bool:
+        current_time = current_time or time.time()
+        self._consume_qr_login_grace_period_if_expired(current_time)
+        remaining = self._get_qr_login_grace_remaining_seconds(current_time)
+        if remaining <= 0:
+            return False
+
+        last_status = str(getattr(self, 'last_token_refresh_status', '') or '')
+        if last_status in {"qr_login_grace_wait", "server_overload_rgv587"}:
+            return True
+
+        return self._get_recent_server_overload_during_qr_grace(current_time) is not None
+
+    def _mark_qr_grace_token_retry_deferred(self, current_time: Optional[float] = None) -> int:
+        current_time = current_time or time.time()
+        remaining = self._get_qr_login_grace_remaining_seconds(current_time)
+        self.last_token_refresh_status = "qr_login_grace_wait"
+        self.last_token_refresh_error_message = f"扫码登录稳定期中，延后Token初始化重试，剩余{remaining}秒"
+        return remaining
+
     @classmethod
     def _cleanup_password_login_failure_backoff(cls):
         """清理已过期的密码登录失败退避状态"""
@@ -1069,7 +1112,7 @@ class XianyuLive:
     def _compute_token_retry_wait_seconds(self, current_time: Optional[float] = None) -> int:
         current_time = current_time or time.time()
         min_wait = max(60, int(RISK_CONTROL.get('token_retry_min_wait_seconds', 180) or 180))
-        if getattr(self, 'last_token_refresh_status', None) == "qr_login_grace_wait":
+        if self._should_defer_token_retry_for_qr_grace(current_time):
             self._consume_qr_login_grace_period_if_expired(current_time)
             remaining = self._get_qr_login_grace_remaining_seconds(current_time)
             if remaining > 0:
@@ -3220,13 +3263,20 @@ class XianyuLive:
             return max(300, self._compute_token_retry_wait_seconds(current_time))
 
         if self._get_active_password_login_failure_backoff(current_time):
+            if self._should_defer_token_retry_for_qr_grace(current_time):
+                self._consume_qr_login_grace_period_if_expired(current_time)
+                remaining = self._get_qr_login_grace_remaining_seconds(current_time)
+                if remaining > 0:
+                    self._mark_qr_grace_token_retry_deferred(current_time)
+                    return max(60, remaining)
             return max(60, self._compute_token_retry_wait_seconds(current_time))
 
         last_refresh_status = getattr(self, 'last_token_refresh_status', None)
-        if last_refresh_status == "qr_login_grace_wait":
+        if self._should_defer_token_retry_for_qr_grace(current_time):
             self._consume_qr_login_grace_period_if_expired(current_time)
             remaining = self._get_qr_login_grace_remaining_seconds(current_time)
             if remaining > 0:
+                self._mark_qr_grace_token_retry_deferred(current_time)
                 return max(60, remaining)
 
         if last_refresh_status in {"password_login_backoff_wait", "verification_pending_manual"}:
@@ -15290,6 +15340,13 @@ class XianyuLive:
         if force_refresh or not self.current_token or token_expired:
             if self._is_in_qr_login_grace_period():
                 remaining = self._get_qr_login_grace_remaining_seconds()
+                if self._should_defer_token_retry_for_qr_grace():
+                    self._mark_qr_grace_token_retry_deferred()
+                    logger.warning(
+                        f"【{self.cookie_id}】扫码登录稳定期内已遇到平台Token限流，"
+                        f"延后初始化Token重试，剩余窗口 {remaining} 秒"
+                    )
+                    raise InitAuthError("Token获取延后(status=qr_login_grace_wait)")
                 logger.info(f"【{self.cookie_id}】扫码登录保护窗口中，仍执行首轮Token初始化；若命中风控再退避，剩余窗口 {remaining} 秒")
 
             logger.info(f"【{self.cookie_id}】获取初始token...")
