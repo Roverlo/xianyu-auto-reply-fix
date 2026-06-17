@@ -3889,7 +3889,8 @@ function getAboutStatusText(type, value) {
             ready: '可收消息/可发货',
             receive_only: '仅收消息',
             auth_backoff: '认证退避中',
-            manual_cookie_recovery_recommended: '建议手动恢复',
+            manual_cookie_recovery_recommended: '建议扫码恢复',
+            qr_login_recovery_recommended: '建议扫码恢复',
             recovering: '恢复中',
             not_ready: '未就绪',
             not_running: '未运行',
@@ -3924,7 +3925,7 @@ function getAboutStatusVariant(type, value) {
     if (type === 'operational') {
         if (normalized === 'ready') return 'success';
         if (normalized === 'receive_only' || normalized === 'recovering') return 'info';
-        if (normalized === 'auth_backoff' || normalized === 'manual_cookie_recovery_recommended') return 'warning';
+        if (normalized === 'auth_backoff' || normalized === 'manual_cookie_recovery_recommended' || normalized === 'qr_login_recovery_recommended') return 'warning';
         if (normalized === 'not_ready') return 'danger';
         return 'secondary';
     }
@@ -3966,6 +3967,30 @@ function buildAboutRuntimeStatusItem({ label, value, note = '', tone = '', richV
             </div>
             <div class="account-diagnostics-status-item-value">${richValue ? value : escapeHtml(value)}</div>
             ${note ? `<div class="account-diagnostics-status-item-note">${richNote ? note : escapeHtml(note)}</div>` : ''}
+        </div>
+    `;
+}
+
+function buildAboutQrRecoveryAction(runtimeStatus) {
+    const status = String(runtimeStatus?.operational_status || '').trim();
+    if (status !== 'qr_login_recovery_recommended' && status !== 'manual_cookie_recovery_recommended') {
+        return '';
+    }
+
+    return `
+        <div class="account-diagnostics-action-bar is-warning">
+            <div class="account-diagnostics-action-copy">
+                <div class="account-diagnostics-action-title">需要重新扫码登录</div>
+                <div class="account-diagnostics-action-subtitle">当前恢复入口只使用扫码登录；扫码完成后系统会保存新的登录态并重新切换账号任务。</div>
+            </div>
+            <div class="account-diagnostics-action-buttons">
+                <button type="button" class="btn btn-success" onclick="showQRCodeLogin()">
+                    <i class="bi bi-qr-code me-1"></i>扫码登录
+                </button>
+                <button type="button" class="btn btn-outline-info" onclick="showQRCodeLogin('lite')">
+                    <i class="bi bi-qr-code-scan me-1"></i>轻量扫码
+                </button>
+            </div>
         </div>
     `;
 }
@@ -4302,6 +4327,7 @@ function renderAboutRuntimeStatus(runtimeStatus) {
                 <div class="account-diagnostics-status-note-title">${escapeHtml(overview.title)}</div>
                 <div class="account-diagnostics-status-note-text">${escapeHtml(overview.note)}</div>
             </div>
+            ${buildAboutQrRecoveryAction(runtimeStatus)}
             <div class="account-diagnostics-status-body">
                 <div class="account-diagnostics-status-primary">
                     <div class="account-diagnostics-status-grid">

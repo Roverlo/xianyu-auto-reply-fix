@@ -564,6 +564,42 @@ input:checked + .status-slider:before {
   color: var(--text-secondary);
 }
 
+.account-diagnostics-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 0.95rem;
+  border: 1px solid rgba(245, 158, 11, 0.34);
+  border-radius: 8px;
+  background: #fff7ed;
+}
+
+.account-diagnostics-action-copy {
+  min-width: 0;
+}
+
+.account-diagnostics-action-title {
+  font-size: 0.98rem;
+  font-weight: 700;
+  line-height: 1.25;
+  color: #9a3412;
+}
+
+.account-diagnostics-action-subtitle {
+  margin-top: 0.2rem;
+  font-size: 0.84rem;
+  line-height: 1.45;
+  color: #7c2d12;
+}
+
+.account-diagnostics-action-buttons {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 0 0 auto;
+}
+
 .account-diagnostics-status-grid {
   display: grid;
   grid-template-columns: 1fr;
@@ -1333,6 +1369,19 @@ input:checked + .status-slider:before {
   background: rgba(59, 130, 246, 0.14);
 }
 
+[data-theme="dark"] .account-diagnostics-action-bar {
+  border-color: rgba(245, 158, 11, 0.32);
+  background: rgba(146, 64, 14, 0.24);
+}
+
+[data-theme="dark"] .account-diagnostics-action-title {
+  color: #fed7aa;
+}
+
+[data-theme="dark"] .account-diagnostics-action-subtitle {
+  color: #fdba74;
+}
+
 /* ================================
    暗色模式适配 - 账号管理
    ================================ */
@@ -1487,6 +1536,15 @@ input:checked + .status-slider:before {
     flex-direction: column;
     align-items: flex-start;
   }
+
+  .account-diagnostics-action-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .account-diagnostics-action-buttons {
+    flex-wrap: wrap;
+  }
 }
 
 @media (max-width: 768px) {
@@ -1548,6 +1606,15 @@ input:checked + .status-slider:before {
   }
 
   .account-diagnostics-actions .btn {
+    width: 100%;
+  }
+
+  .account-diagnostics-action-buttons {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .account-diagnostics-action-buttons .btn {
     width: 100%;
   }
 

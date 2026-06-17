@@ -502,24 +502,12 @@
                     <br>
                     <small class="opacity-75">备用获取 Cookie，仍需通过风控</small>
                   </button>
-                  <button type="button" class="btn btn-outline-warning btn-lg flex-fill refresh-cookie-btn" onclick="toggleRefreshCookieForm()" style="max-width: 300px;">
-                    <i class="bi bi-arrow-repeat me-2"></i>
-                    <span class="fw-bold">手动刷新 Cookie</span>
-                    <br>
-                    <small class="opacity-75">使用已保存账密手动刷新已有账号</small>
-                  </button>
-                  <button type="button" class="btn btn-outline-secondary btn-lg flex-fill manual-input-btn" onclick="toggleManualInput()" style="max-width: 300px;">
-                    <i class="bi bi-keyboard me-2"></i>
-                    <span class="fw-bold">导入 Cookie</span>
-                    <br>
-                    <small class="opacity-75">手动导入消息页 Cookie</small>
-                  </button>
                 </div>
               </div>
             </div>
 
             <div class="text-center text-muted small mb-4">
-              建议优先使用扫码登录添加账号，并尽快配置账密作为 Cookie 过期后的备用恢复方式。账密登录不能绕过平台风控，也不能保证 Token 或 WebSocket 长连接恢复；如遇掉线，可优先尝试扫码登录或手动刷新 Cookie。
+              建议使用扫码登录添加或恢复账号。扫码完成后系统会保存新的登录态并切换账号任务；账密登录不能绕过平台风控，也不能保证 Token 或 WebSocket 长连接恢复。
             </div>
 
             <!-- 账号密码登录表单（默认隐藏） -->

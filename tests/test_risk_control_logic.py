@@ -216,7 +216,8 @@ class RiskControlLogicTest(unittest.TestCase):
         self.assertEqual(state["consecutive_count"], 3)
         self.assertGreaterEqual(state["seconds"], 7200)
         self.assertTrue(state["requires_manual_cookie_refresh"])
-        self.assertIn("Cookie", state["manual_recovery_hint"])
+        self.assertIn("扫码登录", state["manual_recovery_hint"])
+        self.assertNotIn("导入", state["manual_recovery_hint"])
 
     def test_risk_control_freeze_active_for_server_overload_backoff(self):
         self.live.risk_control_freeze_background_tasks = True
@@ -292,6 +293,27 @@ class RiskControlLogicTest(unittest.TestCase):
 
         self.assertTrue(wait_state["requires_manual_cookie_refresh"])
         self.assertIn("RGV587", wait_state["manual_recovery_hint"])
+        self.assertIn("扫码登录", wait_state["manual_recovery_hint"])
+        self.assertNotIn("导入", wait_state["manual_recovery_hint"])
+
+    def test_auth_recovery_wait_state_rewrites_legacy_cookie_import_hint_to_qr_login(self):
+        now = __import__("time").time()
+        XianyuLive._password_login_failure_backoff["test-cookie"] = {
+            "until": now + 900,
+            "reason": "server_overload",
+            "seconds": 1800,
+            "base_seconds": 600,
+            "consecutive_count": 6,
+            "created_at": now - 120,
+            "requires_manual_cookie_refresh": True,
+            "manual_recovery_hint": "平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检",
+        }
+
+        wait_state = self.live._get_auth_recovery_wait_state(now)
+
+        self.assertTrue(wait_state["requires_manual_cookie_refresh"])
+        self.assertIn("扫码登录", wait_state["manual_recovery_hint"])
+        self.assertNotIn("导入", wait_state["manual_recovery_hint"])
 
     def test_completed_qr_recovery_keeps_backoff_but_clears_manual_hint(self):
         with patch.object(XianyuLive, "_persist_login_backoff", lambda *_args, **_kwargs: None):
@@ -344,7 +366,7 @@ class RiskControlLogicTest(unittest.TestCase):
             "consecutive_count": 6,
             "created_at": now - 120,
             "requires_manual_cookie_refresh": True,
-            "manual_recovery_hint": "平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检",
+            "manual_recovery_hint": "平台Token接口持续返回RGV587限流；请重新扫码登录完成恢复，系统会保存新的扫码登录态并切换账号任务",
         }
 
         with patch.object(self.live, "_get_qr_login_grace_remaining_seconds", lambda _now=None: 600), \

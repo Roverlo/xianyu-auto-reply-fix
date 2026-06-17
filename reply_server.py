@@ -75,6 +75,7 @@ if DEFAULT_LOGIN_INFO_PASSWORD is None:
     DEFAULT_LOGIN_INFO_PASSWORD = "admin123" if DEFAULT_ADMIN_PASSWORD == "admin123" else ""
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
+QR_LOGIN_RECOVERY_MESSAGE = "平台Token接口持续限流，请重新扫码登录完成恢复"
 
 # HTTP Bearer认证
 security = HTTPBearer(auto_error=False)
@@ -4147,8 +4148,8 @@ def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
     manual_cookie_recovery_recommended = bool(runtime_status.get('manual_cookie_recovery_recommended'))
     auth_wait_reason = runtime_status.get('auth_recovery_wait_reason')
     if manual_cookie_recovery_recommended:
-        operational_status = 'manual_cookie_recovery_recommended'
-        operational_message = runtime_status.get('manual_recovery_hint') or '平台Token接口持续限流，建议手动完成验证后导入最新Cookie'
+        operational_status = 'qr_login_recovery_recommended'
+        operational_message = runtime_status.get('manual_recovery_hint') or QR_LOGIN_RECOVERY_MESSAGE
     elif auth_wait_reason:
         operational_status = 'auth_backoff'
         operational_message = (

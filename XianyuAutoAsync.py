@@ -75,6 +75,7 @@ PERSISTED_TOKEN_MAX_AGE_SECONDS = max(
     int(RISK_CONTROL.get('persisted_token_max_age_seconds', min(TOKEN_REFRESH_INTERVAL, 72000)) or min(TOKEN_REFRESH_INTERVAL, 72000)),
 )
 PERSISTED_BACKOFF_SETTING_PREFIX = 'xianyu_login_backoff:'
+QR_LOGIN_RECOVERY_HINT = '平台Token接口持续返回RGV587限流；请重新扫码登录完成恢复，系统会保存新的扫码登录态并切换账号任务'
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
 # 不再需要猴子补丁，所有功能已集成到 XianyuSliderStealth 类中
@@ -971,7 +972,7 @@ class XianyuLive:
                 and not recovery_completed_at
             )
             state['manual_recovery_hint'] = (
-                '平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检'
+                QR_LOGIN_RECOVERY_HINT
                 if state['requires_manual_cookie_refresh'] else ''
             )
         cls._password_login_failure_backoff[cookie_id] = state
@@ -989,8 +990,10 @@ class XianyuLive:
         consecutive_count = int(state.get('consecutive_count', 0) or 0)
         if not state.get('requires_manual_cookie_refresh') and consecutive_count >= threshold:
             state['requires_manual_cookie_refresh'] = True
-        if state.get('requires_manual_cookie_refresh') and not state.get('manual_recovery_hint'):
-            state['manual_recovery_hint'] = '平台Token接口持续返回RGV587限流；建议在网页版完成验证后手动导入最新Cookie/x5sec，再只做一次恢复预检'
+        if state.get('requires_manual_cookie_refresh'):
+            existing_hint = str(state.get('manual_recovery_hint') or '')
+            if not existing_hint or '导入' in existing_hint or 'Cookie/x5sec' in existing_hint:
+                state['manual_recovery_hint'] = QR_LOGIN_RECOVERY_HINT
         return state
 
     @classmethod
@@ -1299,7 +1302,7 @@ class XianyuLive:
         await self.send_token_refresh_notification(
             (
                 f"账号 {self.cookie_id} 当前处于风控/限流保护，自动收消息和自动发货不可保证。"
-                f"原因：{reason_text}。请手动检查闲鱼订单，必要时完成网页版验证后导入最新Cookie。"
+                f"原因：{reason_text}。请手动检查闲鱼订单，必要时重新扫码登录完成恢复。"
             ),
             "risk_control_fallback_notice",
         )
