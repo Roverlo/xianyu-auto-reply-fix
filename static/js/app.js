@@ -4313,13 +4313,13 @@ function renderAboutRuntimeStatus(runtimeStatus) {
         runtimeStatus.auth_recovery_next_attempt_at_display,
         runtimeStatus.auth_recovery_next_attempt_at
     );
-    const operationalNoteParts = [
+    const operationalNoteParts = Array.from(new Set([
         runtimeStatus.operational_message || '',
         runtimeStatus.auth_recovery_remaining_seconds
             ? `剩余 ${formatAboutDuration(runtimeStatus.auth_recovery_remaining_seconds)} 后自动尝试`
             : '',
         runtimeStatus.manual_recovery_hint || '',
-    ].filter(Boolean);
+    ].filter(Boolean)));
 
     statusContainer.innerHTML = `
         <div class="account-diagnostics-status-shell">
@@ -6269,7 +6269,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 启动验证会话监控
     startCaptchaSessionMonitor();
     // 添加Cookie表单提交
-    document.getElementById('addForm').addEventListener('submit', handleManualCookieImport);
+    const addForm = document.getElementById('addForm');
+    if (addForm) {
+        addForm.addEventListener('submit', handleManualCookieImport);
+    }
 
     // 添加账号密码登录表单提交
     const passwordLoginForm = document.getElementById('passwordLoginFormElement');
@@ -14122,6 +14125,10 @@ function toggleManualInput() {
     const manualForm = document.getElementById('manualInputForm');
     const passwordForm = document.getElementById('passwordLoginForm');
     const refreshForm = document.getElementById('refreshCookieForm');
+    if (!manualForm) {
+        showToast('当前工作区只支持扫码登录恢复账号', 'info');
+        return;
+    }
     if (manualForm.style.display === 'none') {
         // 隐藏账号密码登录表单
         if (passwordForm) {
@@ -14344,6 +14351,10 @@ function togglePasswordLogin() {
     const passwordForm = document.getElementById('passwordLoginForm');
     const manualForm = document.getElementById('manualInputForm');
     const refreshForm = document.getElementById('refreshCookieForm');
+    if (!passwordForm) {
+        showToast('当前工作区只支持扫码登录恢复账号', 'info');
+        return;
+    }
     if (passwordForm.style.display === 'none') {
         // 隐藏手动输入表单
         if (manualForm) {
@@ -14367,6 +14378,10 @@ function toggleRefreshCookieForm() {
     const refreshForm = document.getElementById('refreshCookieForm');
     const manualForm = document.getElementById('manualInputForm');
     const passwordForm = document.getElementById('passwordLoginForm');
+    if (!refreshForm) {
+        showToast('当前工作区只支持扫码登录恢复账号', 'info');
+        return;
+    }
 
     if (refreshForm.style.display === 'none') {
         // 隐藏其他表单
@@ -14613,8 +14628,10 @@ function startRefreshCookiePolling(sessionId, cookieId) {
                     closePasswordLoginQRModal();
                     toggleLoading(false);
                     showToast(`账号 ${cookieId} Cookie刷新成功！`, 'success');
-                    // 隐藏表单
-                    document.getElementById('refreshCookieForm').style.display = 'none';
+                    const refreshForm = document.getElementById('refreshCookieForm');
+                    if (refreshForm) {
+                        refreshForm.style.display = 'none';
+                    }
                     // 刷新账号列表
                     loadCookies();
                     break;
@@ -15152,8 +15169,10 @@ function handlePasswordLoginSuccess(data) {
     
     showToast(`账号 ${data.account_id} 登录成功！`, 'success');
     
-    // 隐藏表单
-    togglePasswordLogin();
+    const passwordForm = document.getElementById('passwordLoginForm');
+    if (passwordForm) {
+        passwordForm.style.display = 'none';
+    }
     
     // 刷新账号列表
     loadCookies();

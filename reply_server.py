@@ -5887,6 +5887,11 @@ async def manual_cookie_import(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """手动导入 Cookie，并按单次调试链路执行真实浏览器滑块验证。"""
+    return {
+        'success': False,
+        'status': 'disabled',
+        'message': '当前工作区已禁用手动导入 Cookie，请使用扫码登录或轻量扫码完成账号恢复',
+    }
     try:
         account_id = str(request.account_id or '').strip()
         cookie_value = str(request.cookie or '').replace('\ufeff', '').strip()
@@ -6007,6 +6012,11 @@ async def password_login(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """账号密码登录接口（异步，支持人脸认证）"""
+    return {
+        'success': False,
+        'status': 'disabled',
+        'message': '当前工作区已禁用账密登录和手动刷新 Cookie，请使用扫码登录或轻量扫码完成账号恢复',
+    }
     try:
         account_id = request.get('account_id')
         account = request.get('account')
@@ -6171,7 +6181,7 @@ async def check_password_login_status(
             if elapsed_seconds > PASSWORD_LOGIN_PROCESSING_TIMEOUT_SECONDS:
                 timeout_message = (
                     f"账号密码登录处理超过 {PASSWORD_LOGIN_PROCESSING_TIMEOUT_SECONDS} 秒仍未完成，"
-                    "已自动结束本次登录。请稍后重试，或改用扫码登录/手动刷新 Cookie。"
+                    "已自动结束本次登录。请稍后重试，或改用扫码登录/轻量扫码。"
                 )
                 _finalize_password_login_session_failure(
                     session_id,

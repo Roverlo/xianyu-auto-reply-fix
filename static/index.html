@@ -496,128 +496,12 @@
                     <br>
                     <small class="opacity-75">纯 HTTP，无浏览器，秒级出码</small>
                   </button>
-                  <button type="button" class="btn btn-outline-primary btn-lg flex-fill password-login-btn" onclick="togglePasswordLogin()" style="max-width: 300px;">
-                    <i class="bi bi-key me-2"></i>
-                    <span class="fw-bold">账密登录</span>
-                    <br>
-                    <small class="opacity-75">备用获取 Cookie，仍需通过风控</small>
-                  </button>
                 </div>
               </div>
             </div>
 
             <div class="text-center text-muted small mb-4">
-              建议使用扫码登录添加或恢复账号。扫码完成后系统会保存新的登录态并切换账号任务；账密登录不能绕过平台风控，也不能保证 Token 或 WebSocket 长连接恢复。
-            </div>
-
-            <!-- 账号密码登录表单（默认隐藏） -->
-            <div id="passwordLoginForm" style="display: none;">
-              <div class="alert alert-info">
-                <i class="bi bi-info-circle me-2"></i>
-                <strong>提示：</strong>用于新增账号或重新获取 Cookie，登录成功后会自动保存账密。系统会在拿到 Cookie 后继续验证目标 Token，只有 Token 可用才会视为恢复成功；登录过程中可能出现滑块或人脸验证。
-              </div>
-              <form id="passwordLoginFormElement" class="row g-3">
-                <div class="col-md-4">
-                  <label for="passwordLoginAccountId" class="form-label">账号ID</label>
-                  <input type="text" class="form-control" id="passwordLoginAccountId" placeholder="唯一标识" required>
-                </div>
-                <div class="col-md-4">
-                  <label for="passwordLoginAccount" class="form-label">登录账号</label>
-                  <input type="text" class="form-control" id="passwordLoginAccount" placeholder="手机号或邮箱" required>
-                </div>
-                <div class="col-md-4">
-                  <label for="passwordLoginPassword" class="form-label">登录密码</label>
-                  <input type="password" class="form-control" id="passwordLoginPassword" placeholder="请输入密码" required>
-                </div>
-                <div class="col-12">
-                  <div class="form-check">
-                    <input class="form-check-input" type="checkbox" id="passwordLoginShowBrowser" value="1">
-                    <label class="form-check-label" for="passwordLoginShowBrowser">
-                      显示浏览器窗口（Docker 部署下窗口在容器虚拟桌面中，请用 VNC 连接 127.0.0.1:5900 查看）
-                    </label>
-                  </div>
-                </div>
-                <div class="col-12">
-                  <button type="submit" class="btn btn-primary">
-                    <i class="bi bi-box-arrow-in-right me-1"></i>开始登录
-                  </button>
-                  <button type="button" class="btn btn-secondary ms-2" onclick="togglePasswordLogin()">
-                    <i class="bi bi-x-circle me-1"></i>取消
-                  </button>
-                </div>
-              </form>
-            </div>
-
-            <!-- 手动输入表单（默认隐藏） -->
-            <div id="manualInputForm" style="display: none;">
-              <div class="alert alert-info">
-                <i class="bi bi-info-circle me-2"></i>
-                <strong>提示：</strong>用于手动导入已有 Cookie，并按真实浏览器链路立即验证当前滑块。建议优先使用消息页 Cookie。导入后请尽快在账号设置中配置账密，便于后续刷新与恢复。
-              </div>
-              <form id="addForm" class="row g-3">
-                <div class="col-md-3">
-                  <label for="cookieId" class="form-label">账号ID</label>
-                  <input type="text" class="form-control" id="cookieId" placeholder="唯一标识" required>
-                </div>
-                <div class="col-md-9">
-                  <label for="cookieValue" class="form-label">Cookie值</label>
-                  <input type="text" class="form-control" id="cookieValue" placeholder="完整Cookie字符串" required>
-                </div>
-                <div class="col-12">
-                  <div class="form-check">
-                    <input class="form-check-input" type="checkbox" id="manualCookieShowBrowser" value="1">
-                    <label class="form-check-label" for="manualCookieShowBrowser">
-                      显示浏览器窗口（Docker 部署下窗口在容器虚拟桌面中，请用 VNC 连接 127.0.0.1:5900 查看）
-                    </label>
-                  </div>
-                </div>
-                <div class="col-12">
-                  <button type="submit" class="btn btn-primary">
-                    <i class="bi bi-plus-lg me-1"></i>导入并验证账号
-                  </button>
-                  <button type="button" class="btn btn-secondary ms-2" onclick="toggleManualInput()">
-                    <i class="bi bi-x-circle me-1"></i>取消
-                  </button>
-                </div>
-              </form>
-            </div>
-
-            <!-- 刷新Cookie表单（默认隐藏） -->
-            <div id="refreshCookieForm" style="display: none;">
-              <div class="alert alert-warning">
-                <i class="bi bi-exclamation-triangle me-2"></i>
-                <strong>提示：</strong>用于已有账号的手动账密刷新。本流程会读取该账号已保存的用户名和密码，获取 Cookie 后继续做 Token 预检；若平台限流或风控未通过，不会视为恢复成功。
-              </div>
-              <form id="refreshCookieFormElement" class="row g-3">
-                <div class="col-md-6">
-                  <label for="refreshCookieAccountSelect" class="form-label">选择要刷新的账号</label>
-                  <select class="form-select" id="refreshCookieAccountSelect" required>
-                    <option value="">请选择账号...</option>
-                  </select>
-                </div>
-                <div class="col-md-6">
-                  <label class="form-label">账号状态</label>
-                  <div id="refreshCookieAccountStatus" class="form-control-plaintext text-muted">
-                    请先选择账号
-                  </div>
-                </div>
-                <div class="col-12">
-                  <div class="form-check">
-                    <input class="form-check-input" type="checkbox" id="refreshCookieShowBrowser" value="1">
-                    <label class="form-check-label" for="refreshCookieShowBrowser">
-                      显示浏览器窗口（仅影响本次刷新；Docker 部署下请用 VNC 连接 127.0.0.1:5900 查看）
-                    </label>
-                  </div>
-                </div>
-                <div class="col-12">
-                  <button type="submit" class="btn btn-warning">
-                    <i class="bi bi-arrow-repeat me-1"></i>验证并刷新Cookie
-                  </button>
-                  <button type="button" class="btn btn-secondary ms-2" onclick="toggleRefreshCookieForm()">
-                    <i class="bi bi-x-circle me-1"></i>取消
-                  </button>
-                </div>
-              </form>
+              账号添加和恢复只使用扫码登录。扫码完成后系统会保存新的登录态并切换账号任务。
             </div>
           </div>
         </div>
@@ -5839,13 +5723,13 @@
             <div class="mb-3">
               <label class="form-label">用户名</label>
               <input type="text" class="form-control" id="editAccountUsername" placeholder="输入用户名（可选）">
-              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复；不能绕过平台风控</div>
+              <div class="form-text">仅保留历史账号信息；当前账号添加和恢复入口统一使用扫码登录</div>
             </div>
             
             <div class="mb-3">
               <label class="form-label">密码</label>
               <input type="password" class="form-control" id="editAccountPassword" placeholder="输入密码（可选）">
-              <div class="form-text">用于账密登录、手动刷新 Cookie 和自动恢复；Token 预检通过后才算恢复成功</div>
+              <div class="form-text">仅保留历史账号信息；不会用于当前账号恢复流程</div>
             </div>
             
             <div class="mb-3">
@@ -5853,12 +5737,12 @@
                 <input class="form-check-input" type="checkbox" id="editAccountShowBrowser">
                 <label class="form-check-label" for="editAccountShowBrowser">
                   显示浏览器
-                  <i class="bi bi-info-circle text-info ms-1" data-bs-toggle="tooltip" title="控制该账号在账密相关流程中是否显示浏览器窗口"></i>
+                  <i class="bi bi-info-circle text-info ms-1" data-bs-toggle="tooltip" title="当前扫码恢复流程不使用该设置"></i>
                 </label>
               </div>
               <div class="form-text text-warning">
                 <i class="bi bi-exclamation-triangle me-1"></i>
-                该设置会影响账密登录、手动刷新 Cookie 和自动恢复流程。仅建议在本机排查滑块、人脸或风控页面时开启，服务器环境不要开启。
+                当前账号恢复统一使用扫码登录；该设置仅保留给历史数据兼容。
               </div>
             </div>
 
