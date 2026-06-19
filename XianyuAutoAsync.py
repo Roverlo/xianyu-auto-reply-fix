@@ -22,7 +22,7 @@ from config import (
     TOKEN_REFRESH_INTERVAL, TOKEN_RETRY_INTERVAL,
     SESSION_KEEPALIVE_INTERVAL, SESSION_KEEPALIVE_RETRY_INTERVAL, COOKIES_STR,
     LOG_CONFIG, AUTO_REPLY, DEFAULT_HEADERS, WEBSOCKET_HEADERS,
-    APP_CONFIG, API_ENDPOINTS, YIFAN_API, RISK_CONTROL
+    APP_CONFIG, API_ENDPOINTS, YIFAN_API, RISK_CONTROL, RPA_DELIVERY
 )
 # from app.logging_config import setup_logging  # 已移除，模块不存在
 import sys
@@ -2995,6 +2995,79 @@ class XianyuLive:
         finally:
             logger.info(f"【{self.cookie_id}】待发货补偿巡检已退出")
 
+    async def rpa_delivery_loop(self):
+        """Periodically deliver pending orders through the logged-in browser fallback."""
+        if not self.rpa_delivery_config or not self.rpa_delivery_config.enabled:
+            logger.info(f"【{self.cookie_id}】RPA自动发货兜底未启用")
+            return
+
+        try:
+            if self.rpa_delivery_config.boot_delay_seconds > 0:
+                await self._interruptible_sleep(self.rpa_delivery_config.boot_delay_seconds)
+
+            from utils.rpa_delivery_worker import RpaDeliveryWorker
+            self.rpa_delivery_worker = RpaDeliveryWorker(self, self.rpa_delivery_config)
+            logger.warning(
+                f"【{self.cookie_id}】RPA自动发货兜底已启动: "
+                f"interval={self.rpa_delivery_config.interval_seconds}s, "
+                f"profile={self.rpa_delivery_config.profile_dir}, "
+                f"only_when_ws_unready={self.rpa_delivery_config.only_when_ws_unready}"
+            )
+            if self.rpa_delivery_config.open_browser_on_start:
+                try:
+                    await self.rpa_delivery_worker.warmup_browser()
+                    logger.info(f"【{self.cookie_id}】RPA浏览器已预热，可通过VNC完成人工验证")
+                except Exception as warmup_e:
+                    logger.warning(f"【{self.cookie_id}】RPA浏览器预热失败，将在后续巡检中重试: {self._safe_str(warmup_e)}")
+
+            while True:
+                try:
+                    from cookie_manager import manager as cookie_manager
+                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                        logger.info(f"【{self.cookie_id}】账号已禁用，停止RPA自动发货兜底")
+                        break
+
+                    if self.rpa_delivery_lock.locked():
+                        logger.info(f"【{self.cookie_id}】RPA自动发货上一轮仍在执行，跳过本轮")
+                        await self._interruptible_sleep(self.rpa_delivery_config.interval_seconds)
+                        continue
+
+                    async with self.rpa_delivery_lock:
+                        stats = await self.rpa_delivery_worker.run_once()
+                        if any(stats.get(key, 0) for key in ("pending", "delivered", "skipped", "failed", "uncertain")):
+                            logger.info(f"【{self.cookie_id}】RPA自动发货巡检结果: {stats}")
+
+                    await self._interruptible_sleep(self.rpa_delivery_config.interval_seconds)
+                except asyncio.CancelledError:
+                    logger.info(f"【{self.cookie_id}】RPA自动发货兜底收到取消信号")
+                    raise
+                except Exception as e:
+                    logger.error(f"【{self.cookie_id}】RPA自动发货兜底异常: {self._safe_str(e)}")
+                    await self._interruptible_sleep(min(self.rpa_delivery_config.interval_seconds, 60))
+        except asyncio.CancelledError:
+            logger.info(f"【{self.cookie_id}】RPA自动发货兜底已取消")
+            raise
+        finally:
+            try:
+                if self.rpa_delivery_worker:
+                    await self.rpa_delivery_worker.close()
+            except Exception as close_e:
+                logger.warning(f"【{self.cookie_id}】关闭RPA自动发货浏览器失败: {self._safe_str(close_e)}")
+            self.rpa_delivery_worker = None
+            logger.info(f"【{self.cookie_id}】RPA自动发货兜底已退出")
+
+    def _start_rpa_delivery_task_if_needed(self) -> bool:
+        """Start the RPA fallback once; it is independent from the websocket connection."""
+        if not self.rpa_delivery_config or not self.rpa_delivery_config.enabled:
+            return False
+
+        if self.rpa_delivery_task and not self.rpa_delivery_task.done():
+            return False
+
+        logger.warning(f"【{self.cookie_id}】启动RPA自动发货兜底任务...")
+        self.rpa_delivery_task = asyncio.create_task(self.rpa_delivery_loop())
+        return True
+
     def _reset_background_tasks(self):
         """直接重置后台任务引用，不等待取消（用于快速重连）
         
@@ -3037,6 +3110,9 @@ class XianyuLive:
         if self.pending_order_reconcile_task:
             status = "已完成" if self.pending_order_reconcile_task.done() else "运行中"
             other_tasks_status.append(f"待发货补偿巡检({status})")
+        if self.rpa_delivery_task:
+            status = "已完成" if self.rpa_delivery_task.done() else "运行中"
+            other_tasks_status.append(f"RPA自动发货兜底({status})")
         
         if other_tasks_status:
             logger.info(f"【{self.cookie_id}】其他任务继续运行（不依赖WebSocket）: {', '.join(other_tasks_status)}")
@@ -3086,6 +3162,12 @@ class XianyuLive:
                     tasks_to_cancel.append(("待发货补偿巡检", self.pending_order_reconcile_task))
                 else:
                     logger.debug(f"【{self.cookie_id}】待发货补偿巡检已完成，跳过")
+
+            if self.rpa_delivery_task:
+                if not self.rpa_delivery_task.done():
+                    tasks_to_cancel.append(("RPA自动发货兜底", self.rpa_delivery_task))
+                else:
+                    logger.debug(f"【{self.cookie_id}】RPA自动发货兜底已完成，跳过")
             
             if not tasks_to_cancel:
                 logger.info(f"【{self.cookie_id}】没有后台任务需要取消（所有任务已完成或不存在）")
@@ -3096,6 +3178,7 @@ class XianyuLive:
                 self.cookie_refresh_task = None
                 self.stream_watchdog_task = None
                 self.pending_order_reconcile_task = None
+                self.rpa_delivery_task = None
                 return
             
             logger.info(f"【{self.cookie_id}】开始取消 {len(tasks_to_cancel)} 个未完成的后台任务...")
@@ -3232,6 +3315,7 @@ class XianyuLive:
             self.cookie_refresh_task = None
             self.stream_watchdog_task = None
             self.pending_order_reconcile_task = None
+            self.rpa_delivery_task = None
             logger.info(f"【{self.cookie_id}】后台任务引用已全部重置")
 
     def _is_transient_network_error(self, error_type: str = "", error_msg: str = "") -> bool:
@@ -3602,6 +3686,18 @@ class XianyuLive:
         )
         self.pending_order_reconcile_backoff_until = 0.0
         self.pending_order_reconcile_last_error_kind = None
+        try:
+            from utils.rpa_delivery_worker import RpaDeliveryConfig
+            self.rpa_delivery_config = RpaDeliveryConfig.from_mapping(
+                RPA_DELIVERY,
+                bool_coercer=self._coerce_config_bool,
+            )
+        except Exception as config_e:
+            logger.warning(f"【{cookie_id}】RPA发货配置解析失败，已禁用RPA兜底: {self._safe_str(config_e)}")
+            self.rpa_delivery_config = None
+        self.rpa_delivery_task = None
+        self.rpa_delivery_worker = None
+        self.rpa_delivery_lock = asyncio.Lock()
         self.risk_control_freeze_background_tasks = self._coerce_config_bool(
             RISK_CONTROL.get('risk_control_freeze_background_tasks', True),
             True,
@@ -19384,6 +19480,7 @@ class XianyuLive:
         try:
             logger.info(f"【{self.cookie_id}】开始启动XianyuLive主程序...")
             await self.create_session()  # 创建session
+            self._start_rpa_delivery_task_if_needed()
             logger.info(f"【{self.cookie_id}】Session创建完成，开始WebSocket连接循环...")
 
             while True:
@@ -19492,6 +19589,9 @@ class XianyuLive:
                                 else:
                                     logger.info(f"【{self.cookie_id}】待发货补偿巡检任务已在运行，跳过启动")
 
+                            if self._start_rpa_delivery_task_if_needed():
+                                tasks_started.append("RPA自动发货兜底")
+
                             # 启动消息队列工作协程（高性能消息处理）
                             if self.message_queue_enabled:
                                 await self._start_message_queue_workers()
@@ -19500,7 +19600,7 @@ class XianyuLive:
                             # 记录所有后台任务状态
                             if tasks_started:
                                 logger.info(f"【{self.cookie_id}】✅ 新启动的任务: {', '.join(tasks_started)}")
-                            logger.info(f"【{self.cookie_id}】✅ 所有后台任务状态: 心跳(已启动), 会话保活({'运行中' if self.token_refresh_task and not self.token_refresh_task.done() else '已启动'}), 暂停清理({'运行中' if self.cleanup_task and not self.cleanup_task.done() else '已启动'}), Cookie刷新({'运行中' if self.cookie_refresh_task and not self.cookie_refresh_task.done() else '已启动'}), 业务流看门狗({'运行中' if self.stream_watchdog_task and not self.stream_watchdog_task.done() else '已启动'}), 待发货补偿巡检({'运行中' if self.pending_order_reconcile_task and not self.pending_order_reconcile_task.done() else '已启动' if self.pending_order_reconcile_enabled else '未启用'})")
+                            logger.info(f"【{self.cookie_id}】✅ 所有后台任务状态: 心跳(已启动), 会话保活({'运行中' if self.token_refresh_task and not self.token_refresh_task.done() else '已启动'}), 暂停清理({'运行中' if self.cleanup_task and not self.cleanup_task.done() else '已启动'}), Cookie刷新({'运行中' if self.cookie_refresh_task and not self.cookie_refresh_task.done() else '已启动'}), 业务流看门狗({'运行中' if self.stream_watchdog_task and not self.stream_watchdog_task.done() else '已启动'}), 待发货补偿巡检({'运行中' if self.pending_order_reconcile_task and not self.pending_order_reconcile_task.done() else '已启动' if self.pending_order_reconcile_enabled else '未启用'}), RPA自动发货兜底({'运行中' if self.rpa_delivery_task and not self.rpa_delivery_task.done() else '已启动' if self.rpa_delivery_config and self.rpa_delivery_config.enabled else '未启用'})")
                             
                             logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
                             logger.info(f"【{self.cookie_id}】WebSocket连接状态正常，等待服务器消息...")
@@ -19768,6 +19868,7 @@ class XianyuLive:
                         self.cookie_refresh_task = None
                         self.stream_watchdog_task = None
                         self.pending_order_reconcile_task = None
+                        self.rpa_delivery_task = None
                         logger.warning(f"【{self.cookie_id}】清理失败，已强制重置所有任务引用")
                         # 使用可中断的sleep，并定期输出日志
                         logger.info(f"【{self.cookie_id}】清理失败后开始等待 {retry_delay} 秒...")
@@ -19812,7 +19913,8 @@ class XianyuLive:
                 self.cleanup_task and not self.cleanup_task.done(),
                 self.cookie_refresh_task and not self.cookie_refresh_task.done(),
                 self.stream_watchdog_task and not self.stream_watchdog_task.done(),
-                self.pending_order_reconcile_task and not self.pending_order_reconcile_task.done()
+                self.pending_order_reconcile_task and not self.pending_order_reconcile_task.done(),
+                self.rpa_delivery_task and not self.rpa_delivery_task.done()
             ])
             
             if has_pending_tasks:
@@ -19835,6 +19937,7 @@ class XianyuLive:
                     self.cookie_refresh_task = None
                     self.stream_watchdog_task = None
                     self.pending_order_reconcile_task = None
+                    self.rpa_delivery_task = None
             else:
                 logger.info(f"【{self.cookie_id}】所有后台任务已清理完成，跳过重复清理")
                 # 确保任务引用被重置
@@ -19844,6 +19947,7 @@ class XianyuLive:
                 self.cookie_refresh_task = None
                 self.stream_watchdog_task = None
                 self.pending_order_reconcile_task = None
+                self.rpa_delivery_task = None
             
             # 清理所有后台任务
             if self.background_tasks:

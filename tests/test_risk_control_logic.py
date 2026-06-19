@@ -50,6 +50,7 @@ def _install_import_stubs():
     config.APP_CONFIG = {}
     config.API_ENDPOINTS = {"token": "https://example.invalid/token"}
     config.YIFAN_API = {}
+    config.RPA_DELIVERY = {}
     config.RISK_CONTROL = {
         "slider_failure_backoff_seconds": 1800,
         "slider_consecutive_failure_threshold": 2,

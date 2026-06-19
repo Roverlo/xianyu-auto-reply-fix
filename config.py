@@ -164,6 +164,23 @@ RISK_CONTROL = config.get('RISK_CONTROL', {
     'soft_auth_token_preflight_timeout_seconds': 5.0,
     'soft_auth_token_preflight_qr_enabled': False,
 })
+RPA_DELIVERY = config.get('RPA_DELIVERY', {
+    'enabled': False,
+    'boot_delay_seconds': 45,
+    'interval_seconds': 120,
+    'max_orders_per_cycle': 3,
+    'max_order_age_minutes': 1440,
+    'profile_dir': '/app/browser_data/rpa_chrome',
+    'headless': False,
+    'display': ':99',
+    'im_url': 'https://www.goofish.com/im',
+    'screenshot_dir': '/app/logs/rpa_delivery_screenshots',
+    'send_timeout_seconds': 30,
+    'confirmation_timeout_seconds': 8,
+    'only_when_ws_unready': True,
+    'require_buyer_nick': True,
+    'open_browser_on_start': True,
+})
 _cookies_raw = config.get('COOKIES', [])
 if isinstance(_cookies_raw, list):
     COOKIES_LIST = _cookies_raw

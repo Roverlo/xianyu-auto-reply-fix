@@ -106,6 +106,22 @@ RISK_CONTROL:
   message_stream_initial_silence_reconnect_seconds: 14400
   message_stream_watchdog_probe_cooldown_seconds: 1800
   message_stream_watchdog_reconnect_on_keepalive_success: false
+RPA_DELIVERY:
+  enabled: true
+  boot_delay_seconds: 45
+  interval_seconds: 120
+  max_orders_per_cycle: 3
+  max_order_age_minutes: 1440
+  profile_dir: /app/browser_data/rpa_chrome
+  headless: false
+  display: ':99'
+  im_url: https://www.goofish.com/im
+  screenshot_dir: /app/logs/rpa_delivery_screenshots
+  send_timeout_seconds: 30
+  confirmation_timeout_seconds: 8
+  only_when_ws_unready: true
+  require_buyer_nick: true
+  open_browser_on_start: true
 TOKEN_REFRESH_INTERVAL: 72000  # AccessToken 仅在初始化/重连前按需刷新，默认20小时
 TOKEN_RETRY_INTERVAL: 600
 SESSION_KEEPALIVE_INTERVAL: 600  # 使用 loginuser.get 的轻量保活周期，默认10分钟
