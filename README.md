@@ -65,6 +65,8 @@
 - **多种触发** - 支持付款消息、小刀卡片等触发条件
 - **防重复处理** - 智能防重复发货和防重复确认
 - **多种发货方式** - 支持文字、批量数据、API、图片等发货方式
+- **RPA兜底发货** - 官方 WebSocket/token 链路被风控或不可用时，可复用 VNC 中已登录的闲鱼 IM 浏览器进行文本兜底发货
+- **发送不确定保护** - 页面发送结果无法确认时记录不确定状态，阻止自动重复发送
 - **发货统计** - 完整的发货记录和统计功能
 
 ### 🛍️ 商品管理
@@ -237,14 +239,15 @@ SECRET_ENCRYPTION_KEY=your-secret-key
 # 兼容旧单账号模式（可选）
 COOKIES_STR=your_cookie_string
 
-# Docker 图形模式（可选）
+# Docker 图形模式（RPA / VNC 兜底发货需要）
 USE_XVFB=true
 ENABLE_HEADFUL=true
-ENABLE_VNC=false
+ENABLE_VNC=true
 DISPLAY=:99
 ```
 
 > 其他运行参数（如 WebSocket、心跳、自动回复等）主要在 `global_config.yml` 和 Web 管理界面中配置。
+> 默认 `docker-compose.yml` 已映射 VNC 端口 `5900:5900` 并开启 VNC；`docker-compose-cn.yml` 中相关配置默认注释，需要使用 RPA 人工验证时手动打开。当前 `x11vnc` 使用 `-nopw` 启动，不要把 5900 端口暴露到公网。
 
 ### 🔄 热更新发版
 
@@ -329,6 +332,19 @@ DISPLAY=:99
 - 支持文本、批量数据、API、图片等发货方式
 - 系统检测到付款消息或小刀卡片后自动触发发货流程
 
+#### RPA 兜底发货和 VNC 人工验证
+- RPA 兜底用于官方 WebSocket/token 链路不可用时的备用发送路径，不是风控绕过；它依赖一个已经登录并通过滑块等验证的闲鱼 IM 浏览器画像。
+- Docker 环境需要启用有头浏览器：`USE_XVFB=true`、`ENABLE_HEADFUL=true`、`DISPLAY=:99`；需要人工处理登录或滑块时再开启 `ENABLE_VNC=true` 并连接 VNC 端口 `5900`。
+- 兜底配置在 `global_config.yml` 的 `RPA_DELIVERY`：
+  - `enabled: true`：启用 RPA 兜底巡检
+  - `profile_dir: /app/browser_data/rpa_chrome`：独立浏览器画像目录
+  - `open_browser_on_start: true`：启动后自动打开闲鱼 IM 页面，方便通过 VNC 完成人工验证
+  - `only_when_ws_unready: true`：官方 WebSocket 可发货时跳过 RPA，避免两条链路抢同一订单
+- 首次启用后，通过 VNC 打开容器里的浏览器，登录闲鱼并处理滑块；只要该 profile 保持有效，后续可无人值守兜底发送。
+- 当前 RPA 首版只处理“单数量 + 文本发货步骤”的待发货订单；图片发货、多数量订单或复杂步骤会跳过并写入日志。
+- 如果页面发送动作触发了但系统无法确认文本已出现在聊天里，会记录不确定状态并停止自动重发，需要人工核对后再处理。
+- `/health` 只代表容器和应用健康；判断账号是否真的可自动发货，还要看账号 runtime-status、`realtime.log`、`system_settings` 中的登录退避和风控状态。
+
 ### 6. 安装闲鱼聊天暗色模式脚本（可选）
 本项目提供了一个油猴用户脚本，可为闲鱼官网聊天页面添加暗色模式支持。
 
@@ -358,18 +374,18 @@ DISPLAY=:99
                     │
 ┌───────────────────▼─────────────────────┐
 │          XianyuLive (多实例)             │
-│        WebSocket 连接 + 消息处理          │
+│  WebSocket 消息处理 + RPA 发货兜底任务     │
 └──────────────┬──────────────┬───────────┘
                │              │
-┌──────────────▼───────┐ ┌────▼──────────────┐
-│    AIReplyEngine     │ │ FileLogCollector  │
-│     AI 回复与上下文    │ │   实时日志与统计    │
-└──────────────┬───────┘ └────┬──────────────┘
-               │              │
-┌──────────────▼──────────────▼───────────┐
+┌──────────────▼───────┐ ┌────▼──────────────┐ ┌──────────────▼─────────────┐
+│    AIReplyEngine     │ │ FileLogCollector  │ │  Playwright / VNC Browser  │
+│     AI 回复与上下文    │ │   实时日志与统计    │ │    已登录 IM 页面兜底发货    │
+└──────────────┬───────┘ └────┬──────────────┘ └──────────────┬─────────────┘
+               │              │                               │
+┌──────────────▼──────────────▼───────────────────────────────▼┐
 │              SQLite 数据库               │
-│      用户数据 + 商品信息 + 配置数据         │
-└─────────────────────────────────────────┘
+│      用户数据 + 商品信息 + 配置数据 + 发货状态                 │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ## ⚙️ 配置说明
@@ -379,8 +395,32 @@ DISPLAY=:99
 - WebSocket连接参数
 - API接口配置
 - 自动回复设置
+- `RPA_DELIVERY`：RPA 兜底发货开关、巡检间隔、浏览器画像、VNC/Xvfb 显示、发送确认超时等
 - 商品管理配置
 - 日志配置等
+
+当前常用的 RPA 配置示例：
+
+```yaml
+RPA_DELIVERY:
+  enabled: true
+  boot_delay_seconds: 45
+  interval_seconds: 120
+  max_orders_per_cycle: 3
+  max_order_age_minutes: 1440
+  profile_dir: /app/browser_data/rpa_chrome
+  headless: false
+  display: ':99'
+  im_url: https://www.goofish.com/im
+  screenshot_dir: /app/logs/rpa_delivery_screenshots
+  send_timeout_seconds: 30
+  confirmation_timeout_seconds: 8
+  only_when_ws_unready: true
+  require_buyer_nick: true
+  open_browser_on_start: true
+```
+
+`profile_dir` 是无人值守能力的关键状态目录，保存登录态和人工验证结果；除非明确要重新登录，不建议删除。
 
 ## 📊 监控和维护
 
@@ -416,7 +456,7 @@ DISPLAY=:99
 检查 `data/` 目录和数据库文件权限，确保应用有读写权限；如使用自定义路径，确认 `DB_PATH` 配置正确。
 
 ### 3. WebSocket连接失败
-检查网络和防火墙设置，并确认闲鱼账号 Cookie 仍然有效。
+检查网络和防火墙设置，并确认闲鱼账号 Cookie 仍然有效。如果 runtime-status 中出现 `server_overload_rgv587`、`auth_backoff`、`qr_login_recovery_recommended` 等状态，说明账号可能仍在平台登录或 token 风控链路里，`/health` 正常也不代表能自动发货。此时可以通过 VNC 确认 RPA 浏览器是否已登录，RPA 只会在 `only_when_ws_unready=true` 且浏览器会话可用时处理符合条件的文本订单。
 
 ### 4. Shell脚本执行错误（Linux/macOS）
 如果遇到 `bad interpreter` 错误，说明脚本行结束符格式不正确：
