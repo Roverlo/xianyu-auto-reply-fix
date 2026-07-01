@@ -58,6 +58,7 @@ let ordersStreamAbortController = null;
 let ordersStreamReconnectTimer = null;
 let ordersStreamRetryCount = 0;
 let ordersStreamShouldRun = false;
+let pendingOrderLocator = null;
 let orderHistorySyncModalInstance = null;
 let orderHistorySyncPollingTimer = null;
 let activeOrderHistorySyncJobId = '';
@@ -68,6 +69,13 @@ let blacklistState = {
     pageSize: 20,
     total: 0,
     accountsLoaded: false
+};
+let messageFilterState = {
+    page: 1,
+    pageSize: 20,
+    total: 0,
+    accountsLoaded: false,
+    editingId: null
 };
 let loadingRequestCount = 0;
 let loadingShowTimer = null;
@@ -133,6 +141,9 @@ function showSection(sectionName) {
         break;
     case 'auto-reply':      // 【自动回复菜单】
         refreshAccountList();
+        break;
+    case 'message-filters': // 【消息过滤菜单】
+        loadMessageFiltersPage();
         break;
     case 'cards':           // 【卡券管理菜单】
         loadCards();
@@ -3411,6 +3422,374 @@ async function fetchJSON(url, opts = {}) {
     } finally {
         toggleLoading(false);
     }
+}
+
+// ================================
+// 【消息过滤菜单】相关功能
+// ================================
+
+async function loadMessageFiltersPage() {
+    await loadMessageFilterAccountOptions();
+    await loadMessageFilters(messageFilterState.page || 1);
+}
+
+async function loadMessageFilterAccountOptions(force = false) {
+    const accountSelect = document.getElementById('messageFilterCookieId');
+    if (!accountSelect) return;
+    if (messageFilterState.accountsLoaded && !force) return;
+
+    try {
+        const currentValue = accountSelect.value;
+        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        const safeAccounts = Array.isArray(accounts) ? accounts : [];
+        accountSelect.innerHTML = '<option value="">全部账号</option>' + safeAccounts.map(account => {
+            const accountId = String(account.id || '').trim();
+            const remark = String(account.remark || '').trim();
+            const label = remark ? `${accountId}（${remark}）` : accountId;
+            return `<option value="${escapeHtml(accountId)}">${escapeHtml(label)}</option>`;
+        }).join('');
+        if (currentValue && safeAccounts.some(account => String(account.id || '') === currentValue)) {
+            accountSelect.value = currentValue;
+        }
+        messageFilterState.accountsLoaded = true;
+    } catch (error) {
+        console.error('加载消息过滤账号选项失败:', error);
+    }
+}
+
+function handleMessageFilterKeydown(event) {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        loadMessageFilters(1);
+    }
+}
+
+async function loadMessageFilters(page = 1) {
+    const tableBody = document.getElementById('messageFilterTableBody');
+    if (!tableBody) return;
+
+    const pageSizeSelect = document.getElementById('messageFilterPageSize');
+    const pageSize = Math.max(1, parseInt(pageSizeSelect?.value || '20', 10) || 20);
+    const safePage = Math.max(1, parseInt(page, 10) || 1);
+    const params = new URLSearchParams({
+        page: String(safePage),
+        page_size: String(pageSize)
+    });
+    const keyword = document.getElementById('messageFilterKeyword')?.value?.trim();
+    if (keyword) params.set('keyword', keyword);
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/message-filters?${params.toString()}`);
+        const records = Array.isArray(result?.data) ? result.data : [];
+        messageFilterState.page = Number(result?.page || safePage);
+        messageFilterState.pageSize = Number(result?.page_size || pageSize);
+        messageFilterState.total = Number(result?.total || 0);
+        renderMessageFilters(records);
+        renderMessageFilterPagination();
+    } catch (error) {
+        console.error('加载消息过滤规则失败:', error);
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="7" class="text-center py-4 text-danger">
+                    <i class="bi bi-exclamation-triangle fs-1 d-block mb-3"></i>
+                    加载消息过滤规则失败
+                </td>
+            </tr>
+        `;
+    }
+}
+
+function getMessageFilterScopeBadge(scope) {
+    const normalizedScope = String(scope || 'user');
+    const config = {
+        item: { text: '商品级', cls: 'bg-warning text-dark' },
+        account: { text: '账号级', cls: 'bg-info text-dark' },
+        user: { text: '用户级', cls: 'bg-secondary' }
+    }[normalizedScope] || { text: normalizedScope || '未知', cls: 'bg-secondary' };
+    return `<span class="badge ${config.cls}">${escapeHtml(config.text)}</span>`;
+}
+
+function getMessageFilterMatchTypeLabel(matchType) {
+    return ({
+        contains: '包含',
+        exact: '完全',
+        regex: '正则'
+    }[String(matchType || 'contains')] || '包含');
+}
+
+function getMessageFilterSourceLabel(source) {
+    return ({
+        user: '客户',
+        system: '系统',
+        all: '全部'
+    }[String(source || 'user')] || '客户');
+}
+
+function getMessageFilterActionsHtml(record) {
+    const actions = [];
+    if (record?.action_skip_auto_reply) actions.push('跳过自动回复');
+    if (record?.action_skip_ai_reply) actions.push('跳过AI');
+    const pauseMinutes = Number(record?.action_pause_minutes || 0);
+    if (pauseMinutes > 0) actions.push(`暂停${pauseMinutes}分钟`);
+    if (record?.action_notify) actions.push('通知人工');
+    if (actions.length === 0) return '<span class="text-muted small">仅记录</span>';
+    return actions.map(action => `<span class="badge bg-light text-dark border me-1 mb-1">${escapeHtml(action)}</span>`).join('');
+}
+
+function renderMessageFilters(records) {
+    const tableBody = document.getElementById('messageFilterTableBody');
+    const totalText = document.getElementById('messageFilterTotalText');
+    if (!tableBody) return;
+
+    if (totalText) {
+        totalText.textContent = `共 ${messageFilterState.total || 0} 条`;
+    }
+
+    if (!Array.isArray(records) || records.length === 0) {
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="7" class="text-center py-4 text-muted">
+                    <i class="bi bi-funnel fs-1 d-block mb-3"></i>
+                    暂无过滤规则
+                </td>
+            </tr>
+        `;
+        return;
+    }
+
+    tableBody.innerHTML = records.map(record => {
+        const ruleId = Number(record.id || 0);
+        const name = String(record.name || '').trim();
+        const patterns = Array.isArray(record.patterns) ? record.patterns : [];
+        const patternPreview = patterns.slice(0, 3).join(' / ');
+        const cookieId = String(record.cookie_id || '').trim();
+        const itemId = String(record.item_id || '').trim();
+        const enabled = Boolean(record.is_enabled);
+        const updatedAt = formatDateTime(record.updated_at || record.created_at || '');
+        const targetParts = [];
+        targetParts.push(cookieId ? `账号 ${cookieId}` : '全部账号');
+        if (itemId) targetParts.push(`商品 ${itemId}`);
+        const encodedRecord = encodeURIComponent(JSON.stringify(record));
+        return `
+            <tr>
+                <td>
+                    ${getMessageFilterScopeBadge(record.scope)}
+                    <div class="small text-muted mt-1">${targetParts.map(part => escapeHtml(part)).join('<br>')}</div>
+                </td>
+                <td>
+                    <div class="fw-semibold" title="${escapeHtml(name)}">${escapeHtml(name || '-')}</div>
+                    <div class="small text-muted">${getMessageFilterSourceLabel(record.message_source)}消息</div>
+                </td>
+                <td style="max-width: 220px;">
+                    <div class="small"><span class="badge bg-light text-dark border">${getMessageFilterMatchTypeLabel(record.match_type)}</span></div>
+                    <div class="text-truncate mt-1" title="${escapeHtml(patterns.join('\n'))}">${escapeHtml(patternPreview || '-')}</div>
+                </td>
+                <td style="max-width: 260px;">${getMessageFilterActionsHtml(record)}</td>
+                <td>
+                    <div class="form-check form-switch m-0" title="${enabled ? '点击禁用' : '点击启用'}">
+                        <input class="form-check-input" type="checkbox" ${enabled ? 'checked' : ''} onchange="toggleMessageFilter(${ruleId}, this.checked)">
+                    </div>
+                </td>
+                <td><small class="text-muted text-nowrap">${escapeHtml(updatedAt)}</small></td>
+                <td>
+                    <div class="btn-group btn-group-sm" role="group">
+                        <button type="button" class="btn btn-outline-primary" onclick="editMessageFilterRule('${encodedRecord}')" title="编辑">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        <button type="button" class="btn btn-outline-danger" onclick="deleteMessageFilter(${ruleId})" title="删除">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function renderMessageFilterPagination() {
+    const pagination = document.getElementById('messageFilterPagination');
+    const pageText = document.getElementById('messageFilterPageText');
+    if (!pagination) return;
+
+    const pageSize = Math.max(1, Number(messageFilterState.pageSize || 20));
+    const total = Math.max(0, Number(messageFilterState.total || 0));
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const currentPage = Math.min(Math.max(1, Number(messageFilterState.page || 1)), totalPages);
+
+    if (currentPage !== messageFilterState.page && total > 0) {
+        loadMessageFilters(currentPage);
+        return;
+    }
+
+    if (pageText) {
+        pageText.textContent = `第 ${currentPage} / ${totalPages} 页`;
+    }
+
+    const startPage = Math.max(1, currentPage - 2);
+    const endPage = Math.min(totalPages, startPage + 4);
+    const buttons = [];
+    const addButton = (label, targetPage, disabled = false, active = false, title = '') => {
+        buttons.push(`
+            <button type="button" class="btn btn-sm ${active ? 'btn-primary' : 'btn-outline-secondary'}" ${disabled ? 'disabled' : ''} onclick="loadMessageFilters(${targetPage})" title="${escapeHtml(title || label)}">
+                ${label}
+            </button>
+        `);
+    };
+
+    addButton('<i class="bi bi-chevron-left"></i>', currentPage - 1, currentPage <= 1, false, '上一页');
+    for (let page = startPage; page <= endPage; page += 1) {
+        addButton(String(page), page, false, page === currentPage);
+    }
+    addButton('<i class="bi bi-chevron-right"></i>', currentPage + 1, currentPage >= totalPages, false, '下一页');
+    pagination.innerHTML = buttons.join('');
+}
+
+function getMessageFilterPayload() {
+    const name = document.getElementById('messageFilterName')?.value?.trim() || '';
+    const patterns = document.getElementById('messageFilterPatterns')?.value?.trim() || '';
+    if (!name) {
+        showToast('请填写规则名称', 'warning');
+        return null;
+    }
+    if (!patterns) {
+        showToast('请填写匹配内容', 'warning');
+        return null;
+    }
+    const pauseMinutes = Math.max(0, parseInt(document.getElementById('messageFilterPauseMinutes')?.value || '0', 10) || 0);
+    return {
+        name,
+        cookie_id: document.getElementById('messageFilterCookieId')?.value?.trim() || null,
+        item_id: document.getElementById('messageFilterItemId')?.value?.trim() || null,
+        match_type: document.getElementById('messageFilterMatchType')?.value || 'contains',
+        message_source: document.getElementById('messageFilterSource')?.value || 'user',
+        patterns,
+        is_enabled: Boolean(document.getElementById('messageFilterEnabled')?.checked),
+        action_skip_auto_reply: Boolean(document.getElementById('messageFilterSkipAutoReply')?.checked),
+        action_skip_ai_reply: Boolean(document.getElementById('messageFilterSkipAiReply')?.checked),
+        action_pause_minutes: Math.min(pauseMinutes, 1440),
+        action_notify: Boolean(document.getElementById('messageFilterNotify')?.checked)
+    };
+}
+
+async function saveMessageFilterRule() {
+    const payload = getMessageFilterPayload();
+    if (!payload) return;
+
+    const editingId = Number(messageFilterState.editingId || 0);
+    const url = editingId > 0
+        ? `${apiBase}/api/message-filters/${editingId}`
+        : `${apiBase}/api/message-filters`;
+    const method = editingId > 0 ? 'PUT' : 'POST';
+
+    try {
+        const result = await fetchJSON(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        showToast(result?.message || '消息过滤规则已保存', 'success');
+        resetMessageFilterForm();
+        await loadMessageFilters(editingId > 0 ? (messageFilterState.page || 1) : 1);
+    } catch (error) {
+        console.error('保存消息过滤规则失败:', error);
+    }
+}
+
+function editMessageFilterRule(encodedRecord) {
+    try {
+        const record = JSON.parse(decodeURIComponent(encodedRecord));
+        messageFilterState.editingId = Number(record.id || 0);
+        const formTitle = document.getElementById('messageFilterFormTitle');
+        if (formTitle) formTitle.textContent = '编辑过滤规则';
+        const fields = {
+            messageFilterRuleId: record.id || '',
+            messageFilterName: record.name || '',
+            messageFilterCookieId: record.cookie_id || '',
+            messageFilterItemId: record.item_id || '',
+            messageFilterMatchType: record.match_type || 'contains',
+            messageFilterSource: record.message_source || 'user',
+            messageFilterPatterns: Array.isArray(record.patterns) ? record.patterns.join('\n') : (record.patterns_text || ''),
+            messageFilterPauseMinutes: record.action_pause_minutes || 0
+        };
+        Object.entries(fields).forEach(([id, value]) => {
+            const element = document.getElementById(id);
+            if (element) element.value = value;
+        });
+        const checks = {
+            messageFilterEnabled: record.is_enabled,
+            messageFilterSkipAutoReply: record.action_skip_auto_reply,
+            messageFilterSkipAiReply: record.action_skip_ai_reply,
+            messageFilterNotify: record.action_notify
+        };
+        Object.entries(checks).forEach(([id, checked]) => {
+            const element = document.getElementById(id);
+            if (element) element.checked = Boolean(checked);
+        });
+        document.getElementById('messageFilterName')?.focus();
+    } catch (error) {
+        console.error('编辑消息过滤规则失败:', error);
+        showToast('加载规则失败', 'danger');
+    }
+}
+
+function resetMessageFilterForm() {
+    const form = document.getElementById('messageFilterForm');
+    if (form) form.reset();
+    messageFilterState.editingId = null;
+    const ruleId = document.getElementById('messageFilterRuleId');
+    if (ruleId) ruleId.value = '';
+    const formTitle = document.getElementById('messageFilterFormTitle');
+    if (formTitle) formTitle.textContent = '新增过滤规则';
+    const enabled = document.getElementById('messageFilterEnabled');
+    const skipAuto = document.getElementById('messageFilterSkipAutoReply');
+    const skipAi = document.getElementById('messageFilterSkipAiReply');
+    const notify = document.getElementById('messageFilterNotify');
+    const pause = document.getElementById('messageFilterPauseMinutes');
+    const matchType = document.getElementById('messageFilterMatchType');
+    const source = document.getElementById('messageFilterSource');
+    if (enabled) enabled.checked = true;
+    if (skipAuto) skipAuto.checked = true;
+    if (skipAi) skipAi.checked = false;
+    if (notify) notify.checked = false;
+    if (pause) pause.value = '0';
+    if (matchType) matchType.value = 'contains';
+    if (source) source.value = 'user';
+}
+
+async function toggleMessageFilter(ruleId, isEnabled) {
+    try {
+        await fetchJSON(`${apiBase}/api/message-filters/${ruleId}/toggle`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ is_enabled: Boolean(isEnabled) })
+        });
+        showToast(isEnabled ? '规则已启用' : '规则已禁用', 'success');
+    } catch (error) {
+        console.error('更新消息过滤规则状态失败:', error);
+        await loadMessageFilters(messageFilterState.page || 1);
+    }
+}
+
+async function deleteMessageFilter(ruleId) {
+    if (!confirm('确定删除这条消息过滤规则吗？')) return;
+    try {
+        const result = await fetchJSON(`${apiBase}/api/message-filters/${ruleId}`, {
+            method: 'DELETE'
+        });
+        showToast(result?.message || '消息过滤规则已删除', 'success');
+        if (Number(messageFilterState.editingId || 0) === Number(ruleId || 0)) {
+            resetMessageFilterForm();
+        }
+        await loadMessageFilters(messageFilterState.page || 1);
+    } catch (error) {
+        console.error('删除消息过滤规则失败:', error);
+    }
+}
+
+function resetMessageFilterSearch() {
+    const keyword = document.getElementById('messageFilterKeyword');
+    if (keyword) keyword.value = '';
+    loadMessageFilters(1);
 }
 
 // ================================
@@ -10800,6 +11179,7 @@ const DEFAULT_MENU_ITEMS = [
     { id: 'items', name: '商品管理', icon: 'bi-box-seam', required: false },
     { id: 'orders', name: '订单管理', icon: 'bi-receipt-cutoff', required: false },
     { id: 'auto-reply', name: '自动回复', icon: 'bi-chat-left-text', required: false },
+    { id: 'message-filters', name: '消息过滤', icon: 'bi-funnel', required: false },
     { id: 'items-reply', name: '指定商品回复', icon: 'bi-chat-left-text', required: false },
     { id: 'cards', name: '卡券管理', icon: 'bi-credit-card', required: false },
     { id: 'auto-delivery', name: '自动发货', icon: 'bi-truck', required: false },
@@ -17226,6 +17606,10 @@ async function loadOrders() {
         // 加载订单列表
         await refreshOrdersData();
 
+        if (pendingOrderLocator) {
+            applyPendingOrderLocator();
+        }
+
         startOrdersStream();
     } catch (error) {
         console.error('加载订单列表失败:', error);
@@ -17296,6 +17680,56 @@ async function loadAllOrders() {
 // 根据Cookie加载订单
 async function loadOrdersByCookie() {
     filterOrders(false);
+}
+
+function normalizeOrderLocatorKeyword(value) {
+    return String(value || '').trim().replace(/@goofish$/i, '');
+}
+
+function applyPendingOrderLocator() {
+    const locator = pendingOrderLocator;
+    if (!locator) return false;
+
+    const searchInput = document.getElementById('orderSearchInput');
+    const statusFilter = document.getElementById('orderStatusFilter');
+    const cookieFilter = document.getElementById('orderCookieFilter');
+    const keyword = normalizeOrderLocatorKeyword(locator.keyword || locator.buyerId || locator.buyerNick || locator.chatId);
+
+    if (searchInput) searchInput.value = keyword;
+    if (statusFilter) statusFilter.value = '';
+    if (cookieFilter && locator.cookieId) {
+        const hasMatchedOption = Array.from(cookieFilter.options || []).some(option => option.value === locator.cookieId);
+        cookieFilter.value = hasMatchedOption ? locator.cookieId : '';
+    }
+
+    pendingOrderLocator = null;
+    filterOrders(true);
+
+    const matchedText = filteredOrdersData.length ? `，已定位到 ${filteredOrdersData.length} 条订单` : '，暂未匹配到订单';
+    showToast(`已跳转到独立订单页${matchedText}`, filteredOrdersData.length ? 'success' : 'info');
+    return true;
+}
+
+function openOrdersFromChat() {
+    const buyerKeyword = normalizeOrderLocatorKeyword(chatCurrentToUserId || chatCurrentSenderName || chatCurrentChatId);
+    if (!chatCurrentCookieId || !buyerKeyword) {
+        showToast('当前会话缺少账号或买家信息，无法定位订单', 'warning');
+        return;
+    }
+
+    pendingOrderLocator = {
+        cookieId: chatCurrentCookieId,
+        buyerId: normalizeOrderLocatorKeyword(chatCurrentToUserId),
+        buyerNick: chatCurrentSenderName,
+        chatId: chatCurrentChatId,
+        keyword: buyerKeyword,
+    };
+
+    const wasOrdersActive = isOrdersSectionActive();
+    showSection('orders');
+    if (wasOrdersActive) {
+        applyPendingOrderLocator();
+    }
 }
 
 // 筛选订单
@@ -17384,6 +17818,9 @@ function createOrderRow(order) {
     const specValue2 = escapeHtml(order.spec_value_2 || '');
     const quantity = escapeHtml(order.quantity || '-');
     const amountDisplay = escapeHtml(formatOrderAmountDisplay(order.amount));
+    const isPendingConfirm = normalizedStatus === 'partial_pending_finalize' || order.pending_platform_confirm === true;
+    const pendingConfirmError = escapeHtml(order.pending_confirm_error || '');
+    const pendingConfirmTitle = pendingConfirmError || (isPendingConfirm ? '卡券已发出，平台确认发货失败，等待补确认' : '');
 
     // 判断是否可以手动发货（允许多次发货，除了交易关闭的订单）
     const canDeliver = !['cancelled', 'refunding'].includes(normalizedStatus);
@@ -17429,7 +17866,8 @@ function createOrderRow(order) {
                 <span class="text-success fw-bold">${amountDisplay}</span>
             </td>
             <td>
-                <span class="badge ${statusClass}">${escapeHtml(statusText)}</span>
+                <span class="badge ${statusClass}" title="${pendingConfirmTitle}">${escapeHtml(statusText)}</span>
+                ${pendingConfirmError ? `<div class="small text-warning text-truncate mt-1" style="max-width: 140px;" title="${pendingConfirmError}">${pendingConfirmError}</div>` : ''}
             </td>
             <td>
                 <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${cookieId === '-' ? '' : cookieId}">
@@ -17438,6 +17876,10 @@ function createOrderRow(order) {
             </td>
             <td>
                 <div class="btn-group btn-group-sm" role="group">
+                    ${isPendingConfirm ? `
+                    <button class="btn btn-outline-warning btn-sm order-action-btn" data-order-action="confirm-retry" data-order-id="${orderId}" title="补确认发货（只调用平台确认，不重复发卡券）">
+                        <i class="bi bi-check2-circle"></i>
+                    </button>` : ''}
                     <button class="btn btn-outline-success btn-sm order-action-btn" data-order-action="deliver" data-order-id="${orderId}" title="手动发货" ${canDeliver ? '' : 'disabled'}>
                         <i class="bi bi-truck"></i>
                     </button>
@@ -17484,7 +17926,7 @@ function getOrderStatusText(status) {
         'pending_payment': '待付款',
         'pending_ship': '待发货',
         'partial_success': '部分发货',
-        'partial_pending_finalize': '部分待收尾',
+        'partial_pending_finalize': '待补确认',
         'shipped': '已发货',
         'completed': '交易成功',
         'success': '交易成功',
@@ -18137,6 +18579,8 @@ async function showOrderDetail(orderId) {
         const safeCreatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.created_at));
         const safeUpdatedAt = escapeHtml(formatBeijingDateTimeWithSeconds(order.updated_at));
         const safeStatusText = escapeHtml(getOrderStatusText(order.order_status));
+        const safePendingConfirmError = escapeHtml(order.pending_confirm_error || '');
+        const pendingConfirmUnits = Number(order.pending_confirm_units || 0);
 
         const modalContent = `
             <div class="modal fade" id="orderDetailModal" tabindex="-1">
@@ -18160,6 +18604,7 @@ async function showOrderDetail(orderId) {
                                         <tr><td>买家昵称</td><td>${safeBuyerNick}</td></tr>
                                         <tr><td>Cookie账号</td><td>${safeCookieId}</td></tr>
                                         <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${safeStatusText}</span></td></tr>
+                                        ${safePendingConfirmError ? `<tr><td>补确认状态</td><td><span class="badge bg-warning-subtle text-warning-emphasis">待补确认${pendingConfirmUnits ? ` × ${pendingConfirmUnits}` : ''}</span><div class="small text-warning mt-1">${safePendingConfirmError}</div></td></tr>` : ''}
                                     </table>
                                 </div>
                                 <div class="col-md-6">
@@ -18420,6 +18865,45 @@ async function manualDeliverOrder(orderId) {
     }
 }
 
+// 手动补确认发货（只调用平台确认，不重复发送卡券）
+async function retryOrderPlatformConfirm(orderId) {
+    try {
+        const confirmed = confirm(`确定要补确认此订单吗？\n\n订单ID: ${orderId}\n\n只会调用闲鱼平台确认发货接口，不会重复发送卡券/发货内容。`);
+        if (!confirmed) {
+            return;
+        }
+
+        showToast('正在补确认发货...', 'info');
+
+        const response = await fetch(`${apiBase}/api/orders/${orderId}/confirm-retry`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+            if (result.confirmed) {
+                showToast(result.message || '补确认成功', 'success');
+                refreshTodayDeliveryCount();
+            } else if (result.success) {
+                showToast(result.message || '没有待补确认记录', 'info');
+            } else {
+                showToast(`补确认失败: ${result.message || '未知错误'}`, 'warning');
+            }
+            await refreshOrdersData();
+        } else {
+            showToast(`补确认失败: ${result.detail || '未知错误'}`, 'danger');
+        }
+    } catch (error) {
+        console.error('补确认发货失败:', error);
+        showToast('补确认发货失败: ' + error.message, 'danger');
+    }
+}
+
 // 刷新订单状态
 async function refreshOrderStatus(orderId) {
     try {
@@ -18558,6 +19042,8 @@ document.addEventListener('DOMContentLoaded', function() {
 
             if (action === 'deliver') {
                 manualDeliverOrder(orderId);
+            } else if (action === 'confirm-retry') {
+                retryOrderPlatformConfirm(orderId);
             } else if (action === 'refresh') {
                 refreshOrderStatus(orderId);
             } else if (action === 'detail') {
@@ -21156,7 +21642,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v2.0.2';
+const DEFAULT_VERSION = 'v2.0.3';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -21267,9 +21753,20 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v2.0.2',
+    version: 'v2.0.3',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v2.0.3',
+            date: '2026-06-16',
+            updates: [
+                '【新功能】新增待补确认订单补偿能力，发货后平台确认失败的订单会记录待补确认状态并提供补偿入口',
+                '【新功能】在线客服会话新增拉黑入口，便于快速处理异常买家或商品会话',
+                '【优化】会话预览优先显示最新消息，补全客服会话头像昵称，并将客服订单入口跳转到独立订单页',
+                '【修复】停止终态订单重复补确认，避免已完成、已关闭等终态订单被重复处理',
+                '【文档】精简 README 并拆分部署、配置、使用、FAQ 和发版说明文档'
+            ]
+        },
         {
             version: 'v2.0.2',
             date: '2026-06-03',
@@ -23290,6 +23787,10 @@ let chatOldestMsgId = null;
 let chatSseAbortController = null;
 let chatSseRetryCount = 0;
 let chatSseShouldRun = false;
+let chatUserInfoCache = {};
+let chatUserInfoHydrationTimer = null;
+const CHAT_USER_INFO_MISS_TTL_MS = 10 * 60 * 1000;
+let chatBlacklistState = { loading: false, blacklisted: false, can_unblock: false, scope: '', record: null, account_record: null };
 
 function buildSafeCheckboxId(prefix, rawValue) {
     const normalized = String(rawValue || '')
@@ -23325,17 +23826,357 @@ function resolveSessionAvatar(session) {
     return { type: 'text', value: (displayName || '?').charAt(0).toUpperCase() };
 }
 
+function buildChatUserInfoCacheKey(cookieId, chatId) {
+    return `${String(cookieId || '').trim()}::${String(chatId || '').trim().replace(/@goofish$/i, '')}`;
+}
+
+function isValidChatDisplayName(value) {
+    const text = String(value || '').trim();
+    if (!text || text === '-' || text === '未知用户') return false;
+    if (/^\d+$/.test(text)) return false;
+    return !['工作台通知', '订单', '交易消息', '买家', '全部'].includes(text);
+}
+
+function applyChatUserInfoToSession(session, info) {
+    if (!session || !info) return { session, changed: false };
+    const updates = {};
+    const avatar = String(info.avatar || '').trim();
+    const nick = String(info.fish_nick || info.buyer_name_resolved || '').trim();
+    const senderId = String(info.sender_id || '').trim();
+
+    if (avatar && avatar !== String(session.avatar || '')) {
+        updates.avatar = avatar;
+    }
+    if (isValidChatDisplayName(nick)) {
+        if (nick !== String(session.fish_nick || '')) updates.fish_nick = nick;
+        if (nick !== String(session.buyer_name_resolved || '')) updates.buyer_name_resolved = nick;
+        if (!isValidChatDisplayName(session.buyer_name) || String(session.buyer_name || '').trim() === String(session.buyer_id || '').trim()) {
+            updates.buyer_name = nick;
+        }
+        if (!isValidChatDisplayName(session.sender_name) || String(session.sender_name || '').trim() === String(session.sender_id || '').trim()) {
+            updates.sender_name = nick;
+        }
+    }
+    if (senderId && !session.sender_id) {
+        updates.sender_id = senderId;
+    }
+
+    return Object.keys(updates).length > 0
+        ? { session: { ...session, ...updates }, changed: true }
+        : { session, changed: false };
+}
+
+function applyCachedChatUserInfosToSessions() {
+    if (!chatCurrentCookieId || !chatSessionsCache.length) return false;
+    let changed = false;
+    chatSessionsCache = chatSessionsCache.map(session => {
+        const cacheKey = buildChatUserInfoCacheKey(chatCurrentCookieId, session?.chat_id);
+        const cached = chatUserInfoCache[cacheKey];
+        if (!cached || cached.__miss) return session;
+        const result = applyChatUserInfoToSession(session, cached);
+        changed = changed || result.changed;
+        return result.session;
+    });
+    return changed;
+}
+
+function shouldHydrateChatSessionUserInfo(session) {
+    if (!chatCurrentCookieId || !session?.chat_id) return false;
+    const cacheKey = buildChatUserInfoCacheKey(chatCurrentCookieId, session.chat_id);
+    const cached = chatUserInfoCache[cacheKey];
+    if (cached?.__miss && Date.now() - Number(cached.cachedAt || 0) < CHAT_USER_INFO_MISS_TTL_MS) return false;
+
+    const displayName = resolveSessionDisplayName(session);
+    return !session.avatar || !isValidChatDisplayName(displayName);
+}
+
+function syncActiveChatHeaderName() {
+    if (!chatCurrentChatId) return;
+    const currentSession = chatSessionsCache.find(session => session.chat_id === chatCurrentChatId);
+    if (!currentSession) return;
+    chatCurrentSenderName = resolveSessionDisplayName(currentSession);
+    const headerName = document.getElementById('chatHeaderName');
+    if (headerName) headerName.textContent = chatCurrentSenderName;
+}
+
+function getChatBlacklistScopeLabel(scope) {
+    return { item: '商品级', account: '账号级', user: '用户级' }[scope] || '其他范围';
+}
+
+function resetChatBlacklistState() {
+    chatBlacklistState = { loading: false, blacklisted: false, can_unblock: false, scope: '', record: null, account_record: null };
+    renderChatBlacklistButton();
+}
+
+function renderChatBlacklistButton() {
+    const btn = document.getElementById('chatBlacklistBtn');
+    const text = document.getElementById('chatBlacklistBtnText');
+    if (!btn) return;
+
+    const hasBuyer = Boolean(chatCurrentCookieId && chatCurrentChatId && chatCurrentToUserId);
+    btn.classList.remove('btn-outline-danger', 'btn-danger', 'btn-outline-secondary', 'btn-outline-warning');
+
+    if (!hasBuyer) {
+        btn.disabled = true;
+        btn.title = '缺少买家ID，无法拉黑';
+        btn.classList.add('btn-outline-secondary');
+        btn.innerHTML = '<i class="bi bi-person-slash"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">拉黑</span>';
+        return;
+    }
+
+    if (chatBlacklistState.loading) {
+        btn.disabled = true;
+        btn.title = '正在查询黑名单状态';
+        btn.classList.add('btn-outline-secondary');
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">检查中</span>';
+        return;
+    }
+
+    if (chatBlacklistState.blacklisted) {
+        if (chatBlacklistState.can_unblock) {
+            btn.disabled = false;
+            btn.title = '解除当前账号级黑名单';
+            btn.classList.add('btn-outline-warning');
+            btn.innerHTML = '<i class="bi bi-person-check"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">解除拉黑</span>';
+        } else {
+            btn.disabled = true;
+            btn.title = `已命中${getChatBlacklistScopeLabel(chatBlacklistState.scope)}黑名单，请到黑名单管理解除`;
+            btn.classList.add('btn-outline-secondary');
+            btn.innerHTML = '<i class="bi bi-shield-lock"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">已拉黑</span>';
+        }
+        return;
+    }
+
+    btn.disabled = false;
+    btn.title = '将当前买家加入当前账号黑名单';
+    btn.classList.add('btn-outline-danger');
+    btn.innerHTML = '<i class="bi bi-person-slash"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">拉黑</span>';
+    if (text) text.textContent = '拉黑';
+}
+
+async function refreshChatBlacklistStatus() {
+    if (!chatCurrentCookieId || !chatCurrentToUserId) {
+        resetChatBlacklistState();
+        return;
+    }
+
+    const cookieId = chatCurrentCookieId;
+    const buyerId = chatCurrentToUserId;
+    chatBlacklistState = { ...chatBlacklistState, loading: true };
+    renderChatBlacklistButton();
+
+    try {
+        const token = getAuthToken();
+        const response = await fetch(`${apiBase}/api/chat/blacklist-status?cookie_id=${encodeURIComponent(cookieId)}&buyer_id=${encodeURIComponent(buyerId)}`, {
+            headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+            cache: 'no-store',
+        });
+        if (response.status === 401) {
+            stopChatStream();
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        if (cookieId !== chatCurrentCookieId || buyerId !== chatCurrentToUserId) return;
+        const data = result?.data || {};
+        chatBlacklistState = {
+            loading: false,
+            blacklisted: Boolean(data.blacklisted),
+            can_unblock: Boolean(data.can_unblock),
+            scope: data.scope || '',
+            record: data.record || null,
+            account_record: data.account_record || null,
+        };
+    } catch (error) {
+        console.debug('查询客服黑名单状态失败:', error);
+        chatBlacklistState = { ...chatBlacklistState, loading: false };
+    }
+    renderChatBlacklistButton();
+}
+
+async function toggleChatBlacklist() {
+    if (!chatCurrentCookieId || !chatCurrentToUserId) {
+        showToast('当前会话缺少买家ID，无法拉黑', 'warning');
+        return;
+    }
+    if (chatBlacklistState.blacklisted && !chatBlacklistState.can_unblock) {
+        showToast(`该买家命中${getChatBlacklistScopeLabel(chatBlacklistState.scope)}黑名单，请到黑名单管理解除`, 'warning');
+        return;
+    }
+
+    const action = chatBlacklistState.blacklisted ? 'unblock' : 'block';
+    const actionLabel = action === 'block' ? '拉黑' : '解除拉黑';
+    const confirmMessage = action === 'block'
+        ? `确认将买家 ${chatCurrentSenderName || chatCurrentToUserId} 加入当前账号黑名单吗？\n\n加入后自动回复、客服发送和发货流程都会拦截该买家。`
+        : `确认解除买家 ${chatCurrentSenderName || chatCurrentToUserId} 的当前账号黑名单吗？`;
+    if (!window.confirm(confirmMessage)) return;
+
+    chatBlacklistState = { ...chatBlacklistState, loading: true };
+    renderChatBlacklistButton();
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/blacklist-toggle`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                cookie_id: chatCurrentCookieId,
+                buyer_id: chatCurrentToUserId,
+                buyer_nick: chatCurrentSenderName || '',
+                action,
+                reason: '在线客服手动拉黑',
+            }),
+        });
+        const data = result?.data || {};
+        chatBlacklistState = {
+            loading: false,
+            blacklisted: Boolean(data.blacklisted),
+            can_unblock: Boolean(data.can_unblock),
+            scope: data.scope || '',
+            record: data.record || null,
+            account_record: data.account_record || null,
+        };
+        showToast(result.message || `${actionLabel}成功`, result.success === false ? 'warning' : 'success');
+    } catch (error) {
+        console.error(`${actionLabel}失败:`, error);
+        chatBlacklistState = { ...chatBlacklistState, loading: false };
+        showToast(`${actionLabel}失败`, 'danger');
+    }
+    renderChatBlacklistButton();
+}
+
+function rerenderChatSessionsAfterUserInfoUpdate() {
+    syncActiveChatHeaderName();
+    const keyword = String(document.getElementById('chatSearchInput')?.value || '').trim();
+    if (keyword) {
+        filterChatSessions();
+    } else {
+        renderChatSessions(chatSessionsCache);
+    }
+}
+
+function applyChatUserInfosToSessions(users) {
+    if (!users || typeof users !== 'object') return false;
+    let changed = false;
+    chatSessionsCache = chatSessionsCache.map(session => {
+        const chatId = String(session?.chat_id || '').trim().replace(/@goofish$/i, '');
+        const info = users[chatId];
+        if (!info) return session;
+        const result = applyChatUserInfoToSession(session, info);
+        changed = changed || result.changed;
+        return result.session;
+    });
+    if (changed) {
+        rerenderChatSessionsAfterUserInfoUpdate();
+    }
+    return changed;
+}
+
+function scheduleChatUserInfoHydration(sessions) {
+    if (chatUserInfoHydrationTimer) {
+        clearTimeout(chatUserInfoHydrationTimer);
+    }
+    chatUserInfoHydrationTimer = setTimeout(() => {
+        chatUserInfoHydrationTimer = null;
+        hydrateChatUserInfos(sessions);
+    }, 120);
+}
+
+async function hydrateChatUserInfos(sessions) {
+    if (!chatCurrentCookieId || !Array.isArray(sessions) || !sessions.length) return;
+    if (applyCachedChatUserInfosToSessions()) {
+        rerenderChatSessionsAfterUserInfoUpdate();
+        return;
+    }
+
+    const seen = new Set();
+    const queries = [];
+    for (const session of sessions) {
+        const chatId = String(session?.chat_id || '').trim().replace(/@goofish$/i, '');
+        if (!chatId || seen.has(chatId) || !shouldHydrateChatSessionUserInfo(session)) continue;
+        seen.add(chatId);
+        queries.push({
+            chat_id: chatId,
+            sender_id: session.sender_id || session.buyer_id || '',
+            buyer_id: session.buyer_id || '',
+            sender_name: session.sender_name || '',
+            buyer_name: session.buyer_name || session.buyer_name_resolved || session.fish_nick || '',
+            session_type: session.session_type || 1,
+            message_id: session.message_id || '',
+        });
+        if (queries.length >= 24) break;
+    }
+    if (!queries.length) return;
+
+    try {
+        const token = getAuthToken();
+        const response = await fetch(`${apiBase}/api/chat/avatars`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({ cookie_id: chatCurrentCookieId, queries }),
+        });
+        if (response.status === 401) {
+            stopChatStream();
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+        if (!response.ok) return;
+        const result = await response.json();
+        const users = result?.users || {};
+        const now = Date.now();
+
+        queries.forEach(query => {
+            const chatId = String(query.chat_id || '').trim();
+            const cacheKey = buildChatUserInfoCacheKey(chatCurrentCookieId, chatId);
+            const info = users[chatId];
+            chatUserInfoCache[cacheKey] = info && (info.avatar || info.fish_nick || info.buyer_name_resolved)
+                ? { ...info, cachedAt: now }
+                : { __miss: true, cachedAt: now };
+        });
+
+        applyChatUserInfosToSessions(users);
+    } catch (error) {
+        console.debug('批量补全客服头像失败:', error);
+    }
+}
+
+function resolveSessionMessagePreview(session) {
+    const messagePreview = normalizeChatSessionPreview(session?.content, session?.content_type);
+    if (messagePreview && messagePreview !== '[系统/占位消息]' && messagePreview !== '[暂无文本内容]') {
+        return messagePreview;
+    }
+    return '';
+}
+
 function resolveSessionPreview(session) {
-    return session?.item_title
+    return resolveSessionMessagePreview(session)
         || session?.order_status_name
-        || normalizeChatSessionPreview(session?.content, session?.content_type);
+        || session?.item_title
+        || '[暂无文本内容]';
+}
+
+function resolveSessionSubMeta(session) {
+    const preview = resolveSessionPreview(session);
+    const parts = [];
+    [session?.item_title, session?.order_status_name, session?.item_tips].forEach(value => {
+        const text = String(value || '').trim();
+        if (text && text !== preview && !parts.includes(text)) {
+            parts.push(text);
+        }
+    });
+    return parts.join(' · ');
 }
 
 function getChatSessionState(session) {
     return {
         tag: '',
         preview: resolveSessionPreview(session),
-        submeta: session?.order_status_name || session?.item_tips || '',
+        submeta: resolveSessionSubMeta(session),
         className: ''
     };
 }
@@ -23367,9 +24208,9 @@ function scoreChatSession(session) {
 
 function sortChatSessions(sessions) {
     return [...(sessions || [])].sort((a, b) => {
-        const scoreDiff = scoreChatSession(b) - scoreChatSession(a);
-        if (scoreDiff !== 0) return scoreDiff;
-        return String(b?.created_at || '').localeCompare(String(a?.created_at || ''));
+        const timeDiff = String(b?.created_at || b?.lastMessageTime || '').localeCompare(String(a?.created_at || a?.lastMessageTime || ''));
+        if (timeDiff !== 0) return timeDiff;
+        return scoreChatSession(b) - scoreChatSession(a);
     });
 }
 
@@ -23461,12 +24302,17 @@ async function toggleChatAccountConnection(cookieId, disconnect = false) {
 }
 
 async function selectChatAccount(cookieId) {
+    if (chatUserInfoHydrationTimer) {
+        clearTimeout(chatUserInfoHydrationTimer);
+        chatUserInfoHydrationTimer = null;
+    }
     chatCurrentCookieId = cookieId;
     chatCurrentAccount = chatAccountsCache.find(account => account.id === cookieId) || null;
     chatCurrentChatId = '';
     chatCurrentToUserId = '';
     chatCurrentSenderName = '';
     chatCurrentItemId = '';
+    resetChatBlacklistState();
     chatSessionsNextCursor = null;
     chatSessionsHasMore = false;
     chatMessagesNextCursor = null;
@@ -23587,7 +24433,7 @@ function renderChatSessions(sessions) {
         const avatar = resolveSessionAvatar(session);
         const sessionState = getChatSessionState(session);
         const preview = String(sessionState.preview || resolveSessionPreview(session)).substring(0, 42);
-        const baseSubMeta = String(sessionState.submeta || session.item_title || '').trim();
+        const baseSubMeta = String(sessionState.submeta || '').trim();
         const priceMeta = session.item_price ? `<span class="chat-session-price">￥${escapeHtml(String(session.item_price))}</span>` : '';
         const unread = Number(session.unread_count || 0);
         const sourceTag = session.source === 'remote_im' ? '<span class="chat-session-source">IM</span>' : '';
@@ -23615,6 +24461,7 @@ function renderChatSessions(sessions) {
         more.onclick = loadMoreChatSessions;
         body.appendChild(more);
     }
+    scheduleChatUserInfoHydration(sessions);
 }
 
 function mergeHydrationFallbackSessions() {
@@ -23683,9 +24530,17 @@ async function selectChatSession(session) {
     const headerName = document.getElementById('chatHeaderName');
     if (headerName) headerName.textContent = chatCurrentSenderName;
     updateChatHeaderMeta(session);
+    resetChatBlacklistState();
+    renderChatBlacklistButton();
+    if (chatCurrentToUserId) {
+        refreshChatBlacklistStatus();
+    }
 
     renderChatSessions(chatSessionsCache);
     await loadChatMessages(false);
+    if (chatCurrentToUserId) {
+        refreshChatBlacklistStatus();
+    }
 
     if (!document.getElementById('chatReplyPanel')?.classList.contains('d-none') && chatCurrentItemId) {
         await loadItemKeywords();

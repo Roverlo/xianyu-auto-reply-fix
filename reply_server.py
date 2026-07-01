@@ -30,6 +30,7 @@ from config import RISK_CONTROL
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from blacklist_service import blacklist_service
+from message_filter_service import message_filter_service
 from utils.qr_login import qr_login_manager
 from utils.qr_login_lite import qrcode_login_lite
 from utils.xianyu_utils import trans_cookies
@@ -129,6 +130,8 @@ ORDER_STATUS_ALIASES = {
     '待付款': 'pending_payment',
     '待发货': 'pending_ship',
     '部分发货': 'partial_success',
+    '待补确认': 'partial_pending_finalize',
+    '卡券已发出、平台确认失败、等待补确认': 'partial_pending_finalize',
     '部分待收尾': 'partial_pending_finalize',
     '已发货': 'shipped',
     '已完成': 'completed',
@@ -1060,6 +1063,48 @@ def _format_blacklist_block_message(hit: Dict[str, Any]) -> str:
     return f"买家 {hit.get('buyer_id') or ''} 命中{scope_label}黑名单{reason_part}，已拦截"
 
 
+def _find_exact_account_blacklist_record(user_id: int, buyer_id: str, cookie_id: str) -> Optional[Dict[str, Any]]:
+    """查找当前账号维度的个人黑名单记录（包含禁用记录）。"""
+    normalized_buyer_id = str(buyer_id or '').strip()
+    normalized_cookie_id = str(cookie_id or '').strip()
+    if not user_id or not normalized_buyer_id or not normalized_cookie_id:
+        return None
+
+    result = blacklist_service.list_personal(
+        user_id=user_id,
+        buyer_id=normalized_buyer_id,
+        page=1,
+        page_size=200,
+    )
+    for record in result.get('data') or []:
+        if (
+            str(record.get('buyer_id') or '').strip() == normalized_buyer_id
+            and str(record.get('cookie_id') or '').strip() == normalized_cookie_id
+            and not str(record.get('item_id') or '').strip()
+        ):
+            return record
+    return None
+
+
+def _build_chat_blacklist_status(user_id: int, buyer_id: str, cookie_id: str) -> Dict[str, Any]:
+    normalized_buyer_id = str(buyer_id or '').strip()
+    normalized_cookie_id = str(cookie_id or '').strip()
+    exact_record = _find_exact_account_blacklist_record(user_id, normalized_buyer_id, normalized_cookie_id)
+    effective_hit = blacklist_service.is_buyer_blacklisted(
+        user_id=user_id,
+        buyer_id=normalized_buyer_id,
+        cookie_id=normalized_cookie_id,
+    )
+    exact_enabled = bool(exact_record and exact_record.get('is_enabled'))
+    return {
+        'blacklisted': bool(effective_hit),
+        'can_unblock': exact_enabled,
+        'scope': (effective_hit or {}).get('scope'),
+        'record': effective_hit,
+        'account_record': exact_record,
+    }
+
+
 def match_reply(cookie_id: str, message: str) -> Optional[str]:
     """根据 cookie_id 及消息内容匹配回复
     只有启用的账号才会匹配关键字回复
@@ -1103,6 +1148,24 @@ class ResponseData(BaseModel):
 class ResponseModel(BaseModel):
     code: int
     data: ResponseData
+
+
+class MessageFilterRuleRequest(BaseModel):
+    name: str
+    patterns: Any
+    cookie_id: Optional[str] = None
+    item_id: Optional[str] = None
+    match_type: str = 'contains'
+    message_source: str = 'user'
+    is_enabled: bool = True
+    action_skip_auto_reply: bool = True
+    action_skip_ai_reply: bool = False
+    action_pause_minutes: int = 0
+    action_notify: bool = False
+
+
+class MessageFilterToggleRequest(BaseModel):
+    is_enabled: bool
 
 
 class PersonalBlacklistCreateRequest(BaseModel):
@@ -2516,6 +2579,115 @@ async def xianyu_reply(req: RequestModel):
     return {"code": 200, "data": {"send_msg": send_msg}}
 
 
+# ------------------------- 消息过滤规则接口 -------------------------
+
+
+def _normalize_message_filter_payload(request: MessageFilterRuleRequest, current_user: Dict[str, Any]) -> Dict[str, Any]:
+    payload = request.dict()
+    cookie_id = str(payload.get('cookie_id') or '').strip()
+    if cookie_id:
+        payload['cookie_id'] = _ensure_cookie_access(cookie_id, current_user)
+    else:
+        payload['cookie_id'] = None
+    payload['item_id'] = str(payload.get('item_id') or '').strip() or None
+    return payload
+
+
+@app.get('/api/message-filters')
+def get_message_filters(
+    keyword: str = None,
+    page: int = 1,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        result = message_filter_service.list_rules(
+            user_id=current_user['user_id'],
+            keyword=keyword,
+            page=page,
+            page_size=page_size,
+        )
+        return {'success': True, **result}
+    except Exception as e:
+        log_with_user('error', f"查询消息过滤规则失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='查询消息过滤规则失败')
+
+
+@app.post('/api/message-filters')
+def create_message_filter(
+    request: MessageFilterRuleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        payload = _normalize_message_filter_payload(request, current_user)
+        record = message_filter_service.create_rule(current_user['user_id'], payload)
+        log_with_user('info', f"新增消息过滤规则: {record.get('name') or ''}", current_user)
+        return {'success': True, 'message': '消息过滤规则已保存', 'data': record}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log_with_user('error', f"新增消息过滤规则失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='新增消息过滤规则失败')
+
+
+@app.put('/api/message-filters/{rule_id}')
+def update_message_filter(
+    rule_id: int,
+    request: MessageFilterRuleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        payload = _normalize_message_filter_payload(request, current_user)
+        record = message_filter_service.update_rule(rule_id, current_user['user_id'], payload)
+        if not record:
+            raise HTTPException(status_code=404, detail='消息过滤规则不存在')
+        return {'success': True, 'message': '消息过滤规则已更新', 'data': record}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log_with_user('error', f"更新消息过滤规则失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='更新消息过滤规则失败')
+
+
+@app.patch('/api/message-filters/{rule_id}/toggle')
+def toggle_message_filter(
+    rule_id: int,
+    request: MessageFilterToggleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        success = message_filter_service.toggle_rule(rule_id, current_user['user_id'], request.is_enabled)
+        if not success:
+            raise HTTPException(status_code=404, detail='消息过滤规则不存在')
+        return {'success': True, 'message': '状态已更新'}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"更新消息过滤规则状态失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='更新消息过滤规则状态失败')
+
+
+@app.delete('/api/message-filters/{rule_id}')
+def delete_message_filter(
+    rule_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        success = message_filter_service.delete_rule(rule_id, current_user['user_id'])
+        if not success:
+            raise HTTPException(status_code=404, detail='消息过滤规则不存在')
+        return {'success': True, 'message': '删除成功'}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"删除消息过滤规则失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='删除消息过滤规则失败')
+
+
 # ------------------------- 黑名单接口 -------------------------
 
 
@@ -2764,6 +2936,29 @@ class ChatSendRequest(BaseModel):
     message: str
 
 
+class ChatAvatarQuery(BaseModel):
+    chat_id: str
+    sender_id: Optional[str] = None
+    buyer_id: Optional[str] = None
+    sender_name: Optional[str] = None
+    buyer_name: Optional[str] = None
+    session_type: Optional[int] = 1
+    message_id: Optional[str] = None
+
+
+class ChatAvatarBatchRequest(BaseModel):
+    cookie_id: str
+    queries: List[ChatAvatarQuery] = []
+
+
+class ChatBlacklistToggleRequest(BaseModel):
+    cookie_id: str
+    buyer_id: str
+    buyer_nick: Optional[str] = ''
+    action: str
+    reason: Optional[str] = ''
+
+
 class SaveItemKeywordsRequest(BaseModel):
     keywords: list
     item_reply: Optional[str] = None
@@ -2794,6 +2989,9 @@ class ChatHydrationDebug(BaseModel):
 
 _chat_session_enrichment_cache: Dict[str, Dict[str, Any]] = {}
 _CHAT_SESSION_ENRICHMENT_TTL_SECONDS = 180
+_chat_user_info_cache: Dict[str, Dict[str, Any]] = {}
+_CHAT_USER_INFO_TTL_SECONDS = 24 * 60 * 60
+_CHAT_USER_INFO_MISS_TTL_SECONDS = 10 * 60
 _chat_history_probe_cache: Dict[str, Dict[str, Any]] = {}
 _CHAT_HISTORY_PROBE_TTL_SECONDS = 6 * 60 * 60
 
@@ -2915,6 +3113,120 @@ def _set_cached_chat_session_enrichment(cache_key: str, value: Dict[str, Any]) -
     }
 
 
+def _build_chat_user_info_cache_key(cookie_id: str, session_id: str, session_type: int = 1, is_owner: bool = False) -> str:
+    return f"{str(cookie_id or '').strip()}:{_clean_goofish_id(session_id)}:{int(session_type or 1)}:{1 if is_owner else 0}"
+
+
+def _get_cached_chat_user_info(cache_key: str) -> Optional[Dict[str, Any]]:
+    cached = _chat_user_info_cache.get(cache_key)
+    if not cached:
+        return None
+
+    ttl = _CHAT_USER_INFO_MISS_TTL_SECONDS if cached.get('miss') else _CHAT_USER_INFO_TTL_SECONDS
+    if (time.time() - float(cached.get('cached_at') or 0)) > ttl:
+        _chat_user_info_cache.pop(cache_key, None)
+        return None
+
+    return {} if cached.get('miss') else dict(cached.get('value') or {})
+
+
+def _set_cached_chat_user_info(cache_key: str, value: Optional[Dict[str, Any]] = None, *, miss: bool = False) -> None:
+    _chat_user_info_cache[cache_key] = {
+        'cached_at': time.time(),
+        'value': dict(value or {}),
+        'miss': bool(miss),
+    }
+
+
+def _normalize_chat_user_info_enrichment(user_info: Dict[str, Any], *, fallback_name: Any = None, sender_id: Any = None) -> Dict[str, Any]:
+    if not isinstance(user_info, dict):
+        user_info = {}
+
+    nick = (
+        user_info.get('fishNick')
+        or user_info.get('nick')
+        or user_info.get('nickName')
+        or user_info.get('displayName')
+        or ''
+    )
+    if not _is_valid_chat_display_name(nick) and _is_valid_chat_display_name(fallback_name):
+        nick = str(fallback_name).strip()
+
+    avatar = user_info.get('logo') or user_info.get('avatar') or user_info.get('avatarUrl') or ''
+    cleaned_sender_id = _clean_goofish_id(sender_id)
+
+    enriched: Dict[str, Any] = {}
+    if avatar:
+        enriched['avatar'] = avatar
+    if _is_valid_chat_display_name(nick):
+        enriched['fish_nick'] = str(nick).strip()
+        enriched['buyer_name_resolved'] = str(nick).strip()
+    user_ext = _compact_chat_user_ext(user_info.get('ext'))
+    if user_ext:
+        enriched['user_ext'] = user_ext
+    if cleaned_sender_id:
+        enriched['sender_id'] = cleaned_sender_id
+    return enriched
+
+
+async def _fetch_chat_user_info_enrichment(
+    cookie_id: str,
+    session_id: str,
+    *,
+    session_type: int = 1,
+    is_owner: bool = False,
+    message_id: Optional[str] = None,
+    live_instance: Any = None,
+    fallback_name: Any = None,
+    sender_id: Any = None,
+) -> Dict[str, Any]:
+    session_id = _clean_goofish_id(session_id)
+    if not cookie_id or not session_id:
+        return {}
+
+    try:
+        normalized_session_type = int(session_type or 1)
+    except (TypeError, ValueError):
+        normalized_session_type = 1
+
+    cache_key = _build_chat_user_info_cache_key(cookie_id, session_id, normalized_session_type, is_owner=is_owner)
+    cached = _get_cached_chat_user_info(cache_key)
+    if cached is not None:
+        if cached and _clean_goofish_id(sender_id) and not cached.get('sender_id'):
+            cached = {**cached, 'sender_id': _clean_goofish_id(sender_id)}
+        return cached
+
+    live_instance = live_instance or _get_chat_live_instance(cookie_id)
+    if not live_instance:
+        return {}
+
+    try:
+        user_info_result = await _run_live_instance_on_manager_loop(
+            cookie_id,
+            lambda: live_instance.fetch_im_user_info(
+                session_id=session_id,
+                session_type=normalized_session_type,
+                is_owner=is_owner,
+                message_id=message_id or None,
+            ),
+            timeout=20,
+        )
+        user_info = user_info_result.get('userInfo', {}) if isinstance(user_info_result, dict) else {}
+        enriched = _normalize_chat_user_info_enrichment(
+            user_info,
+            fallback_name=fallback_name,
+            sender_id=sender_id,
+        )
+        if enriched:
+            _set_cached_chat_user_info(cache_key, enriched)
+        else:
+            _set_cached_chat_user_info(cache_key, miss=True)
+        return enriched
+    except Exception as e:
+        logger.debug(f"会话用户信息批量补全失败: cookie_id={cookie_id}, session_id={session_id}, error={mask_sensitive_text(e)}")
+        return {}
+
+
 async def _enrich_single_chat_session(cookie_id: str, session: Dict[str, Any]) -> Dict[str, Any]:
     from XianyuAutoAsync import XianyuLive
 
@@ -2938,21 +3250,17 @@ async def _enrich_single_chat_session(cookie_id: str, session: Dict[str, Any]) -
     enriched: Dict[str, Any] = {}
 
     try:
-        user_info_result = await live_instance.fetch_im_user_info(
-            session_id=session_id,
+        user_enrichment = await _fetch_chat_user_info_enrichment(
+            cookie_id,
+            session_id,
             session_type=session_type,
-            is_owner=False,
+            live_instance=live_instance,
+            fallback_name=session.get('buyer_name') or session.get('sender_name'),
+            sender_id=sender_id or session.get('sender_id'),
             message_id=session.get('message_id') or None,
         )
-        user_info = user_info_result.get('userInfo', {}) if isinstance(user_info_result, dict) else {}
-        if user_info:
-            enriched.update({
-                'avatar': user_info.get('logo'),
-                'fish_nick': user_info.get('fishNick') or user_info.get('nick') or session.get('buyer_name') or session.get('sender_name'),
-                'user_ext': _compact_chat_user_ext(user_info.get('ext')),
-                'buyer_name_resolved': user_info.get('fishNick') or user_info.get('nick') or session.get('buyer_name'),
-                'sender_id': sender_id or session.get('sender_id'),
-            })
+        if user_enrichment:
+            enriched.update(user_enrichment)
     except Exception as e:
         logger.debug(f"会话用户信息增强失败: cookie_id={cookie_id}, session_id={session_id}, error={mask_sensitive_text(e)}")
 
@@ -13281,6 +13589,22 @@ def get_user_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
             for order in orders:
                 order['cookie_id'] = cookie_id
                 order['is_owned_item'] = str(order.get('item_id') or '') in owned_item_ids
+                if normalize_order_status_value(order.get('order_status')) == 'partial_pending_finalize':
+                    pending_states = db_manager.get_pending_platform_confirm_states(
+                        cookie_id=cookie_id,
+                        order_id=order.get('order_id'),
+                        limit=20,
+                    )
+                    if pending_states:
+                        pending_errors = []
+                        for state in pending_states:
+                            meta = state.get('delivery_meta') or {}
+                            error_text = meta.get('confirm_error') or state.get('last_error')
+                            if error_text and error_text not in pending_errors:
+                                pending_errors.append(error_text)
+                        order['pending_platform_confirm'] = True
+                        order['pending_confirm_units'] = len(pending_states)
+                        order['pending_confirm_error'] = '；'.join(pending_errors[:3]) if pending_errors else '平台确认发货失败，等待补确认'
                 all_orders.append(order)
 
         # 历史订单补录后优先按平台下单时间展示，回退到本地入库时间
@@ -14150,6 +14474,146 @@ async def get_chat_sessions(
         raise HTTPException(status_code=500, detail="获取会话列表失败")
 
 
+@app.get('/api/chat/blacklist-status')
+async def get_chat_blacklist_status(
+    cookie_id: str,
+    buyer_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """查询在线客服当前买家是否命中个人黑名单。"""
+    try:
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        normalized_buyer_id = str(buyer_id or '').strip()
+        if not normalized_buyer_id:
+            raise HTTPException(status_code=400, detail='缺少买家ID')
+        status_payload = _build_chat_blacklist_status(current_user['user_id'], normalized_buyer_id, cookie_id)
+        return {'success': True, 'data': status_payload}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"查询客服黑名单状态失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail='查询客服黑名单状态失败')
+
+
+@app.post('/api/chat/blacklist-toggle')
+async def toggle_chat_blacklist(
+    req: ChatBlacklistToggleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """在线客服一键加入/解除当前账号维度的个人黑名单。"""
+    try:
+        cookie_id = _ensure_cookie_access(req.cookie_id, current_user)
+        buyer_id = str(req.buyer_id or '').strip()
+        if not buyer_id:
+            raise HTTPException(status_code=400, detail='缺少买家ID')
+
+        action = str(req.action or '').strip().lower()
+        if action not in {'block', 'unblock'}:
+            raise HTTPException(status_code=400, detail='无效操作')
+
+        user_id = current_user['user_id']
+        exact_record = _find_exact_account_blacklist_record(user_id, buyer_id, cookie_id)
+
+        if action == 'block':
+            if exact_record:
+                if not exact_record.get('is_enabled'):
+                    blacklist_service.toggle_personal(int(exact_record['id']), user_id, True)
+                message = '已加入当前账号黑名单'
+            else:
+                reason = str(req.reason or '').strip() or '在线客服手动拉黑'
+                result = blacklist_service.create_personal(
+                    user_id=user_id,
+                    buyer_ids=[buyer_id],
+                    cookie_id=cookie_id,
+                    buyer_nick=str(req.buyer_nick or '').strip(),
+                    reason=reason,
+                    is_enabled=True,
+                )
+                if int(result.get('created') or 0) <= 0 and int(result.get('skipped') or 0) <= 0:
+                    raise HTTPException(status_code=500, detail='加入黑名单失败')
+                message = '已加入当前账号黑名单'
+            log_with_user('info', f"客服会话拉黑买家: cookie_id={cookie_id}, buyer_id={buyer_id}", current_user)
+        else:
+            if not exact_record:
+                status_payload = _build_chat_blacklist_status(user_id, buyer_id, cookie_id)
+                scope_label = {'item': '商品级', 'account': '账号级', 'user': '用户级'}.get(status_payload.get('scope'), '其他范围')
+                return {
+                    'success': False,
+                    'message': f'未找到当前账号级黑名单记录；如仍显示已拉黑，可能命中{scope_label}黑名单，请到黑名单管理解除',
+                    'data': status_payload,
+                }
+            blacklist_service.toggle_personal(int(exact_record['id']), user_id, False)
+            message = '已解除当前账号黑名单'
+            log_with_user('info', f"客服会话解除拉黑买家: cookie_id={cookie_id}, buyer_id={buyer_id}, record_id={exact_record.get('id')}", current_user)
+
+        status_payload = _build_chat_blacklist_status(user_id, buyer_id, cookie_id)
+        return {'success': True, 'message': message, 'data': status_payload}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"客服黑名单操作失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail='客服黑名单操作失败')
+
+
+@app.post('/api/chat/avatars')
+async def get_chat_avatar_infos(
+    req: ChatAvatarBatchRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """批量补全在线客服会话头像与真实昵称，供前端后台懒加载使用。"""
+    try:
+        cookie_id = _ensure_cookie_access(req.cookie_id, current_user)
+        live_instance = _get_chat_live_instance(cookie_id)
+        users: Dict[str, Dict[str, Any]] = {}
+        seen_session_ids = set()
+
+        for query in list(req.queries or [])[:30]:
+            session_id = _clean_goofish_id(query.chat_id)
+            if not session_id or session_id in seen_session_ids:
+                continue
+            seen_session_ids.add(session_id)
+
+            try:
+                session_type = int(query.session_type or 1)
+            except (TypeError, ValueError):
+                session_type = 1
+
+            sender_id = _clean_goofish_id(query.sender_id or query.buyer_id)
+            fallback_name = query.buyer_name if _is_valid_chat_display_name(query.buyer_name) else query.sender_name
+            info = await _fetch_chat_user_info_enrichment(
+                cookie_id,
+                session_id,
+                session_type=session_type,
+                live_instance=live_instance,
+                fallback_name=fallback_name,
+                sender_id=sender_id,
+                message_id=query.message_id or None,
+            )
+            if not info:
+                continue
+
+            users[session_id] = {
+                'chat_id': session_id,
+                'avatar': info.get('avatar') or '',
+                'fish_nick': info.get('fish_nick') or '',
+                'buyer_name_resolved': info.get('buyer_name_resolved') or info.get('fish_nick') or '',
+                'sender_id': info.get('sender_id') or sender_id,
+            }
+
+        return {
+            'success': True,
+            'users': users,
+            'count': len(users),
+            'queried': len(seen_session_ids),
+            'runtime_status': _build_live_runtime_status(cookie_id),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"批量查询客服头像失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail="批量查询客服头像失败")
+
+
 @app.get('/api/chat/messages')
 async def get_chat_messages(
     cookie_id: str = None,
@@ -14493,6 +14957,60 @@ def delete_user_order(order_id: str, current_user: Dict[str, Any] = Depends(get_
         raise HTTPException(status_code=500, detail="删除订单失败，请稍后重试")
 
 
+@app.post('/api/orders/{order_id}/confirm-retry')
+async def retry_order_platform_confirm(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """只重试平台确认发货，不重复发送卡券。"""
+    try:
+        from db_manager import db_manager
+        import cookie_manager
+
+        user_id = current_user['user_id']
+        log_with_user('info', f"补确认发货请求: 订单 {order_id}", current_user)
+
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            return {"success": False, "confirmed": False, "message": "订单不存在"}
+
+        cookie_id = order.get('cookie_id')
+        if not cookie_id:
+            return {"success": False, "confirmed": False, "message": "订单缺少账号信息"}
+
+        cookie_info = db_manager.get_cookie_details(cookie_id)
+        if not cookie_info or cookie_info.get('user_id') != user_id:
+            return {"success": False, "confirmed": False, "message": "无权操作此订单"}
+
+        pending_states = db_manager.get_pending_platform_confirm_states(
+            cookie_id=cookie_id,
+            order_id=order_id,
+            limit=50,
+        )
+        if not pending_states:
+            return {"success": True, "confirmed": False, "message": "该订单没有待补确认记录"}
+
+        xianyu_instance = cookie_manager.manager.get_xianyu_instance(cookie_id) if cookie_manager.manager else None
+        if not xianyu_instance:
+            return {"success": False, "confirmed": False, "message": f"账号 {cookie_id} 未运行，请先启动账号"}
+
+        result = await xianyu_instance.retry_pending_platform_confirms(
+            order_id=order_id,
+            source='manual_confirm_retry',
+            limit=50,
+        )
+        publish_order_update_event(order_id, source='manual_confirm_retry')
+
+        return {
+            "success": bool(result.get('success')),
+            "confirmed": int(result.get('confirmed') or 0) > 0,
+            "message": result.get('message') or '补确认完成',
+            "data": result,
+        }
+    except Exception as e:
+        import traceback
+        log_with_user('error', f"补确认发货异常: 订单 {order_id} - {str(e)}", current_user)
+        logger.error(f"补确认发货异常: {traceback.format_exc()}")
+        return {"success": False, "confirmed": False, "message": f"补确认失败: {str(e)}"}
+
+
 @app.post('/api/orders/{order_id}/deliver')
 async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """手动发货 - 根据订单信息匹配发货规则并发送卡券"""
@@ -14581,16 +15099,28 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
                 item_id=item_id
             )
             if not finalize_result.get('success'):
-                xianyu_instance._persist_delivery_finalization_state(
-                    order_id=order_id,
-                    item_id=item_id,
-                    buyer_id=buyer_id,
-                    delivery_meta=pending_finalize_meta,
-                    channel='manual',
-                    status='sent',
-                    last_error=finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'
-                )
-                return {"success": False, "delivered": False, "message": finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'}
+                finalize_error = finalize_result.get('error') or f'检测到第 {unit_index} 个发货单元已发送记录，但补完成收尾失败'
+                if hasattr(xianyu_instance, '_is_platform_confirm_failure_error') and xianyu_instance._is_platform_confirm_failure_error(finalize_error):
+                    xianyu_instance._mark_delivery_pending_platform_confirm(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=pending_finalize_meta,
+                        confirm_error=finalize_error,
+                        expected_quantity=expected_quantity,
+                        context="手动发货补完成收尾时平台确认失败"
+                    )
+                else:
+                    xianyu_instance._persist_delivery_finalization_state(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        delivery_meta=pending_finalize_meta,
+                        channel='manual',
+                        status='sent',
+                        last_error=finalize_error
+                    )
+                return {"success": False, "delivered": False, "message": finalize_error}
 
             xianyu_instance._persist_delivery_finalization_state(
                 order_id=order_id,
@@ -15124,7 +15654,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
         if finalized_now:
             message_parts.append(f"本次补发成功 {len(finalized_now)} 个单元")
         if pending_finalize_now:
-            message_parts.append(f"仍有 {len(pending_finalize_now)} 个单元待收尾")
+            message_parts.append(f"仍有 {len(pending_finalize_now)} 个单元待补确认")
         if failed_now:
             message_parts.append(f"仍有 {len(failed_now)} 个单元补发失败")
 
@@ -15133,7 +15663,7 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
             message_parts.append(f"订单已全部完成（{progress_summary_after.get('finalized_count', 0)}/{expected_quantity}）")
         elif aggregate_status == 'partial_pending_finalize':
             message_parts.append(
-                f"订单当前为部分待收尾（已完成 {progress_summary_after.get('finalized_count', 0)}/{expected_quantity}，待收尾 {progress_summary_after.get('pending_finalize_count', 0)}）"
+                f"订单当前为待补确认（已完成 {progress_summary_after.get('finalized_count', 0)}/{expected_quantity}，待补确认 {progress_summary_after.get('pending_finalize_count', 0)}）"
             )
         elif aggregate_status == 'partial_success':
             message_parts.append(

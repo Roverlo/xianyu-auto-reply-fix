@@ -289,13 +289,18 @@ build/
 *.dmg
 *.img
 
-# 文档文件（除了README.md）
+# 文档文件（除了README.md和少量公开文档）
 *.md
 !README.md
 !CHANGELOG.md
 !CONTRIBUTING.md
 !SECURITY.md
 !LICENSE.md
+!docs/deployment.md
+!docs/configuration.md
+!docs/usage.md
+!docs/faq.md
+!docs/release.md
 
 # 临时配置文件
 *.local.yml

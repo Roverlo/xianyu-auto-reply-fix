@@ -170,18 +170,28 @@ class AutoReplyPauseManager:
             logger.error(f"获取账号 {cookie_id} 暂停时间失败: {e}，使用默认10分钟")
             pause_minutes = 10
 
-        # 如果暂停时间为0，表示不暂停
-        if pause_minutes == 0:
-            logger.info(f"【{cookie_id}】检测到手动发出消息，但暂停时间设置为0，不暂停自动回复")
+        self.pause_chat_for(chat_id, cookie_id, pause_minutes, reason="检测到手动发出消息")
+
+    def pause_chat_for(self, chat_id: str, cookie_id: str, pause_minutes: int, reason: str = "消息过滤规则"):
+        """按指定分钟数暂停自动回复。"""
+        try:
+            pause_minutes = int(pause_minutes or 0)
+        except (TypeError, ValueError):
+            pause_minutes = 0
+
+        if pause_minutes <= 0:
+            logger.info(f"【{cookie_id}】{reason}，但暂停时间为0，不暂停自动回复")
             return
 
-        pause_duration_seconds = pause_minutes * 60
-        pause_until = time.time() + pause_duration_seconds
-        self.paused_chats[chat_id] = pause_until
+        pause_until = time.time() + pause_minutes * 60
+        existing_until = self.paused_chats.get(chat_id, 0)
+        if existing_until and existing_until > pause_until:
+            logger.info(f"【{cookie_id}】{reason}，chat_id {chat_id} 已有更长暂停时间，保持原暂停")
+            return
 
-        # 计算暂停结束时间
+        self.paused_chats[chat_id] = pause_until
         end_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pause_until))
-        logger.info(f"【{cookie_id}】检测到手动发出消息，chat_id {chat_id} 自动回复暂停{pause_minutes}分钟，恢复时间: {end_time}")
+        logger.info(f"【{cookie_id}】{reason}，chat_id {chat_id} 自动回复暂停{pause_minutes}分钟，恢复时间: {end_time}")
 
     def is_chat_paused(self, chat_id: str) -> bool:
         """检查指定chat_id是否处于暂停状态"""
@@ -3751,6 +3761,11 @@ class XianyuLive:
         # 自动确认发货防重复机制
         self.confirmed_orders = {}  # 记录已确认发货的订单，防止重复确认
         self.order_confirm_cooldown = 600  # 10分钟内不重复确认同一订单
+        self.pending_platform_confirm_retry_lock = asyncio.Lock()  # 待补确认自动重试锁
+        self.last_pending_platform_confirm_retry_time = 0.0
+        self.pending_platform_confirm_retry_cooldown = 60  # 1分钟内不重复自动扫描待补确认订单
+        self.last_platform_confirm_auth_recovery_time = 0.0
+        self.platform_confirm_auth_recovery_cooldown = 300  # 5分钟内不重复触发确认发货失败后的认证恢复
 
         # 自动发货已发送订单记录
         self.delivery_sent_orders = set()  # 记录已发货的订单ID，防止重复发货
@@ -5270,7 +5285,8 @@ class XianyuLive:
         return f"{reason_text} [{', '.join(context_parts)}]"
 
     async def _finalize_delivery_after_send(self, delivery_meta: dict = None, order_id: str = None,
-                                            item_id: str = None, skip_confirm: bool = False):
+                                            item_id: str = None, skip_confirm: bool = False,
+                                            force_confirm: bool = False):
         """在消息发送成功后提交发货副作用：消费卡密、更新计数、确认发货。"""
         meta = delivery_meta or {}
 
@@ -5324,7 +5340,15 @@ class XianyuLive:
             db_manager.increment_delivery_times(rule_id)
 
         if order_id and not skip_confirm:
-            if not self.is_auto_confirm_enabled():
+            if not force_confirm and not self.is_auto_confirm_enabled():
+                if meta.get('pending_platform_confirm') or meta.get('confirm_retry_required'):
+                    return {
+                        'success': False,
+                        'error': '自动确认发货已关闭，无法补确认平台发货状态',
+                        'pending_confirm': True,
+                        'platform_confirm_failed': True,
+                        'confirm_retry_required': True,
+                    }
                 logger.info(f"自动确认发货已关闭，跳过订单 {order_id}")
             else:
                 current_time = time.time()
@@ -5343,9 +5367,19 @@ class XianyuLive:
                         self.confirmed_orders[order_id] = current_time
                         logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
                     else:
+                        confirm_error = confirm_result.get('error', '未知错误')
+                        stop_confirm_retry = self._is_non_retryable_platform_confirm_error(confirm_error, confirm_result)
                         return {
                             'success': False,
-                            'error': f"自动确认发货失败: {confirm_result.get('error', '未知错误')}"
+                            'error': f"自动确认发货失败: {confirm_error}",
+                            'pending_confirm': not stop_confirm_retry,
+                            'platform_confirm_failed': True,
+                            'confirm_retry_required': not stop_confirm_retry,
+                            'non_retryable_platform_confirm': stop_confirm_retry,
+                            'stop_confirm_retry': stop_confirm_retry,
+                            'session_expired': bool(confirm_result.get('session_expired')),
+                            'need_relogin': bool(confirm_result.get('need_relogin')),
+                            'confirm_result': confirm_result,
                         }
 
         if rule_id and consume_required and not reservation_already_finalized:
@@ -5506,6 +5540,420 @@ class XianyuLive:
             status='send_uncertain',
             last_error=last_error or 'IM发送确认后未完成可靠同步，已禁止自动重发'
         )
+
+    def _get_normalized_local_order_status(self, order_id: str) -> str:
+        if not order_id:
+            return ''
+        try:
+            from db_manager import db_manager
+            order = db_manager.get_order_by_id(order_id)
+            if not order:
+                return ''
+            return db_manager._normalize_order_status(order.get('order_status'))
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】读取本地订单状态失败: order_id={order_id}, error={self._safe_str(e)}")
+            return ''
+
+    def _is_platform_confirm_terminal_status(self, status: str) -> bool:
+        normalized = str(status or '').strip()
+        return normalized in {
+            'shipped',
+            'completed',
+            'cancelled',
+            'refunding',
+            'refund_cancelled',
+        }
+
+    def _is_non_retryable_platform_confirm_error(self, error: Any, confirm_result: Any = None) -> bool:
+        error_text = str(error or '')
+        if isinstance(confirm_result, dict) and (
+            confirm_result.get('order_status_error')
+            or confirm_result.get('non_retryable')
+            or confirm_result.get('stop_confirm_retry')
+        ):
+            return True
+        return 'ORDER_STATUS_ERROR' in error_text or '订单状态不正确' in error_text
+
+    def _mark_delivery_platform_confirm_no_longer_required(self, order_id: str, item_id: str, buyer_id: str,
+                                                           delivery_meta: dict = None, reason: str = '',
+                                                           channel: str = 'auto') -> None:
+        """平台已处于不可/无需补确认的终态时，清理待补确认，避免无限重试。"""
+        if not order_id:
+            return
+        meta = dict(delivery_meta or {})
+        meta.update({
+            'pending_confirm': False,
+            'pending_platform_confirm': False,
+            'confirm_retry_required': False,
+            'platform_confirm_status': 'not_required_terminal',
+            'confirm_retry_stopped': True,
+            'confirm_retry_stopped_reason': str(reason or '订单已处于平台终态，无需继续补确认'),
+            'confirm_retry_stopped_at': datetime.now().isoformat(timespec='seconds'),
+        })
+        self._persist_delivery_finalization_state(
+            order_id=order_id,
+            item_id=item_id,
+            buyer_id=buyer_id,
+            delivery_meta=meta,
+            channel=channel or 'auto',
+            status='finalized',
+            last_error=str(reason or '订单已处于平台终态，无需继续补确认'),
+        )
+        logger.warning(f"【{self.cookie_id}】订单 {order_id} 停止补确认重试: {reason or '订单已处于平台终态'}")
+
+    def _is_platform_confirm_failure_error(self, error: Any) -> bool:
+        """判断发送成功后的失败是否属于闲鱼平台确认发货失败。"""
+        error_text = str(error or '')
+        return any(keyword in error_text for keyword in (
+            '自动确认发货失败',
+            'FAIL_SYS_SESSION_EXPIRED',
+            'Session过期',
+            '令牌过期',
+            'TOKEN_EXPIRED',
+            'TOKEN_EXOIRED',
+        ))
+
+    def _is_platform_confirm_auth_error(self, error: Any) -> bool:
+        """判断确认发货失败是否明确需要恢复 Cookie/Token 登录态。"""
+        error_text = str(error or '')
+        return any(keyword in error_text for keyword in (
+            'FAIL_SYS_SESSION_EXPIRED',
+            'Session过期',
+            '令牌过期',
+            'FAIL_SYS_TOKEN_EXPIRED',
+            'FAIL_SYS_TOKEN_EXOIRED',
+            'TOKEN_EXPIRED',
+            'TOKEN_EXOIRED',
+        ))
+
+    def _schedule_auth_recovery_after_platform_confirm_failure(self, order_id: str = None, error: Any = None) -> None:
+        """确认发货因登录态失败时，后台触发认证恢复；恢复成功后会自动扫待补确认。"""
+        if not self._is_platform_confirm_auth_error(error):
+            return
+
+        current_time = time.time()
+        if current_time - self.last_platform_confirm_auth_recovery_time < self.platform_confirm_auth_recovery_cooldown:
+            logger.info(
+                f"【{self.cookie_id}】确认发货认证恢复仍在冷却期内，跳过重复触发: order_id={order_id}"
+            )
+            return
+        self.last_platform_confirm_auth_recovery_time = current_time
+
+        try:
+            self._create_tracked_task(
+                self._recover_auth_after_platform_confirm_failure(order_id=order_id, error=self._safe_str(error))
+            )
+        except RuntimeError:
+            return
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】调度确认发货认证恢复失败: {self._safe_str(e)}")
+
+    async def _recover_auth_after_platform_confirm_failure(self, order_id: str = None, error: str = '') -> None:
+        """确认发货 Session/Token 过期后的后台恢复流程。"""
+        try:
+            logger.warning(
+                f"【{self.cookie_id}】确认发货失败触发认证恢复: order_id={order_id}, error={error}"
+            )
+            await asyncio.sleep(1)
+            token = await self.refresh_token(captcha_retry_count=1, allow_password_login_recovery=True)
+            if token:
+                logger.info(f"【{self.cookie_id}】确认发货失败后的认证恢复成功，准备自动补确认: order_id={order_id}")
+                self._schedule_pending_platform_confirm_retry("确认发货认证恢复成功")
+            else:
+                logger.warning(
+                    f"【{self.cookie_id}】确认发货失败后的认证恢复未成功: "
+                    f"status={self.last_token_refresh_status}, error={self.last_token_refresh_error_message}"
+                )
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】确认发货失败后的认证恢复异常: {self._safe_str(e)}")
+
+    def _mark_delivery_pending_platform_confirm(self, order_id: str, item_id: str, buyer_id: str,
+                                                delivery_meta: dict = None, confirm_error: str = None,
+                                                expected_quantity: int = 1,
+                                                context: str = "平台确认发货失败，等待补确认",
+                                                channel: str = 'auto'):
+        """记录“卡券已发出、平台确认失败、等待补确认”的订单状态。"""
+        if not order_id:
+            return None
+
+        error_text = str(confirm_error or '平台确认发货失败').strip()
+        pending_reason = f"卡券已发出，平台确认发货失败，等待补确认: {error_text}"
+        meta = dict(delivery_meta or {})
+        meta.update({
+            'success': True,
+            'delivery_message_status': 'sent',
+            'platform_confirm_status': 'failed',
+            'pending_confirm': True,
+            'pending_platform_confirm': True,
+            'confirm_retry_required': True,
+            'confirm_error': error_text,
+            'confirm_failed_at': datetime.now().isoformat(timespec='seconds'),
+        })
+
+        self._persist_delivery_finalization_state(
+            order_id=order_id,
+            item_id=item_id,
+            buyer_id=buyer_id,
+            delivery_meta=meta,
+            channel=channel,
+            status='sent',
+            last_error=pending_reason
+        )
+        summary = self._sync_order_delivery_progress(
+            order_id=order_id,
+            cookie_id=self.cookie_id,
+            expected_quantity=expected_quantity,
+            context=context
+        )
+        logger.warning(f"【{self.cookie_id}】订单 {order_id} 已记录为：卡券已发出、平台确认失败、等待补确认。原因: {error_text}")
+        self._schedule_auth_recovery_after_platform_confirm_failure(order_id=order_id, error=error_text)
+        return summary
+
+    def _get_order_expected_delivery_quantity(self, order_id: str) -> int:
+        """获取订单应发货单元数，回退为已记录单元最大序号。"""
+        expected = 1
+        try:
+            from db_manager import db_manager
+            order = db_manager.get_order_by_id(order_id) if order_id else None
+            if order and order.get('quantity'):
+                expected = max(1, int(order.get('quantity') or 1))
+            states = db_manager.get_delivery_finalization_states(order_id) if order_id else []
+            for state in states:
+                try:
+                    expected = max(expected, int(state.get('unit_index') or 1))
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】获取订单应发数量失败: order_id={order_id}, error={self._safe_str(e)}")
+        return expected
+
+    async def retry_pending_platform_confirms(self, order_id: str = None, limit: int = 50,
+                                              source: str = 'manual') -> Dict[str, Any]:
+        """只重试平台确认发货，不重复发送卡券。"""
+        from db_manager import db_manager
+
+        if not order_id and source == 'auto':
+            current_time = time.time()
+            if current_time - self.last_pending_platform_confirm_retry_time < self.pending_platform_confirm_retry_cooldown:
+                return {
+                    'success': True,
+                    'processed': 0,
+                    'message': '待补确认自动扫描仍在冷却期内，已跳过'
+                }
+
+        async with self.pending_platform_confirm_retry_lock:
+            if not order_id and source == 'auto':
+                self.last_pending_platform_confirm_retry_time = time.time()
+
+            states = db_manager.get_pending_platform_confirm_states(
+                cookie_id=self.cookie_id,
+                order_id=order_id,
+                limit=limit,
+            )
+            if not states:
+                return {
+                    'success': True,
+                    'processed': 0,
+                    'confirmed': 0,
+                    'failed': 0,
+                    'message': '没有待补确认订单'
+                }
+
+            processed = 0
+            confirmed = 0
+            failed = 0
+            results = []
+            touched_orders = set()
+
+            for state in states:
+                state_order_id = state.get('order_id')
+                unit_index = int(state.get('unit_index') or 1)
+                state_item_id = state.get('item_id')
+                state_buyer_id = state.get('buyer_id')
+                meta = dict(state.get('delivery_meta') or {})
+                meta.setdefault('success', True)
+                meta['delivery_unit_index'] = unit_index
+                processed += 1
+
+                logger.info(
+                    f"【{self.cookie_id}】开始补确认发货: order_id={state_order_id}, "
+                    f"unit={unit_index}, source={source}"
+                )
+
+                local_order_status = self._get_normalized_local_order_status(state_order_id)
+                if self._is_platform_confirm_terminal_status(local_order_status):
+                    stop_reason = f"本地订单状态已是 {local_order_status}，无需继续补确认平台发货状态"
+                    self._mark_delivery_platform_confirm_no_longer_required(
+                        order_id=state_order_id,
+                        item_id=state_item_id,
+                        buyer_id=state_buyer_id,
+                        delivery_meta=meta,
+                        reason=stop_reason,
+                        channel=source or 'manual',
+                    )
+                    self._record_delivery_log(
+                        order_id=state_order_id,
+                        item_id=state_item_id,
+                        buyer_id=state_buyer_id,
+                        status='success',
+                        reason=f'停止补确认重试: {stop_reason}',
+                        channel=source or 'manual',
+                        rule_meta=meta,
+                    )
+                    confirmed += 1
+                    touched_orders.add(state_order_id)
+                    results.append({
+                        'order_id': state_order_id,
+                        'unit_index': unit_index,
+                        'success': True,
+                        'message': stop_reason,
+                        'stopped_retry': True,
+                    })
+                    continue
+
+                finalize_result = await self._finalize_delivery_after_send(
+                    delivery_meta=meta,
+                    order_id=state_order_id,
+                    item_id=state_item_id,
+                    force_confirm=True,
+                )
+                expected_quantity = self._get_order_expected_delivery_quantity(state_order_id)
+                touched_orders.add(state_order_id)
+
+                if finalize_result.get('success'):
+                    meta.update({
+                        'pending_confirm': False,
+                        'pending_platform_confirm': False,
+                        'confirm_retry_required': False,
+                        'platform_confirm_status': 'success',
+                        'confirm_success_at': datetime.now().isoformat(timespec='seconds'),
+                        'confirm_retry_source': source,
+                    })
+                    self._persist_delivery_finalization_state(
+                        order_id=state_order_id,
+                        item_id=state_item_id,
+                        buyer_id=state_buyer_id,
+                        delivery_meta=meta,
+                        channel=source or 'manual',
+                        status='finalized',
+                        last_error=None,
+                    )
+                    self._record_delivery_log(
+                        order_id=state_order_id,
+                        item_id=state_item_id,
+                        buyer_id=state_buyer_id,
+                        status='success',
+                        reason='待补确认订单平台确认发货成功',
+                        channel=source or 'manual',
+                        rule_meta=meta,
+                    )
+                    confirmed += 1
+                    results.append({
+                        'order_id': state_order_id,
+                        'unit_index': unit_index,
+                        'success': True,
+                        'message': '平台确认发货成功'
+                    })
+                else:
+                    error_text = finalize_result.get('error') or '平台确认发货仍失败'
+                    confirm_result = finalize_result.get('confirm_result') or {}
+                    if self._is_non_retryable_platform_confirm_error(error_text, confirm_result):
+                        stop_reason = f"平台返回订单状态不正确，停止补确认重试: {error_text}"
+                        self._mark_delivery_platform_confirm_no_longer_required(
+                            order_id=state_order_id,
+                            item_id=state_item_id,
+                            buyer_id=state_buyer_id,
+                            delivery_meta=meta,
+                            reason=stop_reason,
+                            channel=source or 'manual',
+                        )
+                        self._record_delivery_log(
+                            order_id=state_order_id,
+                            item_id=state_item_id,
+                            buyer_id=state_buyer_id,
+                            status='success',
+                            reason=f'停止补确认重试: {stop_reason}',
+                            channel=source or 'manual',
+                            rule_meta=meta,
+                        )
+                        confirmed += 1
+                        results.append({
+                            'order_id': state_order_id,
+                            'unit_index': unit_index,
+                            'success': True,
+                            'message': stop_reason,
+                            'stopped_retry': True,
+                        })
+                        continue
+
+                    self._mark_delivery_pending_platform_confirm(
+                        order_id=state_order_id,
+                        item_id=state_item_id,
+                        buyer_id=state_buyer_id,
+                        delivery_meta=meta,
+                        confirm_error=error_text,
+                        expected_quantity=expected_quantity,
+                        context=f"{source}补确认发货失败",
+                        channel=source or 'manual',
+                    )
+                    self._record_delivery_log(
+                        order_id=state_order_id,
+                        item_id=state_item_id,
+                        buyer_id=state_buyer_id,
+                        status='failed',
+                        reason=f'补确认发货失败: {error_text}',
+                        channel=source or 'manual',
+                        rule_meta=meta,
+                    )
+                    failed += 1
+                    results.append({
+                        'order_id': state_order_id,
+                        'unit_index': unit_index,
+                        'success': False,
+                        'message': error_text
+                    })
+
+            for touched_order_id in touched_orders:
+                try:
+                    self._sync_order_delivery_progress(
+                        order_id=touched_order_id,
+                        cookie_id=self.cookie_id,
+                        expected_quantity=self._get_order_expected_delivery_quantity(touched_order_id),
+                        context=f"{source}补确认发货后同步状态"
+                    )
+                except Exception as sync_e:
+                    logger.warning(f"【{self.cookie_id}】补确认后同步订单状态失败: order_id={touched_order_id}, error={self._safe_str(sync_e)}")
+
+            message = f"补确认完成：处理 {processed} 个，成功 {confirmed} 个，失败 {failed} 个"
+            logger.info(f"【{self.cookie_id}】{message}")
+            return {
+                'success': failed == 0,
+                'processed': processed,
+                'confirmed': confirmed,
+                'failed': failed,
+                'results': results,
+                'message': message,
+            }
+
+    def _schedule_pending_platform_confirm_retry(self, reason: str = '') -> None:
+        """认证恢复后异步触发待补确认扫描。"""
+        try:
+            if not self.background_tasks and not self.ws:
+                return
+            self._create_tracked_task(self._retry_pending_platform_confirms_later(reason=reason))
+        except RuntimeError:
+            return
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】调度待补确认扫描失败: {self._safe_str(e)}")
+
+    async def _retry_pending_platform_confirms_later(self, reason: str = '') -> None:
+        await asyncio.sleep(2)
+        try:
+            result = await self.retry_pending_platform_confirms(source='auto', limit=20)
+            if result.get('processed'):
+                logger.info(f"【{self.cookie_id}】认证恢复后自动补确认完成({reason or 'unknown'}): {result.get('message')}")
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】认证恢复后自动补确认异常: {self._safe_str(e)}")
 
     def _summarize_delivery_progress(self, order_id: str, expected_quantity: int = 1):
         if not order_id:
@@ -6539,21 +6987,33 @@ class XianyuLive:
                         item_id=item_id
                     )
                     if not finalize_result.get('success'):
-                        self._persist_delivery_finalization_state(
-                            order_id=order_id,
-                            item_id=item_id,
-                            buyer_id=user_id,
-                            delivery_meta=pending_finalize_meta,
-                            channel='auto',
-                            status='sent',
-                            last_error=finalize_result.get('error') or '补完成 finalize 失败'
-                        )
+                        finalize_error = finalize_result.get('error') or '补完成 finalize 失败'
+                        if self._is_platform_confirm_failure_error(finalize_error):
+                            self._mark_delivery_pending_platform_confirm(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                delivery_meta=pending_finalize_meta,
+                                confirm_error=finalize_error,
+                                expected_quantity=1,
+                                context="自动发货补完成收尾时平台确认失败"
+                            )
+                        else:
+                            self._persist_delivery_finalization_state(
+                                order_id=order_id,
+                                item_id=item_id,
+                                buyer_id=user_id,
+                                delivery_meta=pending_finalize_meta,
+                                channel='auto',
+                                status='sent',
+                                last_error=finalize_error
+                            )
                         self._record_delivery_log(
                             order_id=order_id,
                             item_id=item_id,
                             buyer_id=user_id,
                             status='failed',
-                            reason=finalize_result.get('error') or '检测到已发送记录，但补完成发货收尾失败',
+                            reason=finalize_error,
                             channel='auto',
                             rule_meta=pending_finalize_meta
                         )
@@ -6561,7 +7021,7 @@ class XianyuLive:
                             send_user_name="买家",
                             send_user_id=user_id,
                             item_id=item_id,
-                            error_message=finalize_result.get('error') or '检测到已发送记录，但补完成发货收尾失败',
+                            error_message=finalize_error,
                             chat_id=chat_id,
                             order_id=order_id
                         )
@@ -6681,21 +7141,33 @@ class XianyuLive:
                             item_id=item_id
                         )
                         if not finalize_result.get('success'):
-                            self._persist_delivery_finalization_state(
-                                order_id=order_id,
-                                item_id=item_id,
-                                buyer_id=user_id,
-                                delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
-                                channel='auto',
-                                status='sent',
-                                last_error=finalize_result.get('error') or '发送成功但提交发货副作用失败'
-                            )
+                            finalize_error = finalize_result.get('error') or '发送成功但提交发货副作用失败'
+                            if self._is_platform_confirm_failure_error(finalize_error):
+                                self._mark_delivery_pending_platform_confirm(
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                    buyer_id=user_id,
+                                    delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                                    confirm_error=finalize_error,
+                                    expected_quantity=1,
+                                    context="自动发货发送成功后平台确认失败"
+                                )
+                            else:
+                                self._persist_delivery_finalization_state(
+                                    order_id=order_id,
+                                    item_id=item_id,
+                                    buyer_id=user_id,
+                                    delivery_meta=delivery_result if isinstance(delivery_result, dict) else delivery_rule_meta,
+                                    channel='auto',
+                                    status='sent',
+                                    last_error=finalize_error
+                                )
                             self._record_delivery_log(
                                 order_id=order_id,
                                 item_id=item_id,
                                 buyer_id=user_id,
                                 status='failed',
-                                reason=finalize_result.get('error') or '发送成功但提交发货副作用失败',
+                                reason=finalize_error,
                                 channel='auto',
                                 rule_meta=delivery_rule_meta
                             )
@@ -6703,7 +7175,7 @@ class XianyuLive:
                                 send_user_name="买家",
                                 send_user_id=user_id,
                                 item_id=item_id,
-                                error_message=finalize_result.get('error') or '发送成功但提交发货副作用失败',
+                                error_message=finalize_error,
                                 chat_id=chat_id,
                                 order_id=order_id
                             )
@@ -7226,15 +7698,26 @@ class XianyuLive:
                                 )
                                 if not finalize_result.get('success'):
                                     last_delivery_error = finalize_result.get('error') or f"第 {unit_index} 个卡券补完成收尾失败"
-                                    self._persist_delivery_finalization_state(
-                                        order_id=order_id,
-                                        item_id=item_id,
-                                        buyer_id=send_user_id,
-                                        delivery_meta=pending_finalize_meta,
-                                        channel='auto',
-                                        status='sent',
-                                        last_error=last_delivery_error
-                                    )
+                                    if self._is_platform_confirm_failure_error(last_delivery_error):
+                                        self._mark_delivery_pending_platform_confirm(
+                                            order_id=order_id,
+                                            item_id=item_id,
+                                            buyer_id=send_user_id,
+                                            delivery_meta=pending_finalize_meta,
+                                            confirm_error=last_delivery_error,
+                                            expected_quantity=quantity_to_send,
+                                            context="多数量自动发货补完成收尾时平台确认失败"
+                                        )
+                                    else:
+                                        self._persist_delivery_finalization_state(
+                                            order_id=order_id,
+                                            item_id=item_id,
+                                            buyer_id=send_user_id,
+                                            delivery_meta=pending_finalize_meta,
+                                            channel='auto',
+                                            status='sent',
+                                            last_error=last_delivery_error
+                                        )
                                     self._record_delivery_log(
                                         order_id=order_id,
                                         item_id=item_id,
@@ -7566,15 +8049,26 @@ class XianyuLive:
                                 )
                                 if not finalize_result.get('success'):
                                     last_delivery_error = finalize_result.get('error') or f"第 {unit_index} 条消息发送成功但提交发货副作用失败"
-                                    self._persist_delivery_finalization_state(
-                                        order_id=order_id,
-                                        item_id=item_id,
-                                        buyer_id=send_user_id,
-                                        delivery_meta=unit_rule_meta,
-                                        channel='auto',
-                                        status='sent',
-                                        last_error=last_delivery_error
-                                    )
+                                    if self._is_platform_confirm_failure_error(last_delivery_error):
+                                        self._mark_delivery_pending_platform_confirm(
+                                            order_id=order_id,
+                                            item_id=item_id,
+                                            buyer_id=send_user_id,
+                                            delivery_meta=unit_rule_meta,
+                                            confirm_error=last_delivery_error,
+                                            expected_quantity=quantity_to_send,
+                                            context="多数量自动发货发送成功后平台确认失败"
+                                        )
+                                    else:
+                                        self._persist_delivery_finalization_state(
+                                            order_id=order_id,
+                                            item_id=item_id,
+                                            buyer_id=send_user_id,
+                                            delivery_meta=unit_rule_meta,
+                                            channel='auto',
+                                            status='sent',
+                                            last_error=last_delivery_error
+                                        )
                                     self._record_delivery_log(
                                         order_id=order_id,
                                         item_id=item_id,
@@ -7781,6 +8275,7 @@ class XianyuLive:
         )
         if changed:
             await self.update_config_cookies()
+            self._schedule_pending_platform_confirm_retry(f"Cookie更新:{source}")
         return changed
 
     def _extract_set_cookie_updates(self, response_headers) -> Dict[str, str]:
@@ -8540,6 +9035,7 @@ class XianyuLive:
                     self.last_session_keepalive_error_message = None
                     self.last_session_keepalive_time = time.time()
                     logger.info(f"【{self.cookie_id}】轻量会话保活成功")
+                    self._schedule_pending_platform_confirm_retry("轻量会话保活成功")
                     return True
 
                 error_message = ' | '.join([str(ret) for ret in ret_value]) or '未知错误'
@@ -8740,6 +9236,7 @@ class XianyuLive:
                                 # 标记为成功
                                 self.last_token_refresh_status = "success"
                                 self.last_token_refresh_error_message = None
+                                self._schedule_pending_platform_confirm_retry("token刷新成功")
                                 if self._consume_pending_slider_success_notice():
                                     await self.send_token_refresh_notification(
                                         "滑块验证通过，账号会话已恢复",
@@ -18091,6 +18588,73 @@ class XianyuLive:
         if released is not None:
             logger.warning(f"【{self.cookie_id}】消息ID {message_id[:50]}... 已释放预占，允许重试: {reason or 'unknown'}")
 
+    async def _apply_message_filters(
+        self,
+        send_user_name: str,
+        send_user_id: str,
+        send_message: str,
+        item_id: str,
+        chat_id: str,
+        msg_time: str,
+        message_source: str = 'user',
+        execute_actions: bool = True,
+    ) -> dict:
+        """匹配消息过滤规则，并按需执行通知/暂停动作。"""
+        empty_result = {
+            'matched': False,
+            'rules': [],
+            'skip_auto_reply': False,
+            'skip_ai_reply': False,
+            'pause_minutes': 0,
+            'notify_enabled': False,
+        }
+        try:
+            from message_filter_service import message_filter_service
+            result = message_filter_service.match_by_cookie(
+                cookie_id=self.cookie_id,
+                message=send_message,
+                item_id=item_id,
+                message_source=message_source,
+            )
+        except Exception as e:
+            logger.error(f"[{msg_time}] 【{self.cookie_id}】消息过滤规则匹配失败: {self._safe_str(e)}")
+            return empty_result
+
+        if not result.get('matched'):
+            return result
+
+        matched_rules = result.get('rules') or []
+        rule_names = [str(rule.get('name') or rule.get('id') or '').strip() for rule in matched_rules]
+        rule_label = '、'.join([name for name in rule_names if name]) or '未命名规则'
+        logger.info(
+            f"[{msg_time}] 【{self.cookie_id}】命中消息过滤规则: {rule_label}，"
+            f"skip_auto={bool(result.get('skip_auto_reply'))}, "
+            f"skip_ai={bool(result.get('skip_ai_reply'))}, "
+            f"pause={int(result.get('pause_minutes') or 0)}分钟, "
+            f"notify={bool(result.get('notify_enabled'))}"
+        )
+
+        if not execute_actions:
+            return result
+
+        pause_minutes = int(result.get('pause_minutes') or 0)
+        if pause_minutes > 0:
+            pause_manager.pause_chat_for(
+                chat_id,
+                self.cookie_id,
+                pause_minutes,
+                reason=f"命中消息过滤规则「{rule_label}」"
+            )
+
+        if result.get('notify_enabled'):
+            try:
+                notify_message = f"[消息过滤] 命中规则「{rule_label}」：{send_message}"
+                await self.send_notification(send_user_name, send_user_id, notify_message, item_id, chat_id)
+            except Exception as notify_error:
+                logger.error(f"[{msg_time}] 【{self.cookie_id}】消息过滤通知发送失败: {self._safe_str(notify_error)}")
+
+        return result
+
     async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket,
                                        send_user_name: str, send_user_id: str, send_message: str,
                                        item_id: str, msg_time: str, dedupe_message_id: str = None,
@@ -18258,6 +18822,21 @@ class XianyuLive:
             if blacklist_hit:
                 return
 
+            message_filter_result = await self._apply_message_filters(
+                send_user_name=send_user_name,
+                send_user_id=send_user_id,
+                send_message=send_message,
+                item_id=item_id,
+                chat_id=chat_id,
+                msg_time=msg_time,
+                message_source='user',
+                execute_actions=False,
+            )
+            if message_filter_result.get('skip_auto_reply'):
+                logger.info(f"[{msg_time}] 【{self.cookie_id}】命中消息过滤规则，跳过自动回复")
+                return
+            skip_ai_reply = bool(message_filter_result.get('skip_ai_reply'))
+
             reply = None
             reply_source = None
 
@@ -18291,9 +18870,12 @@ class XianyuLive:
                         reply_source = '默认'
                     else:
                         # 3. 最后尝试AI回复
-                        reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
-                        if reply:
-                            reply_source = 'AI'
+                        if skip_ai_reply:
+                            logger.info(f"[{msg_time}] 【{self.cookie_id}】命中消息过滤规则，跳过AI回复")
+                        else:
+                            reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
+                            if reply:
+                                reply_source = 'AI'
 
             # 注意：这里只有商品ID，没有标题和详情，根据新的规则不保存到数据库
             # 商品信息会在其他有完整信息的地方保存（如发货规则匹配时）
@@ -19442,11 +20024,31 @@ class XianyuLive:
                     except Exception as e:
                         logger.debug(f"更新买家昵称失败: {self._safe_str(e)}")
 
+            message_filter_result = await self._apply_message_filters(
+                send_user_name=send_user_name,
+                send_user_id=send_user_id,
+                send_message=send_message,
+                item_id=item_id,
+                chat_id=chat_id,
+                msg_time=msg_time,
+                message_source='system' if is_system_message else 'user',
+                execute_actions=True,
+            )
+
             if not allow_auto_reply:
                 logger.info(
                     f"【{self.cookie_id}】[{msg_id}] ⏹️ 当前消息不进入自动回复链: "
                     f"route={message_route}, status_signal={order_status_signal or 'none'}"
                 )
+                return
+
+            if message_filter_result.get('skip_auto_reply'):
+                rule_names = '、'.join([
+                    str(rule.get('name') or rule.get('id') or '').strip()
+                    for rule in (message_filter_result.get('rules') or [])
+                    if str(rule.get('name') or rule.get('id') or '').strip()
+                ]) or '消息过滤规则'
+                logger.info(f"【{self.cookie_id}】[{msg_id}] ⏹️ 命中{rule_names}，跳过自动回复")
                 return
 
             # 使用防抖机制处理聊天消息回复

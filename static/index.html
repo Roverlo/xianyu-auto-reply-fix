@@ -107,6 +107,12 @@
           <span>自动回复</span>
         </a>
       </div>
+      <div class="nav-item" data-menu-id="message-filters">
+        <a href="javascript:void(0)" class="nav-link" onclick="showSection('message-filters')">
+          <i class="bi bi-funnel"></i>
+          <span>消息过滤</span>
+        </a>
+      </div>
       <div class="nav-item" data-menu-id="items-reply">
         <a href="javascript:void(0)" class="nav-link" onclick="showSection('items-reply')">
           <i class="bi bi-chat-left-text"></i>
@@ -1178,7 +1184,7 @@
               <option value="pending_payment">待付款</option>
               <option value="pending_ship">待发货</option>
               <option value="partial_success">部分发货</option>
-              <option value="partial_pending_finalize">部分待收尾</option>
+              <option value="partial_pending_finalize">待补确认</option>
               <option value="shipped">已发货</option>
               <option value="completed">交易成功</option>
               <option value="refunding">退款中</option>
@@ -2957,6 +2963,8 @@
                     </div>
                     <div class="d-flex gap-1">
                       <button class="btn btn-sm btn-outline-secondary" onclick="loadMoreChatMessages()" title="加载更多"><i class="bi bi-clock-history"></i></button>
+                      <button class="btn btn-sm btn-outline-success" onclick="openOrdersFromChat()" title="跳转到订单页查看该买家的订单"><i class="bi bi-receipt"></i><span class="d-none d-xl-inline ms-1">订单</span></button>
+                      <button class="btn btn-sm btn-outline-danger" onclick="toggleChatBlacklist()" title="拉黑当前买家" id="chatBlacklistBtn" disabled><i class="bi bi-person-slash"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">拉黑</span></button>
                       <button class="btn btn-sm btn-outline-primary" onclick="toggleReplyPanel()" title="商品回复" id="btnToggleReply"><i class="bi bi-chat-right-text"></i></button>
                     </div>
                   </div>
@@ -3139,6 +3147,178 @@
             <i class="bi bi-search" style="font-size: 3rem; color: #ccc;"></i>
             <h5 class="mt-3 text-muted">未找到相关商品</h5>
             <p class="text-muted">请尝试使用其他关键词或调整搜索条件</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 消息过滤规则内容 -->
+    <div id="message-filters-section" class="content-section">
+      <div class="content-header">
+        <div class="d-flex justify-content-between align-items-center w-100 flex-wrap gap-2">
+          <div>
+            <h2 class="mb-0">
+              <i class="bi bi-funnel me-2"></i>
+              消息过滤
+            </h2>
+            <p class="text-muted mb-0">命中规则后可跳过自动回复、跳过 AI、暂停会话或提醒人工处理</p>
+          </div>
+        </div>
+      </div>
+      <div class="content-body">
+        <div class="row g-4">
+          <div class="col-lg-4">
+            <div class="card h-100">
+              <div class="card-header">
+                <i class="bi bi-plus-circle me-2"></i><span id="messageFilterFormTitle">新增过滤规则</span>
+              </div>
+              <div class="card-body">
+                <form id="messageFilterForm" onsubmit="event.preventDefault(); saveMessageFilterRule(); return false;">
+                  <input type="hidden" id="messageFilterRuleId" value="">
+                  <div class="mb-3">
+                    <label for="messageFilterName" class="form-label">规则名称 <span class="text-danger">*</span></label>
+                    <input type="text" class="form-control" id="messageFilterName" placeholder="例如：投诉转人工" required>
+                  </div>
+                  <div class="mb-3">
+                    <label for="messageFilterCookieId" class="form-label">作用账号</label>
+                    <select class="form-select" id="messageFilterCookieId">
+                      <option value="">全部账号</option>
+                    </select>
+                  </div>
+                  <div class="mb-3">
+                    <label for="messageFilterItemId" class="form-label">商品ID</label>
+                    <input type="text" class="form-control" id="messageFilterItemId" placeholder="可选，填写后仅匹配该商品">
+                  </div>
+                  <div class="row g-2">
+                    <div class="col-md-6 mb-3">
+                      <label for="messageFilterMatchType" class="form-label">匹配方式</label>
+                      <select class="form-select" id="messageFilterMatchType">
+                        <option value="contains" selected>包含关键词</option>
+                        <option value="exact">完全匹配</option>
+                        <option value="regex">正则匹配</option>
+                      </select>
+                    </div>
+                    <div class="col-md-6 mb-3">
+                      <label for="messageFilterSource" class="form-label">消息来源</label>
+                      <select class="form-select" id="messageFilterSource">
+                        <option value="user" selected>客户消息</option>
+                        <option value="system">系统消息</option>
+                        <option value="all">全部消息</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="mb-3">
+                    <label for="messageFilterPatterns" class="form-label">匹配内容 <span class="text-danger">*</span></label>
+                    <textarea class="form-control" id="messageFilterPatterns" rows="5" placeholder="每行一个关键词或正则" required></textarea>
+                  </div>
+                  <div class="mb-3">
+                    <label class="form-label">命中动作</label>
+                    <div class="d-grid gap-2">
+                      <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="messageFilterSkipAutoReply" checked>
+                        <label class="form-check-label" for="messageFilterSkipAutoReply">跳过自动回复</label>
+                      </div>
+                      <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="messageFilterSkipAiReply">
+                        <label class="form-check-label" for="messageFilterSkipAiReply">跳过 AI 回复</label>
+                      </div>
+                      <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="messageFilterNotify">
+                        <label class="form-check-label" for="messageFilterNotify">通知人工处理</label>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="mb-3">
+                    <label for="messageFilterPauseMinutes" class="form-label">暂停会话</label>
+                    <div class="input-group">
+                      <input type="number" min="0" max="1440" step="1" class="form-control" id="messageFilterPauseMinutes" value="0">
+                      <span class="input-group-text">分钟</span>
+                    </div>
+                  </div>
+                  <div class="form-check form-switch mb-3">
+                    <input class="form-check-input" type="checkbox" id="messageFilterEnabled" checked>
+                    <label class="form-check-label" for="messageFilterEnabled">立即启用</label>
+                  </div>
+                  <div class="d-flex gap-2">
+                    <button type="submit" class="btn btn-primary flex-fill">
+                      <i class="bi bi-check-circle me-1"></i>保存
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary" onclick="resetMessageFilterForm()" title="重置">
+                      <i class="bi bi-arrow-counterclockwise"></i>
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-lg-8">
+            <div class="card">
+              <div class="card-header">
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                  <div>
+                    <i class="bi bi-list-check me-2"></i>过滤规则
+                    <span class="text-muted small ms-2" id="messageFilterTotalText">共 0 条</span>
+                  </div>
+                  <button type="button" class="btn btn-outline-primary btn-sm" onclick="loadMessageFilters(1)">
+                    <i class="bi bi-arrow-clockwise me-1"></i>刷新
+                  </button>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="row g-2 align-items-end mb-3">
+                  <div class="col-md-7">
+                    <label for="messageFilterKeyword" class="form-label small mb-1">搜索</label>
+                    <input type="text" class="form-control form-control-sm" id="messageFilterKeyword" placeholder="规则名称 / 关键词 / 商品 / 账号" onkeydown="handleMessageFilterKeydown(event)">
+                  </div>
+                  <div class="col-md-3">
+                    <label for="messageFilterPageSize" class="form-label small mb-1">每页</label>
+                    <select class="form-select form-select-sm" id="messageFilterPageSize" onchange="loadMessageFilters(1)">
+                      <option value="10">10</option>
+                      <option value="20" selected>20</option>
+                      <option value="50">50</option>
+                      <option value="100">100</option>
+                    </select>
+                  </div>
+                  <div class="col-md-2 d-flex gap-2">
+                    <button type="button" class="btn btn-primary btn-sm flex-fill" onclick="loadMessageFilters(1)">
+                      <i class="bi bi-search"></i>
+                    </button>
+                    <button type="button" class="btn btn-outline-secondary btn-sm" onclick="resetMessageFilterSearch()">
+                      <i class="bi bi-x-circle"></i>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="table-responsive">
+                  <table class="table table-hover align-middle">
+                    <thead>
+                      <tr>
+                        <th>范围</th>
+                        <th>规则</th>
+                        <th>匹配</th>
+                        <th>动作</th>
+                        <th>状态</th>
+                        <th>更新时间</th>
+                        <th>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="messageFilterTableBody">
+                      <tr>
+                        <td colspan="7" class="text-center py-4 text-muted">
+                          <i class="bi bi-funnel fs-1 d-block mb-3"></i>
+                          暂无过滤规则
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mt-3">
+                  <div class="small text-muted" id="messageFilterPageText">第 1 页</div>
+                  <div class="btn-group" id="messageFilterPagination" role="group" aria-label="消息过滤分页"></div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
